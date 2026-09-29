@@ -9,21 +9,43 @@ use rars::{rar15_40, rar50, Archive, ArchiveFamily, ArchiveReadOptions, ArchiveR
 // Parse arbitrary bytes and extract every member into a sink through the
 // per-family entry points an embedding application drives, reading every
 // metadata field on the way. Any panic here aborts the host process.
+//
+// Each input is parsed twice: in memory (`read`) and from a file
+// (`read_path`), which walks headers and reads payloads independently. The
+// files go to per-process names under the temp dir (set TMPDIR to a ramdisk).
+//
+// Volume path: byte 0 picks where the rest splits into two "volumes". To seed
+// it from a two-volume fixture pair A, B: write `[x] + A + B`, choosing x (and
+// zero padding after B) so that `x * (len(A) + len(B) + pad) / 256 == len(A)`.
 fuzz_target!(|data: &[u8]| {
-    if let Ok(archive) = ArchiveReader::read(data) {
-        extract(std::slice::from_ref(&archive));
+    for archive in parse(data, "whole.rar").into_iter().flatten() {
+        extract(&[archive]);
     }
-    // Volume path: split at an input-chosen offset into two "volumes".
     if data.len() > 1 {
         let rest = &data[1..];
         let (first, second) = rest.split_at(usize::from(data[0]) * rest.len() / 256);
-        if let (Ok(a), Ok(b)) = (ArchiveReader::read(first), ArchiveReader::read(second)) {
-            if a.family() == b.family() {
-                extract(&[a, b]);
+        let pairs = parse(first, "vol.part1.rar")
+            .into_iter()
+            .zip(parse(second, "vol.part2.rar"));
+        for (a, b) in pairs {
+            if let (Some(a), Some(b)) = (a, b) {
+                if a.family() == b.family() {
+                    extract(&[a, b]);
+                }
             }
         }
     }
 });
+
+/// Parses `bytes` in memory and from a file: two independent header walks.
+fn parse(bytes: &[u8], name: &str) -> [Option<Archive>; 2] {
+    let path = std::env::temp_dir().join(format!("extract_sink-{}-{name}", std::process::id()));
+    std::fs::write(&path, bytes).expect("write fuzz input file");
+    [
+        ArchiveReader::read(bytes).ok(),
+        ArchiveReader::read_path(&path).ok(),
+    ]
+}
 
 fn open<M: std::fmt::Debug>(meta: &M) -> Result<Box<dyn Write>> {
     black_box(format!("{meta:?}"));
