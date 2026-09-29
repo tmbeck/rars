@@ -284,6 +284,13 @@ impl FileHeader {
             ctime: self.times.ctime,
             atime: self.times.atime,
             owner: self.owner.clone(),
+            crc32: self.data_crc32,
+            blake2sp: self
+                .hash
+                .as_ref()
+                .filter(|h| h.hash_type == 0)
+                .and_then(|h| <[u8; 32]>::try_from(h.data.as_slice()).ok()),
+            unpacked_size: self.known_unpacked_size(),
         }
     }
 
@@ -1414,6 +1421,13 @@ impl<B: Budget> PendingSplitRefs<B> {
             ctime: None,
             atime: None,
             owner: None,
+            crc32: final_file.data_crc32,
+            blake2sp: final_file
+                .hash
+                .as_ref()
+                .filter(|h| h.hash_type == 0)
+                .and_then(|h| <[u8; 32]>::try_from(h.data.as_slice()).ok()),
+            unpacked_size: final_file.known_unpacked_size(),
         };
         let mut writer = open(&meta)?;
         budget.run(&final_file.name, &mut writer, |mut writer| {

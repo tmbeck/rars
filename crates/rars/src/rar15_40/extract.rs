@@ -489,6 +489,8 @@ impl<B: Budget> PendingSplitRefs<B> {
             is_directory: false,
             ctime: self.ctime,
             atime: self.atime,
+            crc32: final_file.file_crc,
+            unpacked_size: final_file.unp_size,
         };
         let mut writer = open(&meta)?;
         budget.run(&final_file.name, &mut writer, |mut writer| {

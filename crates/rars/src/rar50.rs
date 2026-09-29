@@ -382,6 +382,9 @@ pub struct ExtractedEntryMeta {
     pub ctime: Option<crate::UnixTimestamp>,
     pub atime: Option<crate::UnixTimestamp>,
     pub owner: Option<UnixOwner>,
+    pub crc32: Option<u32>,
+    pub blake2sp: Option<[u8; 32]>,
+    pub unpacked_size: Option<u64>,
 }
 
 impl FileHeader {
