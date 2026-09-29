@@ -82,3 +82,10 @@ path = "fuzz_targets/unpack15_round_trip.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "extract_sink"
+path = "fuzz_targets/extract_sink.rs"
+test = false
+doc = false
+bench = false
