@@ -894,6 +894,15 @@ pub fn read_volume_member_at(
     Ok(taken)
 }
 
+/// A point in time as Unix seconds plus a sub-second remainder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UnixTimestamp {
+    /// Seconds since 1970-01-01 UTC; negative before it.
+    pub seconds: i64,
+    /// Sub-second remainder, below 1_000_000_000.
+    pub nanoseconds: u32,
+}
+
 /// Detail a coarse timestamp cannot hold, carried alongside it.
 ///
 /// A DOS timestamp counts in two-second steps, so RAR 1.5-4.x archives put the

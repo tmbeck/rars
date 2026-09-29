@@ -193,6 +193,7 @@ pub struct FileHeader {
     /// header field, so a reader that only looks at `mtime` restores nothing
     /// on almost every real archive.
     pub htime_mtime: Option<u32>,
+    pub times: FileTimes,
     pub data_crc32: Option<u32>,
     pub compression_info: u64,
     pub host_os: u64,
@@ -203,6 +204,15 @@ pub struct FileHeader {
     pub encrypted: bool,
     pub encryption: Option<FileEncryption>,
     crypto: Option<FileCryptoState>,
+}
+
+/// Times from the `FHEXTRA_HTIME` record, at the precision it stores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct FileTimes {
+    pub mtime: Option<crate::UnixTimestamp>,
+    pub ctime: Option<crate::UnixTimestamp>,
+    pub atime: Option<crate::UnixTimestamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,6 +306,11 @@ pub struct ExtractedEntryMeta {
     pub attr: u64,
     pub host_os: u64,
     pub is_directory: bool,
+    /// Modification time: the base header's field when present (as
+    /// libarchive and UnRAR prefer it), else `FHEXTRA_HTIME`'s.
+    pub mtime: Option<crate::UnixTimestamp>,
+    pub ctime: Option<crate::UnixTimestamp>,
+    pub atime: Option<crate::UnixTimestamp>,
 }
 
 impl FileHeader {
@@ -1202,6 +1217,7 @@ fn parse_file_header_bytes(parsed: &ParsedBlockHeader) -> Result<FileHeader> {
         attributes,
         mtime,
         htime_mtime: None,
+        times: FileTimes::default(),
         data_crc32,
         compression_info,
         host_os,
@@ -1248,7 +1264,8 @@ fn parse_file_extra_area(
                 file.redirection = Some(parse_file_redirection_record(input, data)?);
             }
             FHEXTRA_HTIME => {
-                file.htime_mtime = parse_htime_mtime(input, data);
+                file.htime_mtime = parse_htime_mtime(input, data.clone());
+                file.times = parse_htime(input, data).unwrap_or_default();
             }
             FHEXTRA_SUBDATA => {
                 file.service_data = Some(input[data].to_vec());
@@ -1288,6 +1305,78 @@ fn parse_htime_mtime(input: &[u8], range: Range<usize>) -> Option<u32> {
     let bytes = input.get(at..at.checked_add(8)?)?;
     let filetime = u64::from_le_bytes(bytes.try_into().ok()?);
     u32::try_from((filetime / FILETIME_TICKS_PER_SECOND).checked_sub(FILETIME_EPOCH_TO_UNIX)?).ok()
+}
+
+/// Reads every time out of an `FHEXTRA_HTIME` record: flags, then the
+/// present times in the order mtime, ctime, atime (`u32` Unix seconds under
+/// flag `0x0001`, else `u64` Windows FILETIME), then, when flags `0x0001`
+/// and `0x0010` are both set, one `u32` nanosecond field per present time in
+/// the same order.
+///
+/// A malformed record yields `None`, as in [`parse_htime_mtime`].
+fn parse_htime(input: &[u8], range: Range<usize>) -> Option<FileTimes> {
+    const HTIME_UNIX: u64 = 0x0001;
+    const HTIME_MTIME: u64 = 0x0002;
+    const HTIME_CTIME: u64 = 0x0004;
+    const HTIME_ATIME: u64 = 0x0008;
+    const HTIME_UNIX_NS: u64 = 0x0010;
+
+    let (flags, flags_len) = read_vint_at(input, range.start, range.end).ok()?;
+    let mut at = range.start.checked_add(flags_len)?;
+    let unix = flags & HTIME_UNIX != 0;
+    let mut times = [None; 3];
+    for (slot, bit) in times
+        .iter_mut()
+        .zip([HTIME_MTIME, HTIME_CTIME, HTIME_ATIME])
+    {
+        if flags & bit == 0 {
+            continue;
+        }
+        *slot = Some(if unix {
+            let bytes: [u8; 4] = take_bytes(input, &mut at, range.end, 4)?.try_into().ok()?;
+            crate::UnixTimestamp {
+                seconds: i64::from(u32::from_le_bytes(bytes)),
+                nanoseconds: 0,
+            }
+        } else {
+            let bytes: [u8; 8] = take_bytes(input, &mut at, range.end, 8)?.try_into().ok()?;
+            filetime_to_unix(u64::from_le_bytes(bytes))?
+        });
+    }
+    if unix && flags & HTIME_UNIX_NS != 0 {
+        for slot in times.iter_mut().flatten() {
+            let bytes: [u8; 4] = take_bytes(input, &mut at, range.end, 4)?.try_into().ok()?;
+            slot.nanoseconds = u32::from_le_bytes(bytes).min(999_999_999);
+        }
+    }
+    let [mtime, ctime, atime] = times;
+    Some(FileTimes {
+        mtime,
+        ctime,
+        atime,
+    })
+}
+
+/// `n` bytes at `*at`, advancing it; `None` past `end`.
+fn take_bytes<'a>(input: &'a [u8], at: &mut usize, end: usize, n: usize) -> Option<&'a [u8]> {
+    let stop = at.checked_add(n)?;
+    if stop > end {
+        return None;
+    }
+    let bytes = input.get(*at..stop)?;
+    *at = stop;
+    Some(bytes)
+}
+
+/// A Windows FILETIME (100 ns ticks since 1601) as a Unix timestamp.
+fn filetime_to_unix(filetime: u64) -> Option<crate::UnixTimestamp> {
+    const TICKS_PER_SECOND: i128 = 10_000_000;
+    const EPOCH_DELTA_SECONDS: i128 = 11_644_473_600;
+    let ticks = i128::from(filetime) - EPOCH_DELTA_SECONDS * TICKS_PER_SECOND;
+    Some(crate::UnixTimestamp {
+        seconds: i64::try_from(ticks.div_euclid(TICKS_PER_SECOND)).ok()?,
+        nanoseconds: u32::try_from(ticks.rem_euclid(TICKS_PER_SECOND) * 100).ok()?,
+    })
 }
 
 fn parse_file_redirection_record(input: &[u8], range: Range<usize>) -> Result<FileRedirection> {
@@ -2041,6 +2130,7 @@ fn decode_compression_info(raw: u64) -> Result<CompressionInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::UnixTimestamp;
 
     #[test]
     fn read_vint_at_honors_logical_end_before_decoding() {
@@ -2102,6 +2192,7 @@ mod tests {
             attributes: 0,
             mtime: None,
             htime_mtime: None,
+            times: FileTimes::default(),
             data_crc32: None,
             compression_info: 0,
             host_os: 0,
@@ -2180,5 +2271,71 @@ mod tests {
         let archive = Archive::parse(&bytes).unwrap();
 
         assert!(archive.archive_comment().unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_htime_reads_all_three_filetimes() {
+        // flags: mtime | ctime | atime, Windows FILETIME encoding.
+        let mut rec = vec![0x0e];
+        for ft in [
+            133_000_000_001_234_567u64, // 1_655_526_400.1234567 s
+            116_444_736_000_000_000,    // the Unix epoch
+            116_444_735_990_000_000,    // one second before it
+        ] {
+            rec.extend_from_slice(&ft.to_le_bytes());
+        }
+        let t = parse_htime(&rec, 0..rec.len()).unwrap();
+        assert_eq!(
+            t.mtime,
+            Some(UnixTimestamp {
+                seconds: 1_655_526_400,
+                nanoseconds: 123_456_700
+            })
+        );
+        assert_eq!(
+            t.ctime,
+            Some(UnixTimestamp {
+                seconds: 0,
+                nanoseconds: 0
+            })
+        );
+        assert_eq!(
+            t.atime,
+            Some(UnixTimestamp {
+                seconds: -1,
+                nanoseconds: 0
+            })
+        );
+    }
+
+    #[test]
+    fn parse_htime_reads_unix_seconds_and_nanoseconds() {
+        // flags: unix | mtime | atime | unix-ns; then mtime s, atime s, mtime ns, atime ns.
+        let mut rec = vec![0x1b];
+        for v in [1_700_000_000u32, 1_600_000_000, 5, 999_999_999] {
+            rec.extend_from_slice(&v.to_le_bytes());
+        }
+        let t = parse_htime(&rec, 0..rec.len()).unwrap();
+        assert_eq!(
+            t.mtime,
+            Some(UnixTimestamp {
+                seconds: 1_700_000_000,
+                nanoseconds: 5
+            })
+        );
+        assert_eq!(t.ctime, None);
+        assert_eq!(
+            t.atime,
+            Some(UnixTimestamp {
+                seconds: 1_600_000_000,
+                nanoseconds: 999_999_999
+            })
+        );
+    }
+
+    #[test]
+    fn parse_htime_rejects_a_short_record() {
+        let rec = [0x02, 1, 2, 3];
+        assert_eq!(parse_htime(&rec, 0..rec.len()), None);
     }
 }

@@ -5976,3 +5976,23 @@ fn head_crypt_kdf_count(bytes: &[u8]) -> u8 {
     read_vint(&mut pos); // encryption flags
     bytes[pos]
 }
+
+#[test]
+fn split_member_keeps_its_htime_mtime() {
+    let volumes = [
+        Archive::parse_path(fixture("multivol.part1.rar")).unwrap(),
+        Archive::parse_path(fixture("multivol.part2.rar")).unwrap(),
+        Archive::parse_path(fixture("multivol.part3.rar")).unwrap(),
+    ];
+    let mut metas = Vec::new();
+    extract_volumes_to(&volumes, ArchiveReadOptions::new(), |meta| {
+        metas.push(meta.clone());
+        Ok(Box::new(std::io::sink()))
+    })
+    .unwrap();
+    let first = volumes[0].files().next().unwrap();
+    // The premise: the base-header mtime is absent, HTIME carries it.
+    assert_eq!(first.mtime, None);
+    assert!(metas.iter().all(|m| m.mtime.is_some()), "{metas:#?}");
+    assert_eq!(metas[0].mtime, first.metadata().mtime);
+}

@@ -196,6 +196,15 @@ impl FileHeader {
             attr: self.attributes,
             host_os: self.host_os,
             is_directory: self.is_directory(),
+            mtime: self
+                .mtime
+                .map(|seconds| crate::UnixTimestamp {
+                    seconds: i64::from(seconds),
+                    nanoseconds: 0,
+                })
+                .or(self.times.mtime),
+            ctime: self.times.ctime,
+            atime: self.times.atime,
         }
     }
 
@@ -853,9 +862,7 @@ fn validate_split_continuation_refs(
 struct PendingSplitRefs {
     name: Vec<u8>,
     fragments: Vec<(usize, usize)>,
-    file_time: u32,
-    attr: u64,
-    host_os: u64,
+    meta: ExtractedEntryMeta,
     compression_info: u64,
     encrypted: bool,
 }
@@ -865,9 +872,7 @@ impl PendingSplitRefs {
         Self {
             name: file.name.clone(),
             fragments: vec![(volume_index, file_index)],
-            file_time: file.mtime.unwrap_or(0),
-            attr: file.attributes,
-            host_os: file.host_os,
+            meta: file.metadata(),
             compression_info: file.compression_info,
             encrypted: file.encrypted,
         }
@@ -888,13 +893,7 @@ impl PendingSplitRefs {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
         let decryptor = session.split_decryptor(&self, volumes)?;
-        let meta = ExtractedEntryMeta {
-            name: self.name.clone(),
-            file_time: self.file_time,
-            attr: self.attr,
-            host_os: self.host_os,
-            is_directory: false,
-        };
+        let meta = self.meta.clone();
         let mut writer = open(&meta)?;
         // Whatever goes wrong with a member split across volumes, the fragment
         // checksums may know which volume to blame. Ask them before giving the
@@ -1288,6 +1287,7 @@ mod tests {
             attributes: 0x20,
             mtime: None,
             htime_mtime: None,
+            times: crate::rar50::FileTimes::default(),
             data_crc32: None,
             compression_info: 0,
             host_os: 2,
@@ -1506,6 +1506,7 @@ mod tests {
             attributes: 0x20,
             mtime: None,
             htime_mtime: None,
+            times: crate::rar50::FileTimes::default(),
             data_crc32: None,
             compression_info: 0,
             host_os: 2,
@@ -1765,6 +1766,7 @@ mod tests {
                 attributes: 0x20,
                 mtime: None,
                 htime_mtime: None,
+                times: crate::rar50::FileTimes::default(),
                 data_crc32: Some(crc),
                 compression_info: 0,
                 host_os: 2,
@@ -1809,6 +1811,7 @@ mod tests {
             attributes: 0x20,
             mtime: None,
             htime_mtime: None,
+            times: crate::rar50::FileTimes::default(),
             data_crc32: None,
             compression_info: 0,
             host_os: 2,
