@@ -59,6 +59,7 @@ const FHEXTRA_CRYPT: u64 = 0x01;
 const FHEXTRA_HASH: u64 = 0x02;
 const FHEXTRA_HTIME: u64 = 0x03;
 const FHEXTRA_REDIR: u64 = 0x05;
+const FHEXTRA_UOWNER: u64 = 0x06;
 const FHEXTRA_SUBDATA: u64 = 0x07;
 const MHEXTRA_ARCHIVE_METADATA: u64 = 0x02;
 const MHEXTRA_ARCHIVE_METADATA_NAME: u64 = 0x0001;
@@ -206,6 +207,7 @@ pub struct FileHeader {
     pub file_times: Option<crate::FileTimes>,
     /// The extended timestamp record converted to signed Unix timestamps.
     pub times: FileTimes,
+    pub owner: Option<UnixOwner>,
     pub data_crc32: Option<u32>,
     pub compression_info: u64,
     pub host_os: u64,
@@ -224,6 +226,15 @@ pub struct FileRedirection {
     pub redirection_type: u64,
     pub flags: u64,
     pub target_name: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct UnixOwner {
+    pub user: Option<Vec<u8>>,
+    pub group: Option<Vec<u8>>,
+    pub uid: Option<u64>,
+    pub gid: Option<u64>,
 }
 
 /// Times from the RAR5 `FHEXTRA_HTIME` record at its full precision.
@@ -370,6 +381,7 @@ pub struct ExtractedEntryMeta {
     pub mtime: Option<crate::UnixTimestamp>,
     pub ctime: Option<crate::UnixTimestamp>,
     pub atime: Option<crate::UnixTimestamp>,
+    pub owner: Option<UnixOwner>,
 }
 
 impl FileHeader {
@@ -1420,6 +1432,7 @@ fn parse_file_header_bytes(parsed: &ParsedBlockHeader) -> Result<FileHeader> {
         htime_mtime_refinement: None,
         file_times: None,
         times: FileTimes::default(),
+        owner: None,
         data_crc32,
         compression_info,
         host_os,
@@ -1496,6 +1509,9 @@ fn parse_file_extra_area(
                 file.times = parse_htime(input, data.clone()).unwrap_or_default();
                 file.htime_mtime = parsed.map(|(seconds, _)| seconds);
                 file.htime_mtime_refinement = parsed.and_then(|(_, detail)| detail);
+            }
+            FHEXTRA_UOWNER => {
+                file.owner = parse_unix_owner(input, data);
             }
             FHEXTRA_SUBDATA => {
                 file.rewrite_metadata_complete &=
@@ -1618,6 +1634,34 @@ fn filetime_to_unix(filetime: u64) -> Option<crate::UnixTimestamp> {
         seconds: i64::try_from(ticks.div_euclid(TICKS_PER_SECOND)).ok()?,
         nanoseconds: u32::try_from(ticks.rem_euclid(TICKS_PER_SECOND) * 100).ok()?,
     })
+}
+
+fn parse_unix_owner(input: &[u8], range: Range<usize>) -> Option<UnixOwner> {
+    let (flags, flags_len) = read_vint_at(input, range.start, range.end).ok()?;
+    let mut at = range.start.checked_add(flags_len)?;
+    let mut owner = UnixOwner::default();
+    if flags & 1 != 0 {
+        owner.user = Some(read_owner_name(input, &mut at, range.end)?);
+    }
+    if flags & 2 != 0 {
+        owner.group = Some(read_owner_name(input, &mut at, range.end)?);
+    }
+    if flags & 4 != 0 {
+        let (id, len) = read_vint_at(input, at, range.end).ok()?;
+        at = at.checked_add(len)?;
+        owner.uid = Some(id);
+    }
+    if flags & 8 != 0 {
+        let (id, _) = read_vint_at(input, at, range.end).ok()?;
+        owner.gid = Some(id);
+    }
+    Some(owner)
+}
+
+fn read_owner_name(input: &[u8], at: &mut usize, end: usize) -> Option<Vec<u8>> {
+    let (len, len_len) = read_vint_at(input, *at, end).ok()?;
+    *at = at.checked_add(len_len)?;
+    Some(take_bytes(input, at, end, usize::try_from(len).ok()?)?.to_vec())
 }
 
 fn parse_file_redirection_record(input: &[u8], range: Range<usize>) -> Result<FileRedirection> {
@@ -3549,6 +3593,7 @@ mod tests {
             htime_mtime_refinement: None,
             file_times: None,
             times: FileTimes::default(),
+            owner: None,
             data_crc32: None,
             compression_info: 0,
             host_os: 0,

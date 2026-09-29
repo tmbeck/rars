@@ -283,6 +283,7 @@ impl FileHeader {
                 .or(self.times.mtime),
             ctime: self.times.ctime,
             atime: self.times.atime,
+            owner: self.owner.clone(),
         }
     }
 
@@ -376,6 +377,7 @@ impl FileHeader {
             htime_mtime_refinement: self.htime_mtime_refinement,
             file_times: self.file_times,
             times: self.times,
+            owner: self.owner.clone(),
             data_crc32: None,
             compression_info: self.compression_info,
             host_os: self.host_os,
@@ -1411,6 +1413,7 @@ impl<B: Budget> PendingSplitRefs<B> {
             }),
             ctime: None,
             atime: None,
+            owner: None,
         };
         let mut writer = open(&meta)?;
         budget.run(&final_file.name, &mut writer, |mut writer| {
@@ -2079,6 +2082,7 @@ mod tests {
             htime_mtime_refinement: None,
             file_times: None,
             times: FileTimes::default(),
+            owner: None,
             data_crc32: None,
             compression_info: 0,
             host_os: 2,
@@ -2624,6 +2628,7 @@ mod tests {
             htime_mtime_refinement: None,
             file_times: None,
             times: FileTimes::default(),
+            owner: None,
             data_crc32: None,
             compression_info: 0,
             host_os: 2,
@@ -2949,6 +2954,7 @@ mod tests {
                 htime_mtime_refinement: None,
                 file_times: None,
             times: FileTimes::default(),
+            owner: None,
                 data_crc32: Some(crc),
                 compression_info: 0,
                 host_os: 2,
@@ -2997,6 +3003,7 @@ mod tests {
             htime_mtime_refinement: None,
             file_times: None,
             times: FileTimes::default(),
+            owner: None,
             data_crc32: None,
             compression_info: 0,
             host_os: 2,
