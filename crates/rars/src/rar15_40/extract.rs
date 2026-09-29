@@ -428,6 +428,8 @@ struct PendingSplitRefs<B: Budget = Allowance> {
     fragments: Buffer<(usize, usize), B>,
     file_time: u32,
     mtime_refinement: Option<crate::TimeRefinement>,
+    ctime: Option<super::DosTime>,
+    atime: Option<super::DosTime>,
     attr: u32,
     host_os: u8,
     method: u8,
@@ -448,6 +450,8 @@ impl<B: Budget> PendingSplitRefs<B> {
             fragments: Buffer::copied(&[(volume_index, file_index)], allowance)?,
             file_time: file.file_time,
             mtime_refinement: file.mtime_refinement(),
+            ctime: super::ext_times(&file.ext_time, file.file_time)[1],
+            atime: super::ext_times(&file.ext_time, file.file_time)[2],
             attr: file.attr,
             host_os: file.host_os,
             method: file.method,
@@ -483,6 +487,8 @@ impl<B: Budget> PendingSplitRefs<B> {
             attr: self.attr,
             host_os: self.host_os,
             is_directory: false,
+            ctime: self.ctime,
+            atime: self.atime,
         };
         let mut writer = open(&meta)?;
         budget.run(&final_file.name, &mut writer, |mut writer| {

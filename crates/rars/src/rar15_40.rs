@@ -352,6 +352,51 @@ impl StreamingEntry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DosTime {
+    pub dos: u32,
+    pub refinement: crate::TimeRefinement,
+}
+
+pub(crate) fn ext_times(ext_time: &[u8], file_time: u32) -> [Option<DosTime>; 4] {
+    const PRESENT: u8 = 0x8;
+    const ADD_SECOND: u8 = 0x4;
+    let mut out = [None; 4];
+    let Some(flags) = ext_time.get(..2).and_then(|b| <[u8; 2]>::try_from(b).ok()) else {
+        return out;
+    };
+    let flags = u16::from_le_bytes(flags);
+    let mut pos = 2usize;
+    for (i, slot) in out.iter_mut().enumerate() {
+        let rmode = ((flags >> (12 - 4 * i)) & 0xf) as u8;
+        if rmode & PRESENT == 0 {
+            continue;
+        }
+        let dos = if i == 0 {
+            file_time
+        } else {
+            let Some(bytes) = ext_time.get(pos..pos + 4) else { break };
+            pos += 4;
+            u32::from_le_bytes(bytes.try_into().ok().unwrap())
+        };
+        let count = usize::from(rmode & 0x3);
+        let Some(fraction) = ext_time.get(pos..pos + count) else { break };
+        pos += count;
+        let mut ticks = 0u32;
+        for &byte in fraction {
+            ticks = (u32::from(byte) << 16) | (ticks >> 8);
+        }
+        *slot = Some(DosTime {
+            dos,
+            refinement: crate::TimeRefinement {
+                add_second: rmode & ADD_SECOND != 0,
+                nanoseconds: ticks * 100,
+            },
+        });
+    }
+    out
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ExtractedEntryMeta {
@@ -364,6 +409,8 @@ pub struct ExtractedEntryMeta {
     pub attr: u32,
     pub host_os: u8,
     pub is_directory: bool,
+    pub ctime: Option<DosTime>,
+    pub atime: Option<DosTime>,
 }
 
 impl FileHeader {
@@ -530,6 +577,7 @@ impl FileHeader {
     }
 
     pub fn metadata(&self) -> ExtractedEntryMeta {
+        let [_, ctime, atime, _] = ext_times(&self.ext_time, self.file_time);
         ExtractedEntryMeta {
             name_is_unicode: self.unicode_name.is_some(),
             name: self.name.clone(),
@@ -538,6 +586,8 @@ impl FileHeader {
             attr: self.attr,
             host_os: self.host_os,
             is_directory: self.is_directory(),
+            ctime,
+            atime,
         }
     }
 
