@@ -5996,3 +5996,72 @@ fn split_member_keeps_its_htime_mtime() {
     assert!(metas.iter().all(|m| m.mtime.is_some()), "{metas:#?}");
     assert_eq!(metas[0].mtime, first.metadata().mtime);
 }
+
+#[derive(Clone, Default)]
+struct Shared(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+impl std::io::Write for Shared {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn volume_meta_carries_the_whole_member_checksum_and_size() {
+    for set in [
+        &[
+            "multivol.part1.rar",
+            "multivol.part2.rar",
+            "multivol.part3.rar",
+        ][..],
+        &[
+            "solid_multivol.part01.rar",
+            "solid_multivol.part02.rar",
+            "solid_multivol.part03.rar",
+            "solid_multivol.part04.rar",
+            "solid_multivol.part05.rar",
+            "solid_multivol.part06.rar",
+        ],
+    ] {
+        let volumes: Vec<_> = set
+            .iter()
+            .map(|n| Archive::parse_path(fixture(n)).unwrap())
+            .collect();
+        let mut seen = Vec::new();
+        rars::rar50::extract_volumes_to(&volumes, rars::ArchiveReadOptions::new(), |meta| {
+            let sink = Shared::default();
+            seen.push((meta.clone(), sink.clone()));
+            Ok(Box::new(sink))
+        })
+        .unwrap();
+        for (meta, data) in &seen {
+            if meta.is_directory {
+                continue;
+            }
+            let data = data.0.borrow();
+            assert_eq!(meta.unpacked_size, Some(data.len() as u64), "{set:?}");
+            assert!(meta.crc32.is_some() || meta.blake2sp.is_some(), "{set:?}");
+            if let Some(c) = meta.crc32 {
+                assert_eq!(c, crc32(&data), "{set:?}");
+            }
+            // These fixtures record BLAKE2sp only. The whole member's hash is
+            // on its final fragment; earlier fragments hash their own part.
+            let last = volumes
+                .iter()
+                .flat_map(|v| v.files())
+                .filter(|f| f.name == meta.name && !f.is_split_after())
+                .last()
+                .unwrap();
+            last.verify_hash(&data).unwrap();
+            assert_eq!(
+                meta.blake2sp.as_ref().map(|h| &h[..]),
+                last.hash.as_ref().map(|h| &h.data[..]),
+                "{set:?}"
+            );
+        }
+    }
+}

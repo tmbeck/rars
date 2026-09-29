@@ -444,6 +444,8 @@ impl PendingSplitRefs {
             is_directory: false,
             ctime: self.ctime,
             atime: self.atime,
+            crc32: final_file.file_crc,
+            unpacked_size: final_file.unp_size,
         };
         let mut writer = open(&meta)?;
         let mut reader = self.fragment_reader(volumes, password)?;

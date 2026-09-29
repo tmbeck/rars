@@ -1,4 +1,4 @@
-use super::{blake2sp, Archive, ExtractedEntryMeta, FileHeader, FileRedirection};
+use super::{blake2sp, Archive, ExtractedEntryMeta, FileHeader, FileRedirection, FHFL_UNPUNKNOWN};
 use crate::codec::rar50::{DecodeMode, DecodedChunk, StreamDecodeError, Unpack50Decoder};
 use crate::crc32::{crc32, Crc32};
 use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
@@ -206,6 +206,13 @@ impl FileHeader {
             ctime: self.times.ctime,
             atime: self.times.atime,
             owner: self.owner.clone(),
+            crc32: self.data_crc32,
+            blake2sp: self
+                .hash
+                .as_ref()
+                .filter(|h| h.hash_type == 0)
+                .and_then(|h| <[u8; 32]>::try_from(h.data.as_slice()).ok()),
+            unpacked_size: (self.file_flags & FHFL_UNPUNKNOWN == 0).then_some(self.unpacked_size),
         }
     }
 
@@ -894,7 +901,12 @@ impl PendingSplitRefs {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
         let decryptor = session.split_decryptor(&self, volumes)?;
-        let meta = self.meta.clone();
+        let mut meta = self.meta.clone();
+        // The whole member's checksum and size live on its final fragment.
+        let last = final_file.metadata();
+        meta.crc32 = last.crc32;
+        meta.blake2sp = last.blake2sp;
+        meta.unpacked_size = last.unpacked_size;
         let mut writer = open(&meta)?;
         // Whatever goes wrong with a member split across volumes, the fragment
         // checksums may know which volume to blame. Ask them before giving the

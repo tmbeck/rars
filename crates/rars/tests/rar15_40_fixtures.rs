@@ -7205,3 +7205,45 @@ fn extracts_legacy_matches_that_reach_past_the_start_of_the_window() {
         assert_eq!(entry.data, expected, "{name}");
     }
 }
+
+#[test]
+fn extracted_meta_carries_crc32_and_size() {
+    let bytes = std::fs::read(fixture("rar300/solid_simple_rar300.rar")).unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    let mut metas = Vec::new();
+    archive
+        .extract_to(rars::ArchiveReadOptions::new(), |m| {
+            metas.push(m.clone());
+            Ok(Box::new(std::io::sink()))
+        })
+        .unwrap();
+    assert_eq!(metas[0].name, b"one.txt");
+    assert_eq!((metas[0].crc32, metas[0].unpacked_size), (0x11cc_9fbb, 48));
+}
+
+#[test]
+fn volume_meta_carries_the_whole_member_crc32_and_size() {
+    // Non-final fragments record their own part's CRC; the meta must carry the
+    // whole member's, which only the final fragment records.
+    let archives: Vec<_> = [
+        "rar300/compressed_multivol_prng_rar300.rar",
+        "rar300/compressed_multivol_prng_rar300.r00",
+        "rar300/compressed_multivol_prng_rar300.r01",
+        "rar300/compressed_multivol_prng_rar300.r02",
+        "rar300/compressed_multivol_prng_rar300.r03",
+    ]
+    .into_iter()
+    .map(|name| Archive::parse(&std::fs::read(fixture(name)).unwrap()).unwrap())
+    .collect();
+    let mut metas = Vec::new();
+    extract_volumes_to(&archives, ArchiveReadOptions::new(), |m| {
+        metas.push(m.clone());
+        Ok(Box::new(std::io::sink()))
+    })
+    .unwrap();
+    assert_eq!(metas.len(), 1);
+    assert_eq!(
+        (metas[0].crc32, metas[0].unpacked_size),
+        (0x96de_2bef, 4096)
+    );
+}

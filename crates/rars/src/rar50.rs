@@ -49,6 +49,7 @@ const MHFL_LOCKED: u64 = 0x0010;
 const FHFL_DIRECTORY: u64 = 0x0001;
 const FHFL_MTIME: u64 = 0x0002;
 const FHFL_CRC32: u64 = 0x0004;
+const FHFL_UNPUNKNOWN: u64 = 0x0008;
 
 const MHEXTRA_LOCATOR: u64 = 0x01;
 const MHEXTRA_LOCATOR_QUICK_OPEN: u64 = 0x0001;
@@ -314,6 +315,12 @@ pub struct ExtractedEntryMeta {
     pub ctime: Option<crate::UnixTimestamp>,
     pub atime: Option<crate::UnixTimestamp>,
     pub owner: Option<UnixOwner>,
+    /// CRC32 of the unpacked data, when recorded.
+    pub crc32: Option<u32>,
+    /// BLAKE2sp of the unpacked data, when recorded.
+    pub blake2sp: Option<[u8; 32]>,
+    /// Unpacked size; `None` when the header flags it unknown.
+    pub unpacked_size: Option<u64>,
 }
 
 impl FileHeader {

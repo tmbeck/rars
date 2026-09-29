@@ -418,6 +418,9 @@ pub struct ExtractedEntryMeta {
     /// Creation and access times from the extended time field.
     pub ctime: Option<DosTime>,
     pub atime: Option<DosTime>,
+    /// CRC32 of the unpacked data (of the whole member for a split one).
+    pub crc32: u32,
+    pub unpacked_size: u64,
 }
 
 impl FileHeader {
@@ -706,6 +709,8 @@ impl FileHeader {
             is_directory: self.is_directory(),
             ctime,
             atime,
+            crc32: self.file_crc,
+            unpacked_size: self.unp_size,
         }
     }
 
