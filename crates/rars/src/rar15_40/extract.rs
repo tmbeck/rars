@@ -391,6 +391,8 @@ struct PendingSplitRefs {
     fragments: Vec<(usize, usize)>,
     file_time: u32,
     mtime_refinement: Option<crate::TimeRefinement>,
+    ctime: Option<DosTime>,
+    atime: Option<DosTime>,
     attr: u32,
     host_os: u8,
     method: u8,
@@ -401,11 +403,14 @@ struct PendingSplitRefs {
 
 impl PendingSplitRefs {
     fn new(file: &FileHeader, volume_index: usize, file_index: usize) -> Self {
+        let [_, ctime, atime, _] = ext_times(&file.ext_time, file.file_time);
         Self {
             name: file.name.clone(),
             fragments: vec![(volume_index, file_index)],
             file_time: file.file_time,
             mtime_refinement: file.mtime_refinement(),
+            ctime,
+            atime,
             attr: file.attr,
             host_os: file.host_os,
             method: file.method,
@@ -437,6 +442,8 @@ impl PendingSplitRefs {
             attr: self.attr,
             host_os: self.host_os,
             is_directory: false,
+            ctime: self.ctime,
+            atime: self.atime,
         };
         let mut writer = open(&meta)?;
         let mut reader = self.fragment_reader(volumes, password)?;

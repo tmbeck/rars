@@ -342,6 +342,68 @@ impl StreamingEntry {
     }
 }
 
+/// A RAR 1.5-4 DOS timestamp with the extended-time detail it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DosTime {
+    /// The DOS date/time word, local time as the archiver saw it.
+    pub dos: u32,
+    pub refinement: crate::TimeRefinement,
+}
+
+/// Decodes the extended time field: a flags word whose nibbles, from bits
+/// 15-12 down, describe mtime, ctime, atime and arctime (`0x8` present,
+/// `0x4` add one second, low two bits = sub-second byte count). mtime
+/// reuses `file_time`; every other present time carries its own 4-byte
+/// DOS value before its sub-second bytes. Decoding stops at the first
+/// field that runs past the end.
+pub(crate) fn ext_times(ext_time: &[u8], file_time: u32) -> [Option<DosTime>; 4] {
+    const PRESENT: u8 = 0x8;
+    const ADD_SECOND: u8 = 0x4;
+    const TICK_NANOSECONDS: u32 = 100;
+
+    let mut out = [None; 4];
+    let Some(flags) = ext_time.get(..2).and_then(|b| <[u8; 2]>::try_from(b).ok()) else {
+        return out;
+    };
+    let flags = u16::from_le_bytes(flags);
+    let mut pos = 2usize;
+    for (i, slot) in out.iter_mut().enumerate() {
+        let rmode = ((flags >> (12 - 4 * i)) & 0xf) as u8;
+        if rmode & PRESENT == 0 {
+            continue;
+        }
+        let dos = if i == 0 {
+            file_time
+        } else {
+            let Some(b) = ext_time
+                .get(pos..pos + 4)
+                .and_then(|b| <[u8; 4]>::try_from(b).ok())
+            else {
+                break;
+            };
+            pos += 4;
+            u32::from_le_bytes(b)
+        };
+        let count = usize::from(rmode & 0x3);
+        let Some(fraction) = ext_time.get(pos..pos + count) else {
+            break;
+        };
+        pos += count;
+        let mut ticks = 0u32;
+        for &byte in fraction {
+            ticks = (u32::from(byte) << 16) | (ticks >> 8);
+        }
+        *slot = Some(DosTime {
+            dos,
+            refinement: crate::TimeRefinement {
+                add_second: rmode & ADD_SECOND != 0,
+                nanoseconds: ticks * TICK_NANOSECONDS,
+            },
+        });
+    }
+    out
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ExtractedEntryMeta {
@@ -353,6 +415,9 @@ pub struct ExtractedEntryMeta {
     pub attr: u32,
     pub host_os: u8,
     pub is_directory: bool,
+    /// Creation and access times from the extended time field.
+    pub ctime: Option<DosTime>,
+    pub atime: Option<DosTime>,
 }
 
 impl FileHeader {
@@ -631,6 +696,7 @@ impl FileHeader {
     }
 
     pub fn metadata(&self) -> ExtractedEntryMeta {
+        let [_, ctime, atime, _] = ext_times(&self.ext_time, self.file_time);
         ExtractedEntryMeta {
             name: self.name.clone(),
             file_time: self.file_time,
@@ -638,6 +704,8 @@ impl FileHeader {
             attr: self.attr,
             host_os: self.host_os,
             is_directory: self.is_directory(),
+            ctime,
+            atime,
         }
     }
 
@@ -2511,6 +2579,40 @@ fn packed_range(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ext_times_reads_ctime_and_atime_after_mtime() {
+        // mtime: present, 3 fraction bytes; ctime: present, +1 s, 1 byte;
+        // atime: present, no fraction; arctime absent.
+        let flags: u16 = (0xb << 12) | (0xd << 8) | (0x8 << 4);
+        let mut ext = flags.to_le_bytes().to_vec();
+        ext.extend_from_slice(&[0x01, 0x02, 0x03]);
+        ext.extend_from_slice(&0x5a21_6b33u32.to_le_bytes());
+        ext.push(0x80);
+        ext.extend_from_slice(&0x5a21_6b34u32.to_le_bytes());
+
+        let t = ext_times(&ext, 0x5a21_6b32);
+        let m = t[0].unwrap();
+        assert_eq!(m.dos, 0x5a21_6b32);
+        assert_eq!(m.refinement.nanoseconds, 0x03_0201 * 100);
+        let c = t[1].unwrap();
+        assert_eq!(c.dos, 0x5a21_6b33);
+        assert!(c.refinement.add_second);
+        assert_eq!(c.refinement.nanoseconds, (0x80 << 16) * 100);
+        let a = t[2].unwrap();
+        assert_eq!((a.dos, a.refinement.nanoseconds), (0x5a21_6b34, 0));
+        assert_eq!(t[3], None);
+    }
+
+    #[test]
+    fn ext_times_stops_at_a_short_field() {
+        let flags: u16 = (0x8 << 12) | (0x8 << 8);
+        let mut ext = flags.to_le_bytes().to_vec();
+        ext.extend_from_slice(&[1, 2]); // ctime's DOS value cut short
+        let t = ext_times(&ext, 7);
+        assert_eq!(t[0].map(|m| m.dos), Some(7));
+        assert_eq!(t[1], None);
+    }
+
     use super::*;
 
     fn test_write_main_header(out: &mut Vec<u8>, flags: u16) {
