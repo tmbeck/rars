@@ -274,6 +274,15 @@ impl FileHeader {
             attr: self.attributes,
             host_os: self.host_os,
             is_directory: self.is_directory(),
+            mtime: self
+                .mtime
+                .map(|seconds| crate::UnixTimestamp {
+                    seconds: i64::from(seconds),
+                    nanoseconds: 0,
+                })
+                .or(self.times.mtime),
+            ctime: self.times.ctime,
+            atime: self.times.atime,
         }
     }
 
@@ -366,6 +375,7 @@ impl FileHeader {
             htime_mtime: self.htime_mtime,
             htime_mtime_refinement: self.htime_mtime_refinement,
             file_times: self.file_times,
+            times: self.times,
             data_crc32: None,
             compression_info: self.compression_info,
             host_os: self.host_os,
@@ -1395,6 +1405,12 @@ impl<B: Budget> PendingSplitRefs<B> {
             attr: self.attr,
             host_os: self.host_os,
             is_directory: false,
+            mtime: self.file_time.map(|seconds| crate::UnixTimestamp {
+                seconds: i64::from(seconds),
+                nanoseconds: 0,
+            }),
+            ctime: None,
+            atime: None,
         };
         let mut writer = open(&meta)?;
         budget.run(&final_file.name, &mut writer, |mut writer| {
@@ -1979,6 +1995,7 @@ mod tests {
     };
     use super::*;
     use crate::{ArchiveVersion, FeatureSet};
+    use crate::rar50::FileTimes;
     use std::cell::RefCell;
     use std::io::Cursor;
     use std::rc::Rc;
@@ -2061,6 +2078,7 @@ mod tests {
             htime_mtime: None,
             htime_mtime_refinement: None,
             file_times: None,
+            times: FileTimes::default(),
             data_crc32: None,
             compression_info: 0,
             host_os: 2,
@@ -2605,6 +2623,7 @@ mod tests {
             htime_mtime: None,
             htime_mtime_refinement: None,
             file_times: None,
+            times: FileTimes::default(),
             data_crc32: None,
             compression_info: 0,
             host_os: 2,
@@ -2929,6 +2948,7 @@ mod tests {
                 htime_mtime: None,
                 htime_mtime_refinement: None,
                 file_times: None,
+            times: FileTimes::default(),
                 data_crc32: Some(crc),
                 compression_info: 0,
                 host_os: 2,
@@ -2976,6 +2996,7 @@ mod tests {
             htime_mtime: None,
             htime_mtime_refinement: None,
             file_times: None,
+            times: FileTimes::default(),
             data_crc32: None,
             compression_info: 0,
             host_os: 2,
