@@ -58,6 +58,7 @@ const FHEXTRA_CRYPT: u64 = 0x01;
 const FHEXTRA_HASH: u64 = 0x02;
 const FHEXTRA_HTIME: u64 = 0x03;
 const FHEXTRA_REDIR: u64 = 0x05;
+const FHEXTRA_UOWNER: u64 = 0x06;
 const FHEXTRA_SUBDATA: u64 = 0x07;
 const MHEXTRA_ARCHIVE_METADATA: u64 = 0x02;
 const MHEXTRA_ARCHIVE_METADATA_NAME: u64 = 0x0001;
@@ -194,6 +195,7 @@ pub struct FileHeader {
     /// on almost every real archive.
     pub htime_mtime: Option<u32>,
     pub times: FileTimes,
+    pub owner: Option<UnixOwner>,
     pub data_crc32: Option<u32>,
     pub compression_info: u64,
     pub host_os: u64,
@@ -311,6 +313,7 @@ pub struct ExtractedEntryMeta {
     pub mtime: Option<crate::UnixTimestamp>,
     pub ctime: Option<crate::UnixTimestamp>,
     pub atime: Option<crate::UnixTimestamp>,
+    pub owner: Option<UnixOwner>,
 }
 
 impl FileHeader {
@@ -1218,6 +1221,7 @@ fn parse_file_header_bytes(parsed: &ParsedBlockHeader) -> Result<FileHeader> {
         mtime,
         htime_mtime: None,
         times: FileTimes::default(),
+        owner: None,
         data_crc32,
         compression_info,
         host_os,
@@ -1266,6 +1270,9 @@ fn parse_file_extra_area(
             FHEXTRA_HTIME => {
                 file.htime_mtime = parse_htime_mtime(input, data.clone());
                 file.times = parse_htime(input, data).unwrap_or_default();
+            }
+            FHEXTRA_UOWNER => {
+                file.owner = parse_unix_owner(input, data);
             }
             FHEXTRA_SUBDATA => {
                 file.service_data = Some(input[data].to_vec());
@@ -1355,6 +1362,55 @@ fn parse_htime(input: &[u8], range: Range<usize>) -> Option<FileTimes> {
         ctime,
         atime,
     })
+}
+
+/// Unix owner from the `FHEXTRA_UOWNER` record.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct UnixOwner {
+    pub user: Option<Vec<u8>>,
+    pub group: Option<Vec<u8>>,
+    pub uid: Option<u64>,
+    pub gid: Option<u64>,
+}
+
+/// Reads an `FHEXTRA_UOWNER` record: flags (`0x1` user name, `0x2` group
+/// name, `0x4` uid, `0x8` gid), then each present field in that order --
+/// names as a vint length plus bytes, ids as vints. A malformed record
+/// yields `None` rather than failing the archive.
+fn parse_unix_owner(input: &[u8], range: Range<usize>) -> Option<UnixOwner> {
+    const USER_NAME: u64 = 0x1;
+    const GROUP_NAME: u64 = 0x2;
+    const USER_ID: u64 = 0x4;
+    const GROUP_ID: u64 = 0x8;
+
+    let end = range.end;
+    let (flags, flags_len) = read_vint_at(input, range.start, end).ok()?;
+    let mut at = range.start.checked_add(flags_len)?;
+    let mut owner = UnixOwner::default();
+    if flags & USER_NAME != 0 {
+        owner.user = Some(read_owner_name(input, &mut at, end)?);
+    }
+    if flags & GROUP_NAME != 0 {
+        owner.group = Some(read_owner_name(input, &mut at, end)?);
+    }
+    if flags & USER_ID != 0 {
+        let (id, len) = read_vint_at(input, at, end).ok()?;
+        at = at.checked_add(len)?;
+        owner.uid = Some(id);
+    }
+    if flags & GROUP_ID != 0 {
+        let (id, _) = read_vint_at(input, at, end).ok()?;
+        owner.gid = Some(id);
+    }
+    Some(owner)
+}
+
+fn read_owner_name(input: &[u8], at: &mut usize, end: usize) -> Option<Vec<u8>> {
+    let (len, len_len) = read_vint_at(input, *at, end).ok()?;
+    *at = at.checked_add(len_len)?;
+    let name = take_bytes(input, at, end, usize::try_from(len).ok()?)?;
+    Some(name.to_vec())
 }
 
 /// `n` bytes at `*at`, advancing it; `None` past `end`.
@@ -2133,6 +2189,35 @@ mod tests {
     use crate::UnixTimestamp;
 
     #[test]
+    fn parse_unix_owner_reads_names_and_ids() {
+        // flags 0x0f; "timb"; "staff"; uid 1000 (vint e8 07); gid 20.
+        let rec = [
+            0x0f, 4, b't', b'i', b'm', b'b', 5, b's', b't', b'a', b'f', b'f', 0xe8, 0x07, 20,
+        ];
+        let o = parse_unix_owner(&rec, 0..rec.len()).unwrap();
+        assert_eq!(o.user.as_deref(), Some(&b"timb"[..]));
+        assert_eq!(o.group.as_deref(), Some(&b"staff"[..]));
+        assert_eq!(o.uid, Some(1000));
+        assert_eq!(o.gid, Some(20));
+    }
+
+    #[test]
+    fn parse_unix_owner_reads_ids_alone() {
+        let rec = [0x0c, 0, 0];
+        let o = parse_unix_owner(&rec, 0..rec.len()).unwrap();
+        assert_eq!(
+            (o.user, o.group, o.uid, o.gid),
+            (None, None, Some(0), Some(0))
+        );
+    }
+
+    #[test]
+    fn parse_unix_owner_rejects_a_name_past_the_record() {
+        let rec = [0x01, 9, b'x'];
+        assert_eq!(parse_unix_owner(&rec, 0..rec.len()), None);
+    }
+
+    #[test]
     fn read_vint_at_honors_logical_end_before_decoding() {
         assert_eq!(read_vint_at(&[0x01], 0, 0), Err(Error::TooShort));
         assert_eq!(read_vint_at(&[0x81, 0x01], 0, 1), Err(Error::TooShort));
@@ -2193,6 +2278,7 @@ mod tests {
             mtime: None,
             htime_mtime: None,
             times: FileTimes::default(),
+            owner: None,
             data_crc32: None,
             compression_info: 0,
             host_os: 0,

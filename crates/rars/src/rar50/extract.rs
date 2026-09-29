@@ -205,6 +205,7 @@ impl FileHeader {
                 .or(self.times.mtime),
             ctime: self.times.ctime,
             atime: self.times.atime,
+            owner: self.owner.clone(),
         }
     }
 
@@ -1288,6 +1289,7 @@ mod tests {
             mtime: None,
             htime_mtime: None,
             times: crate::rar50::FileTimes::default(),
+            owner: None,
             data_crc32: None,
             compression_info: 0,
             host_os: 2,
@@ -1507,6 +1509,7 @@ mod tests {
             mtime: None,
             htime_mtime: None,
             times: crate::rar50::FileTimes::default(),
+            owner: None,
             data_crc32: None,
             compression_info: 0,
             host_os: 2,
@@ -1767,6 +1770,7 @@ mod tests {
                 mtime: None,
                 htime_mtime: None,
                 times: crate::rar50::FileTimes::default(),
+                owner: None,
                 data_crc32: Some(crc),
                 compression_info: 0,
                 host_os: 2,
@@ -1812,6 +1816,7 @@ mod tests {
             mtime: None,
             htime_mtime: None,
             times: crate::rar50::FileTimes::default(),
+            owner: None,
             data_crc32: None,
             compression_info: 0,
             host_os: 2,
