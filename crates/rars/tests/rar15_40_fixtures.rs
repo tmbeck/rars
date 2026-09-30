@@ -7247,3 +7247,39 @@ fn volume_meta_carries_the_whole_member_crc32_and_size() {
         (0x96de_2bef, 4096)
     );
 }
+
+/// A writer's error comes back as itself, not as "output write failed".
+#[test]
+fn a_writer_error_reaches_the_caller_intact() {
+    struct Refuse;
+    impl std::io::Write for Refuse {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("the sink said no"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    for version in [
+        ArchiveVersion::Rar15,
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+    ] {
+        let mut b = rars::Builder::new(version).compression_level(Some(1));
+        b.add_bytes(
+            b"f".to_vec(),
+            b"hello hello hello hello".repeat(100),
+            None,
+            None,
+        )
+        .unwrap();
+        let archive = Archive::parse(&b.to_bytes().unwrap()).unwrap();
+        let err = archive
+            .extract_to(ArchiveReadOptions::default(), |_| Ok(Box::new(Refuse)))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("the sink said no"),
+            "{version:?}: {err}"
+        );
+    }
+}

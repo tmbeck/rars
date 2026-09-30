@@ -1689,8 +1689,7 @@ impl Unpack20 {
         out: &mut impl Write,
     ) -> Result<()> {
         let decoded = self.decode_member(input, output_size)?;
-        out.write_all(&decoded)
-            .map_err(|_| Error::InvalidData("RAR 2.0 output write failed"))
+        out.write_all(&decoded).map_err(|e| Error::Io(e.into()))
     }
 
     pub fn decode_member_from_reader(
@@ -1707,7 +1706,7 @@ impl Unpack20 {
         let mut packed = Vec::new();
         input
             .read_to_end(&mut packed)
-            .map_err(|_| Error::InvalidData("RAR 2.0 input read failed"))?;
+            .map_err(|e| Error::Io(e.into()))?;
         self.bits.append(&packed);
         if !self.in_block && self.bits.remaining_bytes_from_current() > 0 {
             self.read_tables().map_err(|error| match error {
@@ -1723,8 +1722,7 @@ impl Unpack20 {
         self.read_last_tables()?;
 
         let decoded = self.raw_range(start, target)?;
-        out.write_all(decoded)
-            .map_err(|_| Error::InvalidData("RAR 2.0 output write failed"))?;
+        out.write_all(decoded).map_err(|e| Error::Io(e.into()))?;
         self.trim_history(target, target);
         Ok(())
     }
@@ -2902,6 +2900,6 @@ mod tests {
         let err = decoder
             .decode_member_to(&packed, input.len(), &mut FailingWriter)
             .unwrap_err();
-        assert_eq!(err, Error::InvalidData("RAR 2.0 output write failed"));
+        assert!(matches!(err, Error::Io(_)), "{err}");
     }
 }

@@ -2406,8 +2406,7 @@ impl Unpack29 {
             }
 
             let decoded = self.filtered_range(flushed, safe_end, start)?;
-            out.write_all(&decoded)
-                .map_err(|_| Error::InvalidData("RAR 2.9 output write failed"))?;
+            out.write_all(&decoded).map_err(|e| Error::Io(e.into()))?;
             flushed = safe_end;
             self.trim_history(flushed, self.current_pos());
             target = self
@@ -2435,7 +2434,7 @@ impl Unpack29 {
         let mut packed = Vec::new();
         input
             .read_to_end(&mut packed)
-            .map_err(|_| Error::InvalidData("RAR 2.9 input read failed"))?;
+            .map_err(|e| Error::Io(e.into()))?;
         self.bits.append(&packed);
         // Empty members in solid mode still carry their own block init bytes
         // (typically the (esc, 0) end-of-block marker + 4-byte range coder
@@ -2471,8 +2470,7 @@ impl Unpack29 {
             }
 
             let decoded = self.filtered_range(flushed, safe_end, start)?;
-            out.write_all(&decoded)
-                .map_err(|_| Error::InvalidData("RAR 2.9 output write failed"))?;
+            out.write_all(&decoded).map_err(|e| Error::Io(e.into()))?;
             flushed = safe_end;
             self.trim_history(flushed, self.current_pos());
             target = self

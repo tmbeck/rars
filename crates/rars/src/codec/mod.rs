@@ -19,6 +19,8 @@ pub enum Error {
     InvalidData(&'static str),
     NeedMoreInput,
     Cancelled,
+    /// The caller's reader or writer failed; its error, unchanged.
+    Io(crate::error::IoError),
 }
 
 impl std::fmt::Display for Error {
@@ -27,6 +29,7 @@ impl std::fmt::Display for Error {
             Self::InvalidData(msg) => write!(f, "{msg}"),
             Self::NeedMoreInput => write!(f, "codec input is truncated"),
             Self::Cancelled => f.write_str("codec operation was cancelled"),
+            Self::Io(e) => write!(f, "I/O error: {}", e.message),
         }
     }
 }

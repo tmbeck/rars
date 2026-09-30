@@ -209,11 +209,17 @@ impl From<std::io::Error> for Error {
             Ok(inner) => return inner,
             Err(error) => error,
         };
-        Self::Io(IoError {
+        Self::Io(error.into())
+    }
+}
+
+impl From<std::io::Error> for IoError {
+    fn from(error: std::io::Error) -> Self {
+        Self {
             kind: error.kind(),
             message: error.to_string(),
             source: Arc::new(error),
-        })
+        }
     }
 }
 
@@ -254,7 +260,18 @@ impl Error {
 
 impl From<crate::codec::Error> for Error {
     fn from(error: crate::codec::Error) -> Self {
-        Self::Codec(error)
+        match error {
+            // A reader inside the decoder may have wrapped a rars error (a
+            // checksum mismatch in a volume, say) in its io::Error: unwrap it,
+            // as `From<io::Error>` does.
+            crate::codec::Error::Io(e) => e
+                .source
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<Self>())
+                .cloned()
+                .unwrap_or(Self::Io(e)),
+            other => Self::Codec(other),
+        }
     }
 }
 

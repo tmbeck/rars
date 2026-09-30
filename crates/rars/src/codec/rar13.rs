@@ -1681,7 +1681,7 @@ impl Unpack15 {
         let mut packed = Vec::new();
         input
             .read_to_end(&mut packed)
-            .map_err(|_| Error::InvalidData("RAR 1.3 input read failed"))?;
+            .map_err(|e| Error::Io(e.into()))?;
         self.bits.append(&packed);
         self.bits.finish();
 
@@ -1696,8 +1696,7 @@ impl Unpack15 {
                     Error::NeedMoreInput => Error::InvalidData("RAR 1.3 bitstream is truncated"),
                     error => error,
                 })?;
-            out.write_all(&chunk)
-                .map_err(|_| Error::InvalidData("RAR 1.3 output write failed"))?;
+            out.write_all(&chunk).map_err(|e| Error::Io(e.into()))?;
         }
         Ok(())
     }
@@ -2189,8 +2188,7 @@ impl Unpack15 {
         }
         self.window[self.unp_ptr] = byte;
         self.unp_ptr = (self.unp_ptr + 1) & 0xffff;
-        out.write_all(&[byte])
-            .map_err(|_| Error::InvalidData("RAR 1.3 output write failed"))?;
+        out.write_all(&[byte]).map_err(|e| Error::Io(e.into()))?;
         self.output_written += 1;
         Ok(())
     }
