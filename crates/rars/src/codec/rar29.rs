@@ -26,6 +26,9 @@ const MAX_VM_FILTER_BLOCK_SIZE: usize = 128 * 1024;
 // decoders.
 pub(crate) const MAX_VM_DELTA_FILTER_BLOCK_SIZE: usize = 120_000;
 const MAX_VM_AUDIO_FILTER_BLOCK_SIZE: usize = 120_000;
+/// Generic RARVM instructions one member may run across all its filters:
+/// about 16 times what the whole test suite runs. WinRAR writes no generic programs.
+const VM_MEMBER_BUDGET: usize = 4 * rarvm::MAX_INSTRUCTIONS;
 const MAX_VM_GLOBAL_DATA: usize = 0x2000;
 const MAX_VM_CODE_SIZE: usize = 64 * 1024;
 const MAX_VM_PROGRAMS: usize = 8192;
@@ -2249,6 +2252,9 @@ pub struct Unpack29 {
     /// Set when a block claimed the member was over and the member was not.
     member_ended_early: bool,
     last_block_end: Option<LzBlockEnd>,
+    /// Generic RARVM instructions the current member may still run, shared by
+    /// all its filters.
+    vm_budget: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2324,6 +2330,7 @@ impl Unpack29 {
             stale_terminator: false,
             member_ended_early: false,
             last_block_end: None,
+            vm_budget: VM_MEMBER_BUDGET,
         }
     }
 
@@ -2357,6 +2364,7 @@ impl Unpack29 {
     }
 
     pub fn decode_member(&mut self, input: &[u8], output_size: usize) -> Result<Vec<u8>> {
+        self.vm_budget = VM_MEMBER_BUDGET;
         let start = self.current_pos();
         let target = start
             .checked_add(output_size)
@@ -2381,6 +2389,7 @@ impl Unpack29 {
         output_size: usize,
         out: &mut impl Write,
     ) -> Result<()> {
+        self.vm_budget = VM_MEMBER_BUDGET;
         let start = self.current_pos();
         let final_target = start
             .checked_add(output_size)
@@ -2429,6 +2438,7 @@ impl Unpack29 {
         out: &mut impl Write,
     ) -> Result<()> {
         self.bits = BitReader::new();
+        self.vm_budget = VM_MEMBER_BUDGET;
         let start = self.current_pos();
         let final_target = start
             .checked_add(output_size)
@@ -3045,13 +3055,16 @@ impl Unpack29 {
                     } else {
                         global_data.as_slice()
                     };
-                    let result = generic.execute(rarvm::Invocation {
-                        input: &block,
-                        regs,
-                        global_data: globals,
-                        file_offset: file_offset as u64,
-                        exec_count: program.exec_count,
-                    })?;
+                    let result = generic.execute_with_budget(
+                        rarvm::Invocation {
+                            input: &block,
+                            regs,
+                            global_data: globals,
+                            file_offset: file_offset as u64,
+                            exec_count: program.exec_count,
+                        },
+                        &mut self.vm_budget,
+                    )?;
                     program.globals = result.globals;
                     block = result.output;
                 }
@@ -5192,6 +5205,81 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         let filtered = decoder.filtered_range(0, 3, 0).unwrap();
 
         assert_eq!(filtered, [0x44, 0x22, 0x33]);
+    }
+
+    /// `mov r0, loops; dec r0; jnz 1`: 1 + 2 × `loops` instructions a run.
+    fn counting_program(loops: u32) -> VmProgram {
+        let op = |opcode, operands| Instruction {
+            opcode,
+            byte_mode: false,
+            operands,
+        };
+        VmProgram {
+            kind: VmProgramKind::Generic(Program {
+                static_data: Vec::new(),
+                instructions: vec![
+                    op(
+                        Opcode::Mov,
+                        vec![Operand::Register(0), Operand::Immediate(loops)],
+                    ),
+                    op(Opcode::Dec, vec![Operand::Register(0)]),
+                    op(Opcode::Jnz, vec![Operand::Immediate(1)]),
+                ],
+            }),
+            block_size: 4,
+            exec_count: 0,
+            globals: Vec::new(),
+        }
+    }
+
+    fn eight_runs(decoder: &mut Unpack29) {
+        decoder.output.extend_from_slice(&[0; 64]);
+        decoder.programs.push(counting_program(100));
+        for i in 0..8 {
+            decoder.filters.push(VmFilter {
+                program: 0,
+                start: i * 4,
+                size: 4,
+                regs: [0; 7],
+                global_data: Vec::new(),
+            });
+        }
+    }
+
+    #[test]
+    fn generic_vm_filters_share_one_budget_per_member() {
+        // Each run is 201 instructions, well inside a 1000-instruction
+        // budget on its own; eight runs (1608) are not.
+        let mut decoder = Unpack29::new();
+        eight_runs(&mut decoder);
+        decoder.vm_budget = 1000;
+        assert_eq!(
+            decoder.filtered_range(0, 32, 0),
+            Err(Error::InvalidData(
+                "RAR 2.9 VM instruction budget exhausted"
+            ))
+        );
+        // The default budget runs the same member.
+        let mut decoder = Unpack29::new();
+        eight_runs(&mut decoder);
+        assert!(decoder.filtered_range(0, 32, 0).is_ok());
+    }
+
+    #[test]
+    fn vm_budget_resets_at_each_member_start() {
+        // A solid chain reuses one decoder: member N+1 starts with a full budget.
+        let mut decoder = Unpack29::new();
+        decoder.vm_budget = 0;
+        decoder.decode_member(&[], 0).ok();
+        assert_eq!(decoder.vm_budget, super::VM_MEMBER_BUDGET);
+        decoder.vm_budget = 0;
+        decoder.decode_member_to(&[], 0, &mut Vec::new()).ok();
+        assert_eq!(decoder.vm_budget, super::VM_MEMBER_BUDGET);
+        decoder.vm_budget = 0;
+        decoder
+            .decode_member_from_reader(&mut std::io::empty(), 0, &mut Vec::new())
+            .ok();
+        assert_eq!(decoder.vm_budget, super::VM_MEMBER_BUDGET);
     }
 
     #[test]

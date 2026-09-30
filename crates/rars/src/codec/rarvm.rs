@@ -6,7 +6,7 @@ const GLOBAL_BASE: usize = 0x3c000;
 const SYSTEM_GLOBAL_SIZE: usize = 64;
 const MAX_USER_GLOBAL: usize = 0x2000 - SYSTEM_GLOBAL_SIZE;
 const MAX_STATIC_DATA: usize = MEMORY_SIZE - GLOBAL_BASE;
-const MAX_INSTRUCTIONS: usize = 25_000_000;
+pub(super) const MAX_INSTRUCTIONS: usize = 25_000_000;
 const FLAG_C: u32 = 1;
 const FLAG_Z: u32 = 2;
 const FLAG_S: u32 = 0x8000_0000;
@@ -146,8 +146,18 @@ impl Program {
     }
 
     pub fn execute(&self, invocation: Invocation<'_>) -> Result<ExecutionResult> {
+        self.execute_with_budget(invocation, &mut { MAX_INSTRUCTIONS })
+    }
+
+    /// Runs at most `min(MAX_INSTRUCTIONS, *budget)` instructions and
+    /// subtracts what ran, so a caller can share one budget across programs.
+    pub fn execute_with_budget(
+        &self,
+        invocation: Invocation<'_>,
+        budget: &mut usize,
+    ) -> Result<ExecutionResult> {
         let mut vm = Vm::new(self, invocation)?;
-        vm.run(self)
+        vm.run(self, budget)
     }
 }
 
@@ -407,10 +417,13 @@ impl Vm {
         })
     }
 
-    fn run(&mut self, program: &Program) -> Result<ExecutionResult> {
+    fn run(&mut self, program: &Program, budget: &mut usize) -> Result<ExecutionResult> {
         let mut ip = 0usize;
         let mut terminated = false;
-        for _ in 0..MAX_INSTRUCTIONS {
+        let limit = MAX_INSTRUCTIONS.min(*budget);
+        let mut ran = 0usize;
+        for _ in 0..limit {
+            ran += 1;
             let Some(instruction) = program.instructions.get(ip) else {
                 terminated = true;
                 break;
@@ -428,7 +441,13 @@ impl Vm {
                 break;
             }
         }
+        *budget -= ran;
         if !terminated {
+            if *budget == 0 {
+                return Err(Error::InvalidData(
+                    "RAR 2.9 VM instruction budget exhausted",
+                ));
+            }
             return Err(Error::InvalidData("RARVM instruction limit exceeded"));
         }
 
