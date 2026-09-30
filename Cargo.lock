@@ -665,6 +665,7 @@ dependencies = [
  "criterion",
  "getrandom",
  "hmac",
+ "rars-test-alloc",
  "rayon",
  "sha1",
  "sha2",
@@ -692,6 +693,10 @@ dependencies = [
  "pyo3",
  "rars",
 ]
+
+[[package]]
+name = "rars-test-alloc"
+version = "0.0.0"
 
 [[package]]
 name = "rars-wasm"

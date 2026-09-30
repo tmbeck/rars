@@ -41,6 +41,7 @@ getrandom = { workspace = true, features = ["wasm_js"] }
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+rars-test-alloc = { path = "../rars-test-alloc" }
 
 [[bench]]
 name = "chunk_sizes"

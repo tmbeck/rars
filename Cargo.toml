@@ -5,6 +5,8 @@ members = [
     "crates/rars-python",
     "crates/rars-wasm",
 ]
+# Test-only, with its own [workspace] (see its Cargo.toml).
+exclude = ["crates/rars-test-alloc"]
 resolver = "2"
 
 [workspace.package]

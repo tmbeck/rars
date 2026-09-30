@@ -1,0 +1,14 @@
+[package]
+name = "rars-test-alloc"
+version = "0.0.0"
+description = "Test-only global allocator that records live, peak and total heap bytes."
+edition = "2021"
+rust-version = "1.87"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Its own workspace, like fuzz/: a GlobalAlloc needs `unsafe`, which the rars
+# workspace forbids, and release.yml's verify-tag job requires every workspace
+# package to carry the release version. rars reaches it as a path
+# dev-dependency, which `cargo publish` drops.
+[workspace]
