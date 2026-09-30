@@ -10,6 +10,13 @@ const AUDIO_COUNT: usize = 257;
 const MAX_CHANNELS: usize = 4;
 const OLD_LEVEL_COUNT: usize = AUDIO_COUNT * MAX_CHANNELS;
 const MAX_HISTORY: usize = 1024 * 1024;
+const STREAM_CHUNK: usize = 1024 * 1024;
+/// Packed bytes kept ahead of the decoder when it reads from a `Read`: far
+/// more than the largest single decode step (a four-channel audio table,
+/// under 2 KiB).
+const REFILL_MARGIN: usize = 256 * 1024;
+/// Most packed bytes read in one top-up.
+const REFILL_CHUNK: usize = 1024 * 1024;
 
 const LENGTH_BASES: [usize; LENGTH_COUNT] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128,
@@ -1672,11 +1679,10 @@ impl Unpack20 {
             self.bits = BitReader::new();
         }
         self.bits.append(input);
-        self.decode_until(target).map_err(|error| match error {
-            Error::NeedMoreInput => Error::InvalidData("RAR 2.0 bitstream is truncated"),
-            error => error,
-        })?;
-        self.read_last_tables()?;
+        let mut refill = Refill::slice();
+        self.decode_until(target, &mut refill)
+            .map_err(|error| refill.truncation(error))?;
+        self.read_last_tables(&mut refill)?;
         let out = self.raw_range(start, target)?.to_vec();
         self.trim_history(target, target);
         Ok(out)
@@ -1703,41 +1709,44 @@ impl Unpack20 {
             .checked_add(output_size)
             .ok_or(Error::InvalidData("RAR 2.0 output size overflows"))?;
         self.bits = BitReader::new();
-        let mut packed = Vec::new();
-        input
-            .read_to_end(&mut packed)
-            .map_err(|e| Error::Io(e.into()))?;
-        self.bits.append(&packed);
+        let mut refill = Refill {
+            input: Some(input),
+            eof: false,
+        };
+        refill.top_up(&mut self.bits)?;
         if !self.in_block && self.bits.remaining_bytes_from_current() > 0 {
-            self.read_tables().map_err(|error| match error {
-                Error::NeedMoreInput => Error::InvalidData("RAR 2.0 bitstream is truncated"),
-                error => error,
-            })?;
+            self.read_tables()
+                .map_err(|error| refill.truncation(error))?;
             self.in_block = true;
         }
-        self.decode_until(target).map_err(|error| match error {
-            Error::NeedMoreInput => Error::InvalidData("RAR 2.0 bitstream is truncated"),
-            error => error,
-        })?;
-        self.read_last_tables()?;
 
-        let decoded = self.raw_range(start, target)?;
-        out.write_all(decoded).map_err(|e| Error::Io(e.into()))?;
-        self.trim_history(target, target);
-        Ok(())
+        // Output leaves in windows, and only `MAX_HISTORY` of it is kept.
+        let mut flushed = start;
+        while flushed < target {
+            let window_end = flushed.saturating_add(STREAM_CHUNK).min(target);
+            self.decode_until(window_end, &mut refill)
+                .map_err(|error| refill.truncation(error))?;
+            out.write_all(self.raw_range(flushed, window_end)?)
+                .map_err(|e| Error::Io(e.into()))?;
+            flushed = window_end;
+            self.trim_history(flushed, flushed);
+        }
+        self.read_last_tables(&mut refill)
+            .map_err(|error| refill.truncation(error))
     }
 
-    fn decode_until(&mut self, target: usize) -> Result<()> {
+    fn decode_until(&mut self, target: usize, refill: &mut Refill<'_>) -> Result<()> {
         while self.current_pos() < target {
             self.drain_pending_match(target)?;
             if self.current_pos() >= target {
                 break;
             }
             if !self.in_block {
+                refill.top_up(&mut self.bits)?;
                 self.read_tables()?;
                 self.in_block = true;
             }
-            self.decode_lz(target)?;
+            self.decode_lz(target, refill)?;
         }
         Ok(())
     }
@@ -1818,8 +1827,10 @@ impl Unpack20 {
         Ok(lengths)
     }
 
-    fn decode_lz(&mut self, output_size: usize) -> Result<()> {
+    fn decode_lz(&mut self, output_size: usize, refill: &mut Refill<'_>) -> Result<()> {
         while self.current_pos() < output_size {
+            // One symbol with its extra bits: well inside the margin.
+            refill.top_up(&mut self.bits)?;
             if self.audio_block {
                 self.decode_audio_byte()?;
                 if !self.in_block {
@@ -2029,7 +2040,10 @@ impl Unpack20 {
         self.copy_match(length, offset, output_size)
     }
 
-    fn read_last_tables(&mut self) -> Result<()> {
+    fn read_last_tables(&mut self, refill: &mut Refill<'_>) -> Result<()> {
+        refill.top_up(&mut self.bits)?;
+        // Sees only buffered bytes: all of them at EOF, at least the refill
+        // margin before it.
         if self.bits.remaining_bytes_from_current() < 5 {
             return Ok(());
         }
@@ -2231,6 +2245,62 @@ fn validate_huffman_counts(count: &[u16; 16]) -> Result<()> {
     Ok(())
 }
 
+/// Feeds packed input to the bit reader as it is decoded. The bit buffer is
+/// topped up before every decode step, so a step never runs out while input
+/// remains, and a half-read symbol is never resumed.
+struct Refill<'r> {
+    input: Option<&'r mut dyn Read>,
+    eof: bool,
+}
+
+impl Refill<'_> {
+    /// For a member whose whole packed data is already in the bit reader.
+    fn slice() -> Self {
+        Self {
+            input: None,
+            eof: true,
+        }
+    }
+
+    fn top_up(&mut self, bits: &mut BitReader) -> Result<()> {
+        if self.eof || bits.remaining_bytes_from_current() >= REFILL_MARGIN {
+            return Ok(());
+        }
+        let Some(input) = self.input.as_mut() else {
+            return Ok(());
+        };
+        bits.compact();
+        // Allocated once: after `compact` fewer than `REFILL_MARGIN` bytes
+        // remain, so a chunk always fits and the buffer never reallocates.
+        bits.input
+            .reserve_exact((REFILL_MARGIN + REFILL_CHUNK).saturating_sub(bits.input.len()));
+        // `read_to_end` over `take` loops over short reads (one byte at a
+        // time, if that is what the reader gives) and stops at the chunk or
+        // at end of input.
+        let read = input
+            .by_ref()
+            .take(REFILL_CHUNK as u64)
+            .read_to_end(&mut bits.input)
+            .map_err(|e| Error::Io(e.into()))?;
+        if read < REFILL_CHUNK {
+            self.eof = true;
+        }
+        Ok(())
+    }
+
+    /// Running out of input is truncation at the end of the input, and a
+    /// refill-margin bug before it.
+    fn truncation(&self, error: Error) -> Error {
+        match error {
+            Error::NeedMoreInput if self.eof => {
+                Error::InvalidData("RAR 2.0 bitstream is truncated")
+            }
+            Error::NeedMoreInput => Error::InvalidData("RAR 2.0 refill margin exceeded"),
+            error => error,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct BitReader {
     input: Vec<u8>,
@@ -2412,6 +2482,27 @@ mod tests {
             .unwrap();
 
         assert_eq!(output, expected_text());
+    }
+
+    /// The refill logic's regression guard: one-byte reads make every top-up
+    /// cross every boundary.
+    #[test]
+    fn one_byte_reads_decode_a_member() {
+        let data = crate::codec::refill_test_bytes(3 << 20);
+        let packed = super::unpack20_encode_auto(&data).unwrap();
+        assert!(
+            packed.len() > 2 * (super::REFILL_MARGIN + super::REFILL_CHUNK),
+            "packed input spans several refills and compactions"
+        );
+        let mut out = Vec::new();
+        super::Unpack20::new()
+            .decode_member_from_reader(
+                &mut crate::codec::OneByteReader(&packed),
+                data.len(),
+                &mut out,
+            )
+            .unwrap();
+        assert_eq!(out, data);
     }
 
     #[test]

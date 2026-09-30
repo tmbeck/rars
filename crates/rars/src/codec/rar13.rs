@@ -41,6 +41,11 @@ impl Rar13MatchFinder {
     }
 }
 
+/// Packed bytes kept ahead of the decoder when it reads from a `Read`: far
+/// more than one decode step, which reads a few 16-bit fields.
+const REFILL_MARGIN: usize = 256 * 1024;
+/// Most packed bytes read in one top-up.
+const REFILL_CHUNK: usize = 1024 * 1024;
 const MAX_LONG_MATCH_CANDIDATES: usize = 64;
 const MAX_LONG_LZ_DISTANCE: usize = 0x7fff;
 
@@ -1678,12 +1683,7 @@ impl Unpack15 {
 
         self.init_member(target, solid);
         self.bits = BitReader::new(&[]);
-        let mut packed = Vec::new();
-        input
-            .read_to_end(&mut packed)
-            .map_err(|e| Error::Io(e.into()))?;
-        self.bits.append(&packed);
-        self.bits.finish();
+        let mut refill = Refill { input, eof: false };
 
         while self.output_written < self.target {
             let chunk_target = self
@@ -1691,11 +1691,12 @@ impl Unpack15 {
                 .saturating_add(OUTPUT_CHUNK)
                 .min(self.target);
             let mut chunk = Vec::with_capacity(chunk_target - self.output_written);
-            self.decode_loop_until(chunk_target, &mut chunk)
-                .map_err(|error| match error {
-                    Error::NeedMoreInput => Error::InvalidData("RAR 1.3 bitstream is truncated"),
-                    error => error,
-                })?;
+            while self.output_written < chunk_target {
+                // One step reads a few 16-bit fields: well inside the margin.
+                refill.top_up(&mut self.bits)?;
+                self.decode_step(&mut chunk)
+                    .map_err(|error| refill.truncation(error))?;
+            }
             out.write_all(&chunk).map_err(|e| Error::Io(e.into()))?;
         }
         Ok(())
@@ -2260,6 +2261,28 @@ mod tests {
         Unpack15Encoder, DEC_HF0, DEC_HF1, DEC_HF2, DEC_HF3, DEC_HF4, DEC_L1, DEC_L2, POS_HF0,
         POS_HF1, POS_HF2, POS_HF3, POS_HF4, POS_L1, POS_L2,
     };
+
+    /// The refill logic's regression guard: one-byte reads make every top-up
+    /// cross every boundary.
+    #[test]
+    fn one_byte_reads_decode_a_member() {
+        let data = crate::codec::refill_test_bytes(3 << 20);
+        let packed = super::unpack15_encode(&data).unwrap();
+        assert!(
+            packed.len() > 2 * (super::REFILL_MARGIN + super::REFILL_CHUNK),
+            "packed input spans several refills and compactions"
+        );
+        let mut out = Vec::new();
+        super::Unpack15::default()
+            .decode_member_from_reader(
+                &mut crate::codec::OneByteReader(&packed),
+                data.len(),
+                false,
+                &mut out,
+            )
+            .unwrap();
+        assert_eq!(out, data);
+    }
 
     fn decode_num_prefix_is_stable(
         code: u32,
@@ -2977,6 +3000,52 @@ mod tests {
     }
 }
 
+/// Feeds packed input to the bit reader as it is decoded. The bit buffer is
+/// topped up before every decode step, so a step never runs out while input
+/// remains, and a half-read symbol is never resumed. The bit reader reads
+/// zeros past the end only once the end of the input is reached.
+struct Refill<'r> {
+    input: &'r mut dyn Read,
+    eof: bool,
+}
+
+impl Refill<'_> {
+    fn top_up(&mut self, bits: &mut BitReader) -> Result<()> {
+        if self.eof || bits.input.len().saturating_sub(bits.bit_pos / 8) >= REFILL_MARGIN {
+            return Ok(());
+        }
+        bits.compact();
+        // Allocated once: after `compact` fewer than `REFILL_MARGIN` bytes
+        // remain, so a chunk always fits and the buffer never reallocates.
+        bits.input
+            .reserve_exact((REFILL_MARGIN + REFILL_CHUNK).saturating_sub(bits.input.len()));
+        // `read_to_end` over `take` loops over short reads (one byte at a
+        // time, if that is what the reader gives) and stops at the chunk or
+        // at end of input.
+        let read = (&mut self.input)
+            .take(REFILL_CHUNK as u64)
+            .read_to_end(&mut bits.input)
+            .map_err(|e| Error::Io(e.into()))?;
+        if read < REFILL_CHUNK {
+            self.eof = true;
+            bits.finish();
+        }
+        Ok(())
+    }
+
+    /// Running out of input is truncation at the end of the input, and a
+    /// refill-margin bug before it.
+    fn truncation(&self, error: Error) -> Error {
+        match error {
+            Error::NeedMoreInput if self.eof => {
+                Error::InvalidData("RAR 1.3 bitstream is truncated")
+            }
+            Error::NeedMoreInput => Error::InvalidData("RAR 1.3 refill margin exceeded"),
+            error => error,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct BitReader {
     input: Vec<u8>,
@@ -3001,17 +3070,13 @@ impl BitReader {
         }
     }
 
-    fn append(&mut self, input: &[u8]) {
-        self.compact();
-        self.input.extend_from_slice(input);
-    }
-
     fn finish(&mut self) {
         self.final_input = true;
     }
 
     fn compact(&mut self) {
-        let bytes = self.bit_pos / 8;
+        // Reads run past the end only after `finish`, but never panic here.
+        let bytes = (self.bit_pos / 8).min(self.input.len());
         if bytes == 0 {
             return;
         }

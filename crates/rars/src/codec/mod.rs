@@ -53,8 +53,9 @@ impl std::io::Read for OneByteReader<'_> {
     }
 }
 
-/// Text-like bytes (4 bits of entropy) with `0xE8` opcodes sprinkled in, so
-/// packed members are large and an E8 filter has work to do.
+/// Pseudo-random bytes with `0xE8` opcodes sprinkled in: they barely pack,
+/// so a few MiB of them span several refills, and an E8 filter has work to
+/// do.
 #[cfg(test)]
 pub(crate) fn refill_test_bytes(n: usize) -> Vec<u8> {
     let mut x = 0x2545_f491_4f6c_dd1du64;
@@ -66,7 +67,7 @@ pub(crate) fn refill_test_bytes(n: usize) -> Vec<u8> {
             if x.is_multiple_of(9) {
                 0xe8
             } else {
-                b"ACGTacgtNnRrYyKk"[(x >> 60) as usize]
+                (x >> 56) as u8
             }
         })
         .collect()

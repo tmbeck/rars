@@ -5033,7 +5033,7 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
     /// cross every boundary, in the LZ, VM-filter and PPMd paths.
     #[test]
     fn one_byte_reads_decode_lz_and_ppmd_members_with_filters() {
-        let data = crate::codec::refill_test_bytes(768 * 1024);
+        let data = crate::codec::refill_test_bytes(3 << 20);
         let e8 = crate::FilterSpec::whole(crate::FilterKind::E8);
         for packed in [
             super::Unpack29Encoder::new()
@@ -5042,8 +5042,8 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             super::unpack29_encode_ppmd_with_filter(&data, e8, 4 << 20).unwrap(),
         ] {
             assert!(
-                packed.len() > 300 * 1024,
-                "packed input spans several refills"
+                packed.len() > 2 * (super::REFILL_MARGIN + super::REFILL_CHUNK),
+                "packed input spans several refills and compactions"
             );
             let mut out = Vec::new();
             Unpack29::new()

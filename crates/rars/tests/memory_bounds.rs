@@ -344,3 +344,30 @@ fn rar29_split_member_reads_input_incrementally() {
     assert_eq!(n, 32 * MIB as u64);
     check("rar29 32 MiB over volumes", u, 12 * MIB);
 }
+
+/// F2: RAR 2.0 read the whole packed member and held the whole member's
+/// output before writing it.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release only")]
+fn rar20_member_streams() {
+    let _g = serial();
+    let a = open_all(&cached("rar20-32m-v1", || {
+        legacy(rars::ArchiveVersion::Rar20, 32 * MIB, None)
+    }));
+    let (n, u) = measure(|| extract_all(&a, default_opts()).unwrap());
+    assert_eq!(n, 32 * MIB as u64);
+    check("rar20 32 MiB", u, 8 * MIB);
+}
+
+/// F2: RAR 1.5 read the whole packed member into memory.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release only")]
+fn rar15_member_reads_input_incrementally() {
+    let _g = serial();
+    let a = open_all(&cached("rar15-32m-v1", || {
+        legacy(rars::ArchiveVersion::Rar15, 32 * MIB, None)
+    }));
+    let (n, u) = measure(|| extract_all(&a, default_opts()).unwrap());
+    assert_eq!(n, 32 * MIB as u64);
+    check("rar15 32 MiB", u, 8 * MIB);
+}
