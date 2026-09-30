@@ -6117,3 +6117,70 @@ fn streaming_filters_match_the_input() {
         assert_eq!(got[0].data, data, "{kind:?}");
     }
 }
+
+fn vint_at(b: &[u8], at: &mut usize) -> u64 {
+    let (mut v, mut shift) = (0u64, 0);
+    loop {
+        let c = b[*at];
+        *at += 1;
+        v |= u64::from(c & 0x7f) << shift;
+        shift += 7;
+        if c & 0x80 == 0 {
+            return v;
+        }
+    }
+}
+
+/// Set FHFL_UNPUNKNOWN (0x0008) on the first file header, as `rar -si`
+/// writes it, and overwrite the (now meaningless) size field with 1 in
+/// place, so decoding to it would fail. Fixes the header CRC32.
+fn mark_size_unknown(bytes: &mut [u8]) {
+    let archive = Archive::parse(bytes).unwrap();
+    let file = archive.files().next().unwrap();
+    let start = archive.sfx_offset + file.block.offset;
+    let mut at = start + 4;
+    let size = vint_at(bytes, &mut at) as usize;
+    let body = at;
+    let _type = vint_at(bytes, &mut at);
+    let flags = vint_at(bytes, &mut at);
+    if flags & 1 != 0 {
+        vint_at(bytes, &mut at);
+    }
+    if flags & 2 != 0 {
+        vint_at(bytes, &mut at);
+    }
+    let file_flags_at = at;
+    let file_flags = vint_at(bytes, &mut at);
+    assert_eq!(at - file_flags_at, 1, "one-byte file flags");
+    bytes[file_flags_at] = (file_flags | 0x0008) as u8;
+    // The size vint, rewritten as 1 without changing its length:
+    // [0x01], or [0x81, 0x80, ..., 0x00].
+    let size_at = at;
+    vint_at(bytes, &mut at);
+    let len = at - size_at;
+    for (i, b) in bytes[size_at..at].iter_mut().enumerate() {
+        *b = match (i, len) {
+            (_, 1) => 1,
+            (0, _) => 0x81,
+            (i, len) if i + 1 == len => 0x00,
+            _ => 0x80,
+        };
+    }
+    let crc = rars::crc32::crc32(&bytes[start + 4..body + size]);
+    bytes[start..start + 4].copy_from_slice(&crc.to_le_bytes());
+}
+
+#[test]
+fn a_member_of_unknown_size_decodes_to_its_last_block() {
+    let data = b"size unknown until the end ".repeat(5000);
+    for store in [false, true] {
+        let mut b = rars::Builder::new(rars::ArchiveVersion::Rar50).store(store);
+        b.add_bytes(b"u".to_vec(), data.clone(), None, None)
+            .unwrap();
+        let mut bytes = b.to_bytes().unwrap();
+        mark_size_unknown(&mut bytes);
+        let archive = Archive::parse(&bytes).unwrap();
+        let got = collect_extract(&archive).unwrap();
+        assert_eq!(got[0].data, data, "store={store}");
+    }
+}

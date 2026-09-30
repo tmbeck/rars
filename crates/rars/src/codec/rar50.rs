@@ -2622,7 +2622,7 @@ impl Unpack50Decoder {
         let decoded = self.decode(
             input,
             algorithm_version,
-            output_size,
+            Some(output_size),
             dictionary_size,
             solid,
             mode,
@@ -2648,7 +2648,8 @@ impl Unpack50Decoder {
         &mut self,
         input: &mut impl Read,
         algorithm_version: u8,
-        output_size: usize,
+        // `None`: decode to the block flagged last (size unknown).
+        output_size: Option<usize>,
         dictionary_size: usize,
         solid: bool,
         mut sink: impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
@@ -2671,7 +2672,7 @@ impl Unpack50Decoder {
         &mut self,
         input: &mut impl Read,
         algorithm_version: u8,
-        output_size: usize,
+        output_size: Option<usize>,
         dictionary_size: usize,
         solid: bool,
         mode: DecodeMode,
@@ -2684,7 +2685,7 @@ impl Unpack50Decoder {
             self.reset();
         }
         self.window.set_dictionary(dictionary_size);
-        let mut output = StreamingOutput::new(&mut self.window, Some(output_size), dictionary_size);
+        let mut output = StreamingOutput::new(&mut self.window, output_size, dictionary_size);
 
         loop {
             let block = read_compressed_block(input)?;
@@ -2702,7 +2703,9 @@ impl Unpack50Decoder {
             let mut bits = BitReader::new(payload);
             bits.bit_pos = payload_bit_pos;
 
-            while bits.bit_pos < block.header.payload_bits && output.written() < output_size {
+            while bits.bit_pos < block.header.payload_bits
+                && output_size.is_none_or(|size| output.written() < size)
+            {
                 let symbol = tables.main.decode(&mut bits)?;
                 match symbol {
                     0..=255 => output.push(symbol as u8, sink)?,
@@ -2770,12 +2773,12 @@ impl Unpack50Decoder {
             }
 
             self.tables = Some(tables);
-            if block.header.is_last || output.written() >= output_size {
+            if block.header.is_last || output_size.is_some_and(|size| output.written() >= size) {
                 break;
             }
         }
 
-        if output.written() == output_size {
+        if output_size.is_none_or(|size| output.written() == size) {
             output.finish(sink)
         } else {
             Err(Error::NeedMoreInput.into())
@@ -5048,7 +5051,7 @@ mod tests {
             .decode_member_from_reader_with_dictionary_to_sink(
                 &mut reader,
                 0,
-                data.len(),
+                Some(data.len()),
                 128 * 1024,
                 false,
                 |chunk| {
@@ -5882,7 +5885,7 @@ mod tests {
             Unpack50Decoder::new().decode_member_from_reader_with_dictionary_to_sink(
                 &mut &mut *input,
                 0,
-                4,
+                Some(4),
                 6,
                 false,
                 |_| Ok::<(), std::io::Error>(()),
@@ -5918,7 +5921,7 @@ mod tests {
             .decode_member_from_reader_with_dictionary_to_sink(
                 &mut std::io::Cursor::new(&first),
                 0,
-                4,
+                Some(4),
                 6,
                 false,
                 |chunk| {
@@ -5940,7 +5943,7 @@ mod tests {
             .decode_member_from_reader_with_dictionary_to_sink(
                 &mut std::io::Cursor::new(&second),
                 0,
-                4,
+                Some(4),
                 6,
                 true,
                 |chunk| {

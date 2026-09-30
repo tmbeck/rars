@@ -165,7 +165,7 @@ impl FileHeader {
                 .as_ref()
                 .filter(|h| h.hash_type == 0)
                 .and_then(|h| <[u8; 32]>::try_from(h.data.as_slice()).ok()),
-            unpacked_size: (self.file_flags & FHFL_UNPUNKNOWN == 0).then_some(self.unpacked_size),
+            unpacked_size: self.size_limit(),
         }
     }
 
@@ -266,8 +266,15 @@ impl FileHeader {
         let dictionary_size = usize::try_from(info.dictionary_size).map_err(|_| {
             Error::InvalidHeader("RAR 5 dictionary size overflows host address size")
         })?;
-        let output_size = usize::try_from(self.unpacked_size)
-            .map_err(|_| Error::InvalidHeader("RAR 5 unpacked size overflows host address size"))?;
+        // `rar -si` members record a placeholder size: decode to the last block.
+        let output_size = self
+            .size_limit()
+            .map(|size| {
+                usize::try_from(size).map_err(|_| {
+                    Error::InvalidHeader("RAR 5 unpacked size overflows host address size")
+                })
+            })
+            .transpose()?;
         let mut crc = Crc32::new();
         let mut hash = streaming_hash_verifier(self)?;
         let mut written = 0u64;
@@ -315,6 +322,8 @@ impl FileHeader {
         password: Option<&[u8]>,
         writer: &mut dyn Write,
     ) -> Result<()> {
+        self.check_stored_size_verifiable()
+            .map_err(|error| self.entry_error("decoding", error))?;
         let (mut reader, keys) = self
             .packed_reader_with_password(archive, password)
             .map_err(|error| self.entry_error("decoding", error))?;
@@ -332,8 +341,9 @@ impl FileHeader {
             if count == 0 {
                 break;
             }
-            let remaining =
-                usize::try_from(self.unpacked_size.saturating_sub(written)).unwrap_or(usize::MAX);
+            // Unknown size: nothing to trim, not even an encrypted member's
+            // padding (UnRAR cannot tell it from data either).
+            let remaining = self.remaining_after(written);
             let chunk_len = count.min(remaining);
             let chunk = &buf[..chunk_len];
             if self.encrypted && buf[chunk_len..count].iter().any(|&byte| byte != 0) {
@@ -356,7 +366,7 @@ impl FileHeader {
                 .map_err(|error| self.entry_error("writing", error))?;
         }
 
-        if written != self.unpacked_size {
+        if self.size_limit().is_some_and(|size| written != size) {
             return Err(self.entry_error(
                 "decoding",
                 Error::InvalidHeader("RAR 5 stored file has mismatched packed and unpacked sizes"),
@@ -599,8 +609,39 @@ impl<'a> DecoderSession<'a> {
 }
 
 impl FileHeader {
+    /// The unpacked size, or `None` when it is unknown (`rar -si` records a
+    /// placeholder).
+    fn size_limit(&self) -> Option<u64> {
+        (self.file_flags & FHFL_UNPUNKNOWN == 0).then_some(self.unpacked_size)
+    }
+
+    /// Bytes of stored data still to keep after `written`; all of it when the
+    /// size is unknown.
+    fn remaining_after(&self, written: u64) -> usize {
+        self.size_limit().map_or(usize::MAX, |size| {
+            usize::try_from(size.saturating_sub(written)).unwrap_or(usize::MAX)
+        })
+    }
+
+    /// An encrypted stored member of unknown size cannot tell its AES padding
+    /// from data, so only a recorded checksum could catch the difference.
+    fn check_stored_size_verifiable(&self) -> Result<()> {
+        if self.encrypted
+            && self.size_limit().is_none()
+            && self.data_crc32.is_none()
+            && self.hash.is_none()
+        {
+            return Err(Error::InvalidHeader(
+                "RAR 5 encrypted stored file of unknown size records no checksum",
+            ));
+        }
+        Ok(())
+    }
+
+    // An unknown size cannot say a member is small: stream it.
     fn should_stream_decode(&self, buffered_decode_limit: u64) -> bool {
-        !self.is_stored() && self.unpacked_size > buffered_decode_limit
+        !self.is_stored()
+            && (self.size_limit().is_none() || self.unpacked_size > buffered_decode_limit)
     }
 }
 
@@ -814,6 +855,7 @@ impl PendingSplitRefs {
         decryptor: Option<&SplitDecryptor>,
         writer: &mut dyn Write,
     ) -> Result<()> {
+        final_file.check_stored_size_verifiable()?;
         let mut reader = self.fragment_reader(volumes, decryptor)?;
         let mut crc = Crc32::new();
         let mut hash = streaming_hash_verifier(final_file)?;
@@ -826,8 +868,7 @@ impl PendingSplitRefs {
                 break;
             }
             let chunk = if final_file.encrypted {
-                let remaining = usize::try_from(final_file.unpacked_size.saturating_sub(written))
-                    .unwrap_or(usize::MAX);
+                let remaining = final_file.remaining_after(written);
                 let chunk_len = count.min(remaining);
                 if buf[chunk_len..count].iter().any(|&byte| byte != 0) {
                     return Err(Error::InvalidHeader(
@@ -848,7 +889,7 @@ impl PendingSplitRefs {
             writer.write_all(chunk)?;
         }
 
-        if written != final_file.unpacked_size {
+        if final_file.size_limit().is_some_and(|size| written != size) {
             return Err(Error::InvalidHeader(
                 "RAR 5 stored split file has mismatched packed and unpacked sizes",
             ));
@@ -1306,6 +1347,64 @@ mod tests {
             matches!(err, Error::Codec(crate::codec::Error::NeedMoreInput)),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn truncated_unknown_size_member_fails_instead_of_coming_out_short() {
+        // Varied text so the member compresses into several blocks.
+        let mut data = Vec::new();
+        let mut x = 1u32;
+        while data.len() < 1 << 20 {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            data.extend_from_slice(format!("{} ", x >> 20).as_bytes());
+        }
+        let archive = Rar50Writer::new(WriterOptions {
+            target: crate::ArchiveVersion::Rar50,
+            features: crate::FeatureSet::default(),
+            compression_level: Some(1),
+            dictionary_size: None,
+        })
+        .entries([entry(b"text.txt", &data)].to_vec())
+        .finish()
+        .unwrap();
+        let archive = Archive::parse(&archive).unwrap();
+        let mut file = archive.files().next().unwrap().clone();
+        assert!(!file.is_stored());
+        file.data_crc32 = None;
+        file.hash = None;
+        file.file_flags |= FHFL_UNPUNKNOWN;
+        assert!(file.should_stream_decode(u64::MAX));
+        let (packed, _) = file.packed_data_with_password(&archive, None).unwrap();
+
+        let mut out = Vec::new();
+        let err = file
+            .stream_packed_with_decoder(
+                &mut Cursor::new(&packed[..packed.len() * 3 / 4]),
+                None,
+                &mut Unpack50Decoder::new(),
+                &mut out,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Codec(crate::codec::Error::NeedMoreInput)),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn encrypted_stored_member_of_unknown_size_needs_a_checksum() {
+        let mut file = plain_file(b"s.txt", b"hello", None);
+        file.encrypted = true;
+        file.file_flags |= FHFL_UNPUNKNOWN;
+        file.data_crc32 = None;
+        file.hash = None;
+        let err = file.check_stored_size_verifiable().unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidHeader(msg) if msg.contains("unknown size")),
+            "{err:?}"
+        );
+        file.data_crc32 = Some(0);
+        file.check_stored_size_verifiable().unwrap();
     }
 
     #[test]
