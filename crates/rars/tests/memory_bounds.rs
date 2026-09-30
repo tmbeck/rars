@@ -371,3 +371,42 @@ fn rar15_member_reads_input_incrementally() {
     assert_eq!(n, 32 * MIB as u64);
     check("rar15 32 MiB", u, 8 * MIB);
 }
+
+/// F8: the PPMd model used about 5.9x its declared size (152 MiB for the
+/// writer's 25 MiB model, measured at e0e4d30 by decoding straight from the
+/// codec). 8 MiB of input already fills the model.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release only")]
+fn ppmd_model_stays_near_its_declared_size() {
+    let _g = serial();
+    let a = open_all(&cached("rar29-ppmd-8m-v1", || {
+        let data = nibble_text(8 * MIB, 5);
+        let opts = rars::rar15_40::WriterOptions::new(
+            rars::ArchiveVersion::Rar29,
+            rars::FeatureSet::default(),
+        )
+        .with_method(rars::rar15_40::Rar29Method::Ppmd);
+        let entry = rars::rar15_40::FileEntry {
+            name: b"t",
+            data: &data,
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        };
+        let bytes = rars::rar15_40::write_compressed_archive(&[entry], opts).unwrap();
+        let archive = rars::rar15_40::Archive::parse(&bytes).unwrap();
+        let file = archive.files().next().unwrap();
+        assert_ne!(
+            bytes[file.packed_range.start] & 0x80,
+            0,
+            "the member is PPMd"
+        );
+        vec![bytes]
+    }));
+    let (_, u) = measure(|| extract_all(&a, default_opts()).unwrap());
+    // 3.5x the model, plus the 4 MiB window, the 1 MiB output chunk and the
+    // bit buffer.
+    check("ppmd 25 MiB model", u, 25 * MIB * 7 / 2 + 8 * MIB);
+}
