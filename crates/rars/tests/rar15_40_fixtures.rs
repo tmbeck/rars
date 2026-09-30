@@ -6207,7 +6207,9 @@ fn rejects_incomplete_rar300_stored_volume_set() {
 
     assert!(matches!(
         collect_extract_volumes(&archives),
-        Err(Error::InvalidHeader("RAR 1.5 split entry is incomplete"))
+        Err(Error::InvalidHeader(
+            "RAR volume set is missing volumes after the last one"
+        ))
     ));
 }
 
@@ -7331,4 +7333,70 @@ fn an_archive_reads_from_a_caller_source() {
         collect_facade_extract(&a).unwrap(),
         collect_facade_extract(&b).unwrap()
     );
+}
+
+/// A stored volume set with one member spanning every volume (the RAR 1.5-4
+/// writer takes one input per set).
+fn stored_volumes(version: ArchiveVersion) -> Vec<Vec<u8>> {
+    let mut b = rars::Builder::new(version)
+        .store(true)
+        .volume_size(Some(64 * 1024));
+    b.add_bytes(b"a".to_vec(), vec![7u8; 450 * 1024], None, None)
+        .unwrap();
+    let v = b.build_volumes(None).unwrap();
+    assert!(v.len() >= 4, "several volumes");
+    v
+}
+
+fn parse_all(v: &[Vec<u8>]) -> Vec<rars::Archive> {
+    v.iter()
+        .map(|b| rars::ArchiveReader::read(b).unwrap())
+        .collect()
+}
+
+/// RAR 1.5-4 volumes carry no number, only "first volume": a set that does
+/// not start with its first volume is the order error that can be seen.
+#[test]
+fn a_volume_set_out_of_order_is_refused() {
+    let mut a = parse_all(&stored_volumes(ArchiveVersion::Rar29));
+    a.swap(0, 1);
+    let err = rars::extract_volumes_to(&a, None, |_| Ok(Box::new(std::io::sink()))).unwrap_err();
+    assert!(err.to_string().contains("out of order"), "{err}");
+}
+
+/// The rars RAR 1.5-4 writer writes no end block, so the tail is judged by
+/// the last file header: split after the last volume means volumes are missing.
+#[test]
+fn a_volume_set_missing_its_tail_is_refused() {
+    let v = stored_volumes(ArchiveVersion::Rar29);
+    let a = parse_all(&v[..v.len() - 1]);
+    let err = rars::extract_volumes_to(&a, None, |_| Ok(Box::new(std::io::sink()))).unwrap_err();
+    assert!(err.to_string().contains("missing volumes"), "{err}");
+}
+
+/// The tail can also be judged by the end block: the last volume of a real
+/// RAR 3.00 set, with its end block flagged "next volume follows".
+#[test]
+fn a_volume_set_whose_end_block_wants_more_volumes_is_refused() {
+    let mut last = std::fs::read(fixture("rar300/stored_multivol_rar300.r02")).unwrap();
+    // End block: crc(2) type(1) flags(2) size(2); set EARC_NEXT_VOLUME and
+    // fix the header crc (low 16 bits of the crc32 of type..size).
+    let n = last.len();
+    last[n - 4] |= 1;
+    let crc = crc32(&last[n - 5..]) as u16;
+    last[n - 7..n - 5].copy_from_slice(&crc.to_le_bytes());
+    let a: Vec<_> = [
+        "rar300/stored_multivol_rar300.rar",
+        "rar300/stored_multivol_rar300.r00",
+        "rar300/stored_multivol_rar300.r01",
+    ]
+    .into_iter()
+    .map(|name| Archive::parse(&std::fs::read(fixture(name)).unwrap()).unwrap())
+    .chain([Archive::parse(&last).unwrap()])
+    .collect();
+    assert!(!a[3].files().last().unwrap().is_split_after());
+    assert!(matches!(
+        collect_extract_volumes(&a),
+        Err(Error::InvalidHeader(m)) if m.contains("missing volumes")
+    ));
 }

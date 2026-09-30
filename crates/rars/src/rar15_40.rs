@@ -52,6 +52,7 @@ const MHD_PROTECT: u16 = 0x0040;
 const MHD_PASSWORD: u16 = 0x0080;
 const MHD_FIRSTVOLUME: u16 = 0x0100;
 const MHD_ENCRYPTVER: u16 = 0x0200;
+const EARC_NEXT_VOLUME: u16 = 0x0001;
 
 const FHD_SPLIT_BEFORE: u16 = 0x0001;
 const FHD_SPLIT_AFTER: u16 = 0x0002;
@@ -1359,6 +1360,14 @@ impl Archive {
 
     fn range_reader(&self, range: Range<usize>) -> Result<Box<dyn Read + '_>> {
         self.source.range_reader(range)
+    }
+
+    /// True when the archive's end block says another volume follows.
+    pub fn end_has_next_volume(&self) -> bool {
+        self.blocks.iter().any(|block| match block {
+            Block::End(end) => end.flags & EARC_NEXT_VOLUME != 0,
+            _ => false,
+        })
     }
 
     pub fn files(&self) -> impl Iterator<Item = &FileHeader> {

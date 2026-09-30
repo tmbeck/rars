@@ -6233,3 +6233,37 @@ fn an_archive_reads_from_a_caller_source() {
         collect_facade_extract(&b).unwrap()
     );
 }
+
+/// A stored volume set with one member spanning every volume.
+fn stored_volumes(version: ArchiveVersion) -> Vec<Vec<u8>> {
+    let mut b = rars::Builder::new(version)
+        .store(true)
+        .volume_size(Some(64 * 1024));
+    b.add_bytes(b"a".to_vec(), vec![7u8; 450 * 1024], None, None)
+        .unwrap();
+    let v = b.build_volumes(None).unwrap();
+    assert!(v.len() >= 4, "several volumes");
+    v
+}
+
+fn parse_all(v: &[Vec<u8>]) -> Vec<rars::Archive> {
+    v.iter()
+        .map(|b| rars::ArchiveReader::read(b).unwrap())
+        .collect()
+}
+
+#[test]
+fn a_volume_set_out_of_order_is_refused() {
+    let mut a = parse_all(&stored_volumes(ArchiveVersion::Rar50));
+    a.swap(1, 2);
+    let err = rars::extract_volumes_to(&a, None, |_| Ok(Box::new(std::io::sink()))).unwrap_err();
+    assert!(err.to_string().contains("out of order"), "{err}");
+}
+
+#[test]
+fn a_volume_set_missing_its_tail_is_refused() {
+    let v = stored_volumes(ArchiveVersion::Rar50);
+    let a = parse_all(&v[..v.len() - 1]);
+    let err = rars::extract_volumes_to(&a, None, |_| Ok(Box::new(std::io::sink()))).unwrap_err();
+    assert!(err.to_string().contains("missing volumes"), "{err}");
+}

@@ -270,6 +270,30 @@ impl FileHeader {
     }
 }
 
+/// Refuse a multi-volume set that is visibly out of order or cut short.
+/// RAR 1.5-4 volumes carry no number: the only order signal is the
+/// first-volume flag, and a swap of two later volumes cannot be seen. Some
+/// RAR 3.0 sets carry the flag on every volume, so the flag on a later volume
+/// is only an error when the first volume lacks it.
+fn check_volume_set(volumes: &[Archive]) -> Result<()> {
+    if volumes.len() < 2 {
+        return Ok(());
+    }
+    if volumes.iter().any(|v| !v.main.is_volume())
+        || (!volumes[0].main.is_first_volume()
+            && volumes.iter().skip(1).any(|v| v.main.is_first_volume()))
+    {
+        return Err(Error::InvalidHeader("RAR volume set is out of order"));
+    }
+    let last = &volumes[volumes.len() - 1];
+    if last.end_has_next_volume() || last.files().last().is_some_and(|f| f.is_split_after()) {
+        return Err(Error::InvalidHeader(
+            "RAR volume set is missing volumes after the last one",
+        ));
+    }
+    Ok(())
+}
+
 /// Streams a multivolume archive set to caller-provided writers.
 pub fn extract_volumes_to<F>(
     volumes: &[Archive],
@@ -282,6 +306,7 @@ where
     if volumes.is_empty() {
         return Err(Error::InvalidHeader("RAR 1.5 volume set is empty"));
     }
+    check_volume_set(volumes)?;
 
     let password = options.password;
     let mut split = SplitVolumeState::new();
@@ -910,7 +935,7 @@ mod tests {
             sfx_offset: 0,
             main: MainHeader {
                 head_crc: 0,
-                flags: 0,
+                flags: MHD_VOLUME,
                 head_size: 0,
                 reserved1: 0,
                 reserved2: 0,

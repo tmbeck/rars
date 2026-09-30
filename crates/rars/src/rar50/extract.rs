@@ -652,6 +652,32 @@ fn rar50_buffered_decode_limit(options: crate::ArchiveReadOptions<'_>) -> u64 {
         .unwrap_or(BUFFERED_DECODE_LIMIT)
 }
 
+/// Refuse a multi-volume set that is out of order or missing its last
+/// volumes. WinRAR's first volume carries no number, so none means 0.
+fn check_volume_set(volumes: &[Archive]) -> Result<()> {
+    if volumes.len() < 2 {
+        return Ok(());
+    }
+    let in_order = volumes
+        .iter()
+        .enumerate()
+        .all(|(i, v)| v.main.is_volume() && v.main.volume_number.unwrap_or(0) == i as u64);
+    if !in_order {
+        return Err(Error::InvalidHeader("RAR volume set is out of order"));
+    }
+    let last = &volumes[volumes.len() - 1];
+    let end_next = last.blocks.iter().any(|b| match b {
+        super::Block::End(end) => end.has_next_volume(),
+        _ => false,
+    });
+    if end_next || last.files().last().is_some_and(|f| f.is_split_after()) {
+        return Err(Error::InvalidHeader(
+            "RAR volume set is missing volumes after the last one",
+        ));
+    }
+    Ok(())
+}
+
 /// Streams a RAR 5 multivolume archive set to caller-provided writers.
 pub fn extract_volumes_to<F>(
     volumes: &[Archive],
@@ -691,6 +717,7 @@ where
     if volumes.is_empty() {
         return Err(Error::InvalidHeader("RAR 5 volume set is empty"));
     }
+    check_volume_set(volumes)?;
 
     let password = options.password;
     let mut split = SplitVolumeState::new();
@@ -1723,8 +1750,8 @@ mod tests {
             sfx_offset: 0,
             main: MainHeader {
                 block: empty_block(1, 0, 0..0),
-                archive_flags: 0,
-                volume_number: None,
+                archive_flags: super::super::MHFL_VOLUME,
+                volume_number: Some(u64::from(flags & HFL_SPLIT_BEFORE != 0)),
                 extras: Vec::new(),
             },
             blocks: vec![Block::File(FileHeader {
