@@ -72,7 +72,20 @@ pub struct ArchiveReadOptions<'a> {
     /// other extraction path consults it: they stream every compressed member
     /// in bounded memory, whatever its size.
     pub rar50_buffered_decode_limit: Option<u64>,
+    /// Largest RAR 5/7 dictionary a member may declare before it is decoded
+    /// (default [`DEFAULT_MAX_DICTIONARY_SIZE`], 64 GiB, as UnRAR).
+    ///
+    /// The decoder's window grows up to the declared dictionary, so this caps
+    /// the memory one member can claim. A member declaring more fails with
+    /// [`Error::DictionaryLimitExceeded`] before any of it is decoded. RAR
+    /// 1.5-4 windows are fixed by the format (at most 4 MiB) and ignore it.
+    pub max_dictionary_size: Option<u64>,
 }
+
+/// The largest RAR 5/7 dictionary decoded unless
+/// [`ArchiveReadOptions::with_max_dictionary_size`] says otherwise: 64 GiB,
+/// the limit UnRAR refuses beyond.
+pub const DEFAULT_MAX_DICTIONARY_SIZE: u64 = 64 << 30;
 
 impl<'a> ArchiveReadOptions<'a> {
     /// Creates read options without a password.
@@ -100,6 +113,13 @@ impl<'a> ArchiveReadOptions<'a> {
     /// whole in memory; see [`Self::rar50_buffered_decode_limit`].
     pub fn with_rar50_buffered_decode_limit(mut self, limit: u64) -> Self {
         self.rar50_buffered_decode_limit = Some(limit);
+        self
+    }
+
+    /// Sets the largest RAR 5/7 dictionary a member may declare; see
+    /// [`Self::max_dictionary_size`].
+    pub fn with_max_dictionary_size(mut self, bytes: u64) -> Self {
+        self.max_dictionary_size = Some(bytes);
         self
     }
 }

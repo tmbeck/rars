@@ -799,6 +799,7 @@ impl FileHeader {
             | Error::UnsupportedWriterOption { .. }
             | Error::Rar50BufferedDecodeLimitExceeded { .. }
             | Error::MemoryLimitExceeded { .. }
+            | Error::DictionaryLimitExceeded { .. }
             | Error::UnsupportedFamilyFeature { .. }
             | Error::UnsupportedCompression { .. }
             | Error::UnsupportedEncryption { .. }

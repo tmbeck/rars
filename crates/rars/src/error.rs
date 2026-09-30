@@ -69,6 +69,12 @@ pub enum Error {
         required: u64,
         dictionary_size: u64,
     },
+    /// A member declares a dictionary above
+    /// [`crate::ArchiveReadOptions::max_dictionary_size`].
+    DictionaryLimitExceeded {
+        limit: u64,
+        dictionary_size: u64,
+    },
     UnsupportedFamilyFeature {
         family: ArchiveFamily,
         feature: &'static str,
@@ -152,6 +158,13 @@ impl std::fmt::Display for Error {
             } => write!(
                 f,
                 "compression needs at least {required} bytes of working memory for a {dictionary_size}-byte dictionary, above the configured limit of {limit} bytes"
+            ),
+            Self::DictionaryLimitExceeded {
+                limit,
+                dictionary_size,
+            } => write!(
+                f,
+                "member declares a {dictionary_size}-byte dictionary, above the configured limit of {limit} bytes"
             ),
             Self::UnsupportedFamilyFeature { family, feature } => {
                 write!(f, "feature {feature} is not supported by {family:?}")

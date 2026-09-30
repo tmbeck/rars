@@ -6368,3 +6368,169 @@ fn service_data_refuses_unknown_huge_or_split_services() {
         );
     }
 }
+
+/// A RAR 7 archive whose one member has a 160 KiB dictionary: not a power of
+/// two, so the header uses the v1 fields and a three-byte compression vint.
+fn rar70_with_160k_dictionary() -> (Vec<u8>, Vec<u8>) {
+    let data = b"dictionary ceiling payload, repeated to compress\n".repeat(64);
+    let options = rar50::WriterOptions::new(ArchiveVersion::Rar70, FeatureSet::store_only())
+        .with_dictionary_size(160 * 1024);
+    let bytes = write_compressed_archive(&[entry(b"dict.txt", &data)], options).unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    let file = archive.files().next().unwrap();
+    assert!(!file.is_stored());
+    assert_eq!(
+        file.decoded_compression_info().unwrap().dictionary_size,
+        160 * 1024
+    );
+    (bytes, data)
+}
+
+fn dictionary_refusal(err: &Error) -> Option<(u64, u64)> {
+    match err {
+        Error::AtEntry { source, .. } => dictionary_refusal(source),
+        Error::DictionaryLimitExceeded {
+            limit,
+            dictionary_size,
+        } => Some((*limit, *dictionary_size)),
+        _ => None,
+    }
+}
+
+#[test]
+fn max_dictionary_size_option_round_trips() {
+    assert_eq!(ArchiveReadOptions::new().max_dictionary_size, None);
+    assert_eq!(
+        ArchiveReadOptions::with_password(b"pw")
+            .with_max_dictionary_size(4 << 30)
+            .max_dictionary_size,
+        Some(4 << 30)
+    );
+    assert_eq!(rars::DEFAULT_MAX_DICTIONARY_SIZE, 64 << 30);
+}
+
+#[test]
+fn a_dictionary_above_the_limit_is_refused_before_decoding() {
+    let (bytes, data) = rar70_with_160k_dictionary();
+    let archive = Archive::parse(&bytes).unwrap();
+
+    let limit = 160 * 1024 - 1;
+    let entries = RefCell::new(Vec::new());
+    let err = archive
+        .extract_to(
+            ArchiveReadOptions::new().with_max_dictionary_size(limit),
+            |_| {
+                let out = Rc::new(RefCell::new(Vec::new()));
+                entries.borrow_mut().push(Rc::clone(&out));
+                Ok(Box::new(CollectWriter { data: out }))
+            },
+        )
+        .unwrap_err();
+    assert_eq!(dictionary_refusal(&err), Some((limit, 160 * 1024)), "{err}");
+    assert!(
+        err.to_string().contains(&format!("limit of {limit} bytes")),
+        "{err}"
+    );
+    assert!(entries.borrow().iter().all(|out| out.borrow().is_empty()));
+
+    let exact = ArchiveReadOptions::new().with_max_dictionary_size(160 * 1024);
+    assert_eq!(
+        collect_extract_with_options(&archive, exact).unwrap()[0].data,
+        data
+    );
+    assert_eq!(collect_extract(&archive).unwrap()[0].data, data);
+}
+
+#[test]
+fn a_split_member_above_the_dictionary_limit_is_refused() {
+    let data = deterministic_noise(48 * 1024).repeat(3);
+    let options = rar50::WriterOptions::new(ArchiveVersion::Rar70, FeatureSet::store_only())
+        .with_dictionary_size(160 * 1024);
+    let volumes = write_volumes(&[entry(b"split.bin", &data)], options, 16 * 1024, None).unwrap();
+    assert!(volumes.len() > 1);
+    let archives: Vec<_> = volumes.iter().map(|v| Archive::parse(v).unwrap()).collect();
+    let first = archives[0].files().next().unwrap();
+    assert!(first.is_split_after() && !first.is_stored());
+
+    let err = extract_volumes_to(
+        &archives,
+        ArchiveReadOptions::new().with_max_dictionary_size(128 * 1024),
+        |_| Ok(Box::new(std::io::sink())),
+    )
+    .unwrap_err();
+    assert_eq!(
+        dictionary_refusal(&err),
+        Some((128 * 1024, 160 * 1024)),
+        "{err}"
+    );
+    assert_eq!(collect_extract_volumes(&archives).unwrap()[0].data, data);
+}
+
+/// Hand-edits the member's header to declare the largest dictionary the v1
+/// fields can express (power 31, fraction 31: about 504 TiB). The default
+/// ceiling refuses it before the decoder allocates anything.
+#[test]
+fn the_default_ceiling_refuses_a_crafted_huge_dictionary() {
+    fn vint(mut value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                return out;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    let (mut bytes, _) = rar70_with_160k_dictionary();
+    let file = Archive::parse(&bytes)
+        .unwrap()
+        .files()
+        .next()
+        .unwrap()
+        .clone();
+    let mut needle = vint(file.compression_info);
+    assert_eq!(needle.len(), 3);
+    needle.extend(vint(file.host_os));
+    needle.extend(vint(file.name.len() as u64));
+    needle.extend(&file.name);
+    let at = bytes
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .unwrap();
+    // The header CRC32 covers everything from `HeadSize` to the header end.
+    let crc_at = (0..at)
+        .rev()
+        .find(|&p| {
+            let size = bytes[p + 4] as usize;
+            size < 0x80
+                && p + 5 + size <= bytes.len()
+                && crc32(&bytes[p + 4..p + 5 + size]).to_le_bytes() == bytes[p..p + 4]
+        })
+        .unwrap();
+
+    let huge = (file.compression_info & !(0x3ff << 10)) | (31 << 10) | (31 << 15);
+    let patched = vint(huge);
+    assert_eq!(patched.len(), 3);
+    bytes[at..at + 3].copy_from_slice(&patched);
+    let end = crc_at + 5 + bytes[crc_at + 4] as usize;
+    let crc = crc32(&bytes[crc_at + 4..end]);
+    bytes[crc_at..crc_at + 4].copy_from_slice(&crc.to_le_bytes());
+
+    let archive = Archive::parse(&bytes).unwrap();
+    let declared = archive
+        .files()
+        .next()
+        .unwrap()
+        .decoded_compression_info()
+        .unwrap();
+    assert_eq!(declared.dictionary_size, 63 << 43);
+    let err = collect_extract(&archive).unwrap_err();
+    assert_eq!(
+        dictionary_refusal(&err),
+        Some((rars::DEFAULT_MAX_DICTIONARY_SIZE, 63 << 43)),
+        "{err}"
+    );
+}

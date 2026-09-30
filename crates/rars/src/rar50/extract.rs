@@ -180,7 +180,8 @@ impl FileHeader {
         password: Option<&[u8]>,
         out: &mut impl Write,
     ) -> Result<()> {
-        let mut session = DecoderSession::new_with_password(password);
+        let mut session =
+            DecoderSession::new(crate::ArchiveReadOptions::with_optional_password(password));
         session.write_file_to(archive, self, out)
     }
 
@@ -227,9 +228,7 @@ impl FileHeader {
         }
 
         let info = self.decoded_compression_info()?;
-        let dictionary_size = usize::try_from(info.dictionary_size).map_err(|_| {
-            Error::InvalidHeader("RAR 5 dictionary size overflows host address size")
-        })?;
+        let dictionary_size = checked_dictionary_size(&info, crate::DEFAULT_MAX_DICTIONARY_SIZE)?;
         let output_size = checked_unpacked_size(self.unpacked_size)?;
         match decoder.decode_member_with_dictionary(
             packed,
@@ -259,6 +258,7 @@ impl FileHeader {
         packed: &mut R,
         keys: Option<&Rar50Keys>,
         decoder: &mut Unpack50Decoder,
+        max_dictionary_size: u64,
         writer: &mut dyn Write,
     ) -> Result<()> {
         if self.is_stored() {
@@ -268,9 +268,7 @@ impl FileHeader {
         }
 
         let info = self.decoded_compression_info()?;
-        let dictionary_size = usize::try_from(info.dictionary_size).map_err(|_| {
-            Error::InvalidHeader("RAR 5 dictionary size overflows host address size")
-        })?;
+        let dictionary_size = checked_dictionary_size(&info, max_dictionary_size)?;
         // `rar -si` members record a placeholder size: decode to the last block.
         let output_size = self
             .size_limit()
@@ -457,7 +455,7 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
     {
-        let mut session = DecoderSession::new_with_password(options.password);
+        let mut session = DecoderSession::new(options);
         for file in self.files() {
             if let Some(redirection) = &file.redirection {
                 if emit_redirections {
@@ -498,11 +496,9 @@ impl Archive {
             return self.extract_to(options, open);
         }
 
-        let password = options.password;
         let files: Vec<_> = self.files().collect();
-        let entries = crate::parallel::map_collect(files, |file| {
-            decode_parallel_entry(self, file, password)
-        })?;
+        let entries =
+            crate::parallel::map_collect(files, |file| decode_parallel_entry(self, file, options))?;
         for entry in entries {
             write_parallel_entry(entry, &mut open, &mut |_, _| Ok(()))?;
         }
@@ -525,7 +521,7 @@ enum ParallelExtractedEntry {
 fn decode_parallel_entry(
     archive: &Archive,
     file: &FileHeader,
-    password: Option<&[u8]>,
+    options: crate::ArchiveReadOptions<'_>,
 ) -> Result<ParallelExtractedEntry> {
     if let Some(redirection) = &file.redirection {
         return Ok(ParallelExtractedEntry::Redirection {
@@ -543,7 +539,7 @@ fn decode_parallel_entry(
         return Ok(ParallelExtractedEntry::Directory(meta));
     }
     let mut data = Vec::new();
-    let mut session = DecoderSession::new_with_password(password);
+    let mut session = DecoderSession::new(options);
     session.write_file_to(archive, file, &mut data)?;
     Ok(ParallelExtractedEntry::File { meta, data })
 }
@@ -575,13 +571,17 @@ where
 struct DecoderSession<'a> {
     decoder: Unpack50Decoder,
     password: Option<&'a [u8]>,
+    max_dictionary_size: u64,
 }
 
 impl<'a> DecoderSession<'a> {
-    fn new_with_password(password: Option<&'a [u8]>) -> Self {
+    fn new(options: crate::ArchiveReadOptions<'a>) -> Self {
         Self {
             decoder: Unpack50Decoder::new(),
-            password,
+            password: options.password,
+            max_dictionary_size: options
+                .max_dictionary_size
+                .unwrap_or(crate::DEFAULT_MAX_DICTIONARY_SIZE),
         }
     }
 
@@ -614,8 +614,14 @@ impl<'a> DecoderSession<'a> {
         let (mut packed, keys) = file
             .packed_reader_with_password(archive, self.password)
             .map_err(|error| file.entry_error("decoding", error))?;
-        file.stream_packed_with_decoder(&mut packed, keys.as_ref(), &mut self.decoder, writer)
-            .map_err(|error| file.entry_error("decoding", error))
+        file.stream_packed_with_decoder(
+            &mut packed,
+            keys.as_ref(),
+            &mut self.decoder,
+            self.max_dictionary_size,
+            writer,
+        )
+        .map_err(|error| file.entry_error("decoding", error))
     }
 
     fn split_decryptor(
@@ -662,6 +668,19 @@ impl FileHeader {
         !self.is_stored()
             && (self.size_limit().is_none() || self.unpacked_size > buffered_decode_limit)
     }
+}
+
+/// The member's dictionary, refused above `limit` before the decoder's window
+/// can grow toward it.
+fn checked_dictionary_size(info: &super::CompressionInfo, limit: u64) -> Result<usize> {
+    if info.dictionary_size > limit {
+        return Err(Error::DictionaryLimitExceeded {
+            limit,
+            dictionary_size: info.dictionary_size,
+        });
+    }
+    usize::try_from(info.dictionary_size)
+        .map_err(|_| Error::InvalidHeader("RAR 5 dictionary size overflows host address size"))
 }
 
 fn rar50_buffered_decode_limit(options: crate::ArchiveReadOptions<'_>) -> u64 {
@@ -739,7 +758,7 @@ where
 
     let password = options.password;
     let mut split = SplitVolumeState::new();
-    let mut session = DecoderSession::new_with_password(password);
+    let mut session = DecoderSession::new(options);
 
     for (volume_index, archive) in volumes.iter().enumerate() {
         for (file_index, file) in archive.files().enumerate() {
@@ -899,6 +918,7 @@ impl PendingSplitRefs {
                 &mut packed,
                 decryptor.as_ref().map(|decryptor| &decryptor.keys),
                 &mut session.decoder,
+                session.max_dictionary_size,
                 &mut writer,
             )
             .map_err(|error| self.checksum_error(volumes).unwrap_or(error))
@@ -1398,6 +1418,7 @@ mod tests {
                 &mut Cursor::new(&packed[..packed.len() * 3 / 4]),
                 None,
                 &mut Unpack50Decoder::new(),
+                crate::DEFAULT_MAX_DICTIONARY_SIZE,
                 &mut out,
             )
             .unwrap_err();
@@ -1441,6 +1462,7 @@ mod tests {
                 &mut Cursor::new(&packed[..packed.len() * 3 / 4]),
                 None,
                 &mut Unpack50Decoder::new(),
+                crate::DEFAULT_MAX_DICTIONARY_SIZE,
                 &mut out,
             )
             .unwrap_err();
@@ -2075,6 +2097,7 @@ mod tests {
                 &mut Cursor::new(Vec::<u8>::new()),
                 None,
                 &mut decoder,
+                crate::DEFAULT_MAX_DICTIONARY_SIZE,
                 &mut out,
             )
             .unwrap_err();
