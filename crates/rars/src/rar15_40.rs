@@ -9,6 +9,8 @@ use crate::detect::{find_archive_start, ArchiveSignature, RAR15_SIGNATURE, SFX_S
 use crate::error::{Error, Result};
 use crate::features::FeatureSet;
 use crate::io_util::{align16 as checked_align16, read_exact_at, read_u16, read_u32};
+use crate::read_at::{file_source, ReadAt};
+use crate::source::scan_signature;
 pub(crate) use crate::source::ArchiveSource;
 use crate::version::ArchiveFamily;
 use crate::ArchiveVersion;
@@ -1081,17 +1083,12 @@ impl Archive {
         path: impl AsRef<Path>,
         password: Option<&[u8]>,
     ) -> Result<Self> {
-        let path = Arc::new(path.as_ref().to_path_buf());
-        let mut file = File::open(path.as_ref())?;
-        let len = file.metadata()?.len();
-        let scan_len = len.min(SFX_SCAN_LIMIT as u64) as usize;
-        let mut scan = vec![0; scan_len];
-        file.read_exact(&mut scan)?;
-        let sig = find_archive_start(&scan, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
+        let source = file_source(File::open(path.as_ref())?);
+        let sig = scan_signature(source.as_ref())?;
         if sig.family != ArchiveFamily::Rar15To40 {
             return Err(Error::UnsupportedSignature);
         }
-        Self::parse_seekable(file, len, sig.offset, ArchiveSource::File(path), password)
+        Self::parse_seekable(source, sig.offset, password)
     }
 
     pub fn parse_path_with_signature(
@@ -1110,16 +1107,24 @@ impl Archive {
         if signature.family != ArchiveFamily::Rar15To40 {
             return Err(Error::UnsupportedSignature);
         }
-        let path = Arc::new(path.as_ref().to_path_buf());
-        let file = File::open(path.as_ref())?;
-        let len = file.metadata()?.len();
         Self::parse_seekable(
-            file,
-            len,
+            file_source(File::open(path.as_ref())?),
             signature.offset,
-            ArchiveSource::File(path),
             password,
         )
+    }
+
+    /// Parses an archive read through `source`, whose signature was already
+    /// found at `signature`. The archive keeps `source` for member data.
+    pub fn parse_source_with_signature(
+        source: Arc<dyn ReadAt>,
+        signature: ArchiveSignature,
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<Self> {
+        if signature.family != ArchiveFamily::Rar15To40 {
+            return Err(Error::UnsupportedSignature);
+        }
+        Self::parse_seekable(source, signature.offset, options.password)
     }
 
     fn parse_shared(input: Arc<[u8]>, password: Option<&[u8]>) -> Result<Self> {
@@ -1232,24 +1237,24 @@ impl Archive {
     }
 
     fn parse_seekable(
-        mut file: File,
-        file_len: u64,
+        source: Arc<dyn ReadAt>,
         sfx_offset: usize,
-        source: ArchiveSource,
         password: Option<&[u8]>,
     ) -> Result<Self> {
-        let marker = read_block_header_at(&mut file, file_len, sfx_offset, 0)?;
+        let file_len = source.size()?;
+        let file = source.as_ref();
+        let marker = read_block_header_at(file, file_len, sfx_offset, 0)?;
         if marker.head_type != MARK_HEAD || marker.head_size != RAR15_SIGNATURE.len() as u16 {
             return Err(Error::InvalidHeader("RAR 1.5 marker block is invalid"));
         }
 
         let main_block =
-            read_block_header_at(&mut file, file_len, sfx_offset, marker.head_size as usize)?;
+            read_block_header_at(file, file_len, sfx_offset, marker.head_size as usize)?;
         if main_block.head_type != MAIN_HEAD {
             return Err(Error::InvalidHeader("RAR 1.5 main header is missing"));
         }
         let main_header = read_exact_at(
-            &mut file,
+            file,
             sfx_offset + main_block.offset,
             main_block.head_size as usize,
         )?;
@@ -1267,7 +1272,7 @@ impl Archive {
             let (block, header, total) = if main.has_encrypted_headers() {
                 let password = password.ok_or(Error::NeedPassword)?;
                 let encrypted = read_encrypted_header_at(
-                    &mut file,
+                    file,
                     file_len,
                     sfx_offset,
                     pos,
@@ -1276,9 +1281,9 @@ impl Archive {
                 )?;
                 (encrypted.block, encrypted.header, encrypted.total_size)
             } else {
-                let block = read_block_header_at(&mut file, file_len, sfx_offset, pos)?;
+                let block = read_block_header_at(file, file_len, sfx_offset, pos)?;
                 let total = block_total_size(&block)?;
-                let header = read_exact_at(&mut file, sfx_offset + pos, block.head_size as usize)?;
+                let header = read_exact_at(file, sfx_offset + pos, block.head_size as usize)?;
                 (block, header, total)
             };
             match block.head_type {
@@ -1340,7 +1345,7 @@ impl Archive {
             sfx_offset,
             main,
             blocks,
-            source,
+            source: ArchiveSource::Positioned(source),
         })
     }
 
@@ -2090,7 +2095,7 @@ fn decrypt_encrypted_header_at(
 }
 
 fn read_encrypted_header_at(
-    file: &mut File,
+    file: &dyn ReadAt,
     file_len: u64,
     archive_offset: usize,
     offset: usize,
@@ -2359,7 +2364,7 @@ fn decode_file_name(raw: &[u8], flags: u16) -> Vec<u8> {
 }
 
 fn read_block_header_at(
-    file: &mut File,
+    file: &dyn ReadAt,
     file_len: u64,
     archive_offset: usize,
     offset: usize,

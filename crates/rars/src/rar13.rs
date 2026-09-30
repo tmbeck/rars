@@ -7,6 +7,8 @@ use crate::detect::{find_archive_start, ArchiveSignature, RAR13_SIGNATURE, SFX_S
 use crate::error::{Error, Result};
 use crate::features::FeatureSet;
 use crate::io_util::{read_exact_at, read_u16, read_u32};
+use crate::read_at::{file_source, ReadAt};
+use crate::source::scan_signature;
 pub(crate) use crate::source::ArchiveSource;
 pub use crate::streaming::{EntrySource, WriterResources};
 use crate::version::{ArchiveFamily, ArchiveVersion};
@@ -16,7 +18,7 @@ use crate::write_progress::{ProgressReporter, WorkTracker};
 use crate::write_stream::{MemberBytes, MemberPayload};
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -315,17 +317,12 @@ impl Archive {
     }
 
     pub fn parse_path(path: impl AsRef<Path>) -> Result<Self> {
-        let path = Arc::new(path.as_ref().to_path_buf());
-        let mut file = File::open(path.as_ref())?;
-        let len = file.metadata()?.len();
-        let scan_len = len.min(SFX_SCAN_LIMIT as u64) as usize;
-        let mut scan = vec![0; scan_len];
-        file.read_exact(&mut scan)?;
-        let sig = find_archive_start(&scan, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
+        let source = file_source(File::open(path.as_ref())?);
+        let sig = scan_signature(source.as_ref())?;
         if sig.family != ArchiveFamily::Rar13 {
             return Err(Error::UnsupportedSignature);
         }
-        Self::parse_seekable(file, len, sig.offset, ArchiveSource::File(path))
+        Self::parse_seekable(source, sig.offset)
     }
 
     pub fn parse_path_with_signature(
@@ -335,10 +332,19 @@ impl Archive {
         if signature.family != ArchiveFamily::Rar13 {
             return Err(Error::UnsupportedSignature);
         }
-        let path = Arc::new(path.as_ref().to_path_buf());
-        let file = File::open(path.as_ref())?;
-        let len = file.metadata()?.len();
-        Self::parse_seekable(file, len, signature.offset, ArchiveSource::File(path))
+        Self::parse_source_with_signature(file_source(File::open(path.as_ref())?), signature)
+    }
+
+    /// Parses an archive read through `source`, whose signature was already
+    /// found at `signature`. The archive keeps `source` for member data.
+    pub fn parse_source_with_signature(
+        source: Arc<dyn ReadAt>,
+        signature: ArchiveSignature,
+    ) -> Result<Self> {
+        if signature.family != ArchiveFamily::Rar13 {
+            return Err(Error::UnsupportedSignature);
+        }
+        Self::parse_seekable(source, signature.offset)
     }
 
     fn parse_shared(input: Arc<[u8]>) -> Result<Self> {
@@ -386,23 +392,20 @@ impl Archive {
         })
     }
 
-    fn parse_seekable(
-        mut file: File,
-        file_len: u64,
-        sfx_offset: usize,
-        source: ArchiveSource,
-    ) -> Result<Self> {
-        let main_prefix = read_exact_at(&mut file, sfx_offset, MAIN_HEAD_SIZE as usize)?;
+    fn parse_seekable(source: Arc<dyn ReadAt>, sfx_offset: usize) -> Result<Self> {
+        let file_len = source.size()?;
+        let file = source.as_ref();
+        let main_prefix = read_exact_at(file, sfx_offset, MAIN_HEAD_SIZE as usize)?;
         let head_size = read_u16(&main_prefix, 4)? as usize;
-        let main_bytes = read_exact_at(&mut file, sfx_offset, head_size)?;
+        let main_bytes = read_exact_at(file, sfx_offset, head_size)?;
         let main = MainHeader::parse(&main_bytes)?;
         let mut pos = main.head_size as usize;
         let mut entries = Vec::new();
 
         while (sfx_offset + pos) as u64 + FILE_HEAD_BASE_SIZE as u64 <= file_len {
-            let header_prefix = read_exact_at(&mut file, sfx_offset + pos, FILE_HEAD_BASE_SIZE)?;
+            let header_prefix = read_exact_at(file, sfx_offset + pos, FILE_HEAD_BASE_SIZE)?;
             let head_size = read_u16(&header_prefix, 10)? as usize;
-            let header_bytes = read_exact_at(&mut file, sfx_offset + pos, head_size)?;
+            let header_bytes = read_exact_at(file, sfx_offset + pos, head_size)?;
             let (header, name, extra, consumed) = FileHeader::parse(&header_bytes)?;
             let data_start = pos + consumed;
             let data_end =
@@ -427,7 +430,7 @@ impl Archive {
             sfx_offset,
             main,
             entries,
-            source,
+            source: ArchiveSource::Positioned(source),
         })
     }
 
@@ -457,13 +460,12 @@ impl Archive {
                     out.write_all(&buffer[..chunk.len()])?;
                 }
             }
-            ArchiveSource::File(path) => {
-                let mut file = File::open(path.as_ref())?;
-                file.seek(SeekFrom::Start(range.start as u64))?;
+            ArchiveSource::Positioned(_) => {
+                let mut reader = self.source.range_reader(range.clone())?;
                 let mut remaining = range.len();
                 while remaining > 0 {
                     let to_read = remaining.min(buffer.len());
-                    file.read_exact(&mut buffer[..to_read])?;
+                    reader.read_exact(&mut buffer[..to_read])?;
                     for byte in &mut buffer[..to_read] {
                         *byte = cipher.decrypt_byte(*byte);
                     }
@@ -653,7 +655,7 @@ impl Entry {
             ArchiveSource::Memory(data) => {
                 data.get(self.packed_range.clone()).ok_or(Error::TooShort)
             }
-            ArchiveSource::File(_) => Err(Error::InvalidHeader(
+            ArchiveSource::Positioned(_) => Err(Error::InvalidHeader(
                 "RAR 1.3 file-backed packed data requires owned read",
             )),
         }
@@ -3294,7 +3296,7 @@ mod tests {
     fn extract_to_encrypted_archive_reads_through_file_backed_decrypted_range() {
         // The Memory-backed path is already exercised; this test takes the
         // same encrypted archive out to disk so copy_decrypted_range_to runs
-        // its ArchiveSource::File branch.
+        // its ArchiveSource::Positioned branch.
         let input = [StoredEntry {
             name: b"secret.bin",
             data: b"file-backed secret payload",

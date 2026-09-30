@@ -3,6 +3,8 @@ use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
 use crate::detect::{find_archive_start, ArchiveSignature, RAR50_SIGNATURE, SFX_SCAN_LIMIT};
 use crate::error::{Error, Result};
 use crate::io_util::{align16 as checked_align16, read_exact_at, read_u32};
+use crate::read_at::{file_source, ReadAt};
+use crate::source::scan_signature;
 pub(crate) use crate::source::ArchiveSource;
 use crate::version::ArchiveFamily;
 use std::fs::File;
@@ -506,27 +508,12 @@ impl Archive {
         path: impl AsRef<Path>,
         password: Option<&[u8]>,
     ) -> Result<Self> {
-        let path = Arc::new(path.as_ref().to_path_buf());
-        let mut file = File::open(path.as_ref())?;
-        let len = file.metadata()?.len();
-        let scan_len = len.min(SFX_SCAN_LIMIT as u64) as usize;
-        let mut scan = vec![0; scan_len];
-        file.read_exact(&mut scan)?;
-        let sig = find_archive_start(&scan, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
+        let source = file_source(File::open(path.as_ref())?);
+        let sig = scan_signature(source.as_ref())?;
         if sig.family != ArchiveFamily::Rar50Plus {
             return Err(Error::UnsupportedSignature);
         }
-        let archive_len = usize::try_from(len)
-            .map_err(|_| Error::InvalidHeader("RAR 5 archive size overflows usize"))?
-            .checked_sub(sig.offset)
-            .ok_or(Error::TooShort)?;
-        Self::parse_file_backed(
-            &mut file,
-            archive_len,
-            sig.offset,
-            ArchiveSource::File(path),
-            password,
-        )
+        Self::parse_file_backed(source, sig.offset, password)
     }
 
     pub fn parse_path_with_signature(
@@ -545,20 +532,24 @@ impl Archive {
         if signature.family != ArchiveFamily::Rar50Plus {
             return Err(Error::UnsupportedSignature);
         }
-        let path = Arc::new(path.as_ref().to_path_buf());
-        let mut file = File::open(path.as_ref())?;
-        let len = file.metadata()?.len();
-        let archive_len = usize::try_from(len)
-            .map_err(|_| Error::InvalidHeader("RAR 5 archive size overflows usize"))?
-            .checked_sub(signature.offset)
-            .ok_or(Error::TooShort)?;
         Self::parse_file_backed(
-            &mut file,
-            archive_len,
+            file_source(File::open(path.as_ref())?),
             signature.offset,
-            ArchiveSource::File(path),
             password,
         )
+    }
+
+    /// Parses an archive read through `source`, whose signature was already
+    /// found at `signature`. The archive keeps `source` for member data.
+    pub fn parse_source_with_signature(
+        source: Arc<dyn ReadAt>,
+        signature: ArchiveSignature,
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<Self> {
+        if signature.family != ArchiveFamily::Rar50Plus {
+            return Err(Error::UnsupportedSignature);
+        }
+        Self::parse_file_backed(source, signature.offset, options.password)
     }
 
     fn parse_shared(input: Arc<[u8]>, password: Option<&[u8]>) -> Result<Self> {
@@ -606,32 +597,26 @@ impl Archive {
     }
 
     fn parse_file_backed(
-        file: &mut File,
-        archive_len: usize,
+        source: Arc<dyn ReadAt>,
         sfx_offset: usize,
-        source: ArchiveSource,
         password: Option<&[u8]>,
     ) -> Result<Self> {
+        let archive_len = usize::try_from(source.size()?)
+            .map_err(|_| Error::InvalidHeader("RAR 5 archive size overflows usize"))?
+            .checked_sub(sfx_offset)
+            .ok_or(Error::TooShort)?;
+        let file = source.as_ref();
         let signature = read_exact_at(file, sfx_offset, RAR50_SIGNATURE.len())?;
         if signature != RAR50_SIGNATURE {
             return Err(Error::UnsupportedSignature);
         }
 
-        let file_cell = std::cell::RefCell::new(file);
         let (main, blocks) = parse_archive_blocks(
             archive_len,
             password,
-            |offset| {
-                read_block_header_at(&mut file_cell.borrow_mut(), offset, archive_len, sfx_offset)
-            },
+            |offset| read_block_header_at(file, offset, archive_len, sfx_offset),
             |offset, keys| {
-                read_encrypted_block_header_at(
-                    &mut file_cell.borrow_mut(),
-                    offset,
-                    archive_len,
-                    sfx_offset,
-                    keys,
-                )
+                read_encrypted_block_header_at(file, offset, archive_len, sfx_offset, keys)
             },
         )?;
 
@@ -639,7 +624,7 @@ impl Archive {
             sfx_offset,
             main,
             blocks,
-            source,
+            source: ArchiveSource::Positioned(source),
         })
     }
 
@@ -1865,7 +1850,7 @@ fn parse_encrypted_block_header_bytes(
 }
 
 fn read_block_header_at(
-    file: &mut File,
+    file: &dyn ReadAt,
     offset: usize,
     archive_len: usize,
     sfx_offset: usize,
@@ -1902,7 +1887,7 @@ fn read_block_header_at(
 }
 
 fn read_encrypted_block_header_at(
-    file: &mut File,
+    file: &dyn ReadAt,
     offset: usize,
     archive_len: usize,
     sfx_offset: usize,

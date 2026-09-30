@@ -7283,3 +7283,52 @@ fn a_writer_error_reaches_the_caller_intact() {
         );
     }
 }
+
+/// A member's name and bytes.
+type NamedBytes = (Vec<u8>, Vec<u8>);
+
+/// Each member's name and bytes through the family-independent facade.
+fn collect_facade_extract(archive: &rars::Archive) -> Result<Vec<NamedBytes>, Error> {
+    let got = RefCell::new(Vec::new());
+    archive.extract_to(None, |meta| {
+        let data = Rc::new(RefCell::new(Vec::new()));
+        got.borrow_mut().push((meta.name.clone(), Rc::clone(&data)));
+        Ok(Box::new(CollectWriter { data }))
+    })?;
+    Ok(got
+        .into_inner()
+        .into_iter()
+        .map(|(name, data)| (name, data.borrow().clone()))
+        .collect())
+}
+
+/// Data comes from the file that was opened, whatever the path names later.
+#[cfg(unix)]
+#[test]
+fn a_file_backed_archive_keeps_reading_the_opened_file() {
+    let dir = scratch::case("rars-held4");
+    let path = dir.join("a.rar");
+    let original = std::fs::read(fixture("rar300/solid_simple_rar300.rar")).unwrap();
+    std::fs::write(&path, &original).unwrap();
+    let archive = rars::ArchiveReader::read_path(&path).unwrap();
+    // Replace the path with different bytes of the same length.
+    let other = dir.join("b.rar");
+    std::fs::write(&other, vec![0u8; original.len()]).unwrap();
+    std::fs::rename(&other, &path).unwrap();
+    let got = collect_facade_extract(&archive).unwrap();
+    let want = collect_facade_extract(&rars::ArchiveReader::read_owned(original).unwrap()).unwrap();
+    assert_eq!(got.len(), 2);
+    assert_eq!(got, want);
+}
+
+#[test]
+fn an_archive_reads_from_a_caller_source() {
+    let bytes = std::fs::read(fixture("rar300/solid_simple_rar300.rar")).unwrap();
+    let src = std::sync::Arc::new(rars::SeekReader::new(std::io::Cursor::new(bytes.clone())));
+    let a = rars::ArchiveReader::read_source(src).unwrap();
+    let b = rars::ArchiveReader::read_owned(bytes).unwrap();
+    assert_eq!(
+        collect_facade_extract(&a).unwrap(),
+        collect_facade_extract(&b).unwrap()
+    );
+}

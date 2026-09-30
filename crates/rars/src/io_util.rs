@@ -1,11 +1,17 @@
+use crate::read_at::ReadAt;
 use crate::{Error, Result};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 
-pub(crate) fn read_exact_at(file: &mut File, offset: usize, len: usize) -> Result<Vec<u8>> {
-    file.seek(SeekFrom::Start(offset as u64))?;
+pub(crate) fn read_exact_at(src: &dyn ReadAt, offset: usize, len: usize) -> Result<Vec<u8>> {
     let mut data = vec![0; len];
-    file.read_exact(&mut data)?;
+    let mut filled = 0;
+    while filled < len {
+        match src.read_at(&mut data[filled..], (offset + filled) as u64) {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into()),
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
     Ok(data)
 }
 

@@ -30,6 +30,7 @@ mod parallel;
 pub mod rar13;
 pub mod rar15_40;
 pub mod rar50;
+mod read_at;
 #[doc(hidden)]
 pub mod recovery;
 mod source;
@@ -48,7 +49,8 @@ pub use features::{Feature, FeatureSet};
 pub use filter::{
     formats_supporting_filter, FilterKind, FilterPolicy, FilterSpec, UnsupportedFilterKind,
 };
-use std::io::{Read, Write};
+pub use read_at::{ReadAt, SeekReader};
+use std::io::Write;
 use std::path::Path;
 pub use streaming::{EntryReader, EntrySource, WriterResources, DEFAULT_WRITER_MEMORY_LIMIT};
 pub use version::{ArchiveFamily, ArchiveVersion};
@@ -764,27 +766,52 @@ impl ArchiveReader {
         Self::read_path_with_options(path, ArchiveReadOptions::default())
     }
 
-    /// Parses an archive from a path using explicit read options.
+    /// Parses an archive from a path using explicit read options. The
+    /// archive holds the file open and reads it by position.
     pub fn read_path_with_options(
         path: impl AsRef<Path>,
         options: ArchiveReadOptions<'_>,
     ) -> Result<Archive> {
-        let path = path.as_ref();
-        let mut file = std::fs::File::open(path)?;
-        let len = file.metadata()?.len();
-        let mut scan = vec![0; len.min(SFX_SCAN_LIMIT as u64) as usize];
-        file.read_exact(&mut scan)?;
-        let signature =
-            find_archive_start(&scan, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
+        Self::read_file_with_options(std::fs::File::open(path)?, options)
+    }
+
+    /// Parses an archive from an open file with default read options.
+    pub fn read_file(file: std::fs::File) -> Result<Archive> {
+        Self::read_file_with_options(file, ArchiveReadOptions::default())
+    }
+
+    /// Parses an archive from an open file using explicit read options. The
+    /// archive keeps the file and reads it by position, so data comes from
+    /// this file whatever its path names later.
+    pub fn read_file_with_options(
+        file: std::fs::File,
+        options: ArchiveReadOptions<'_>,
+    ) -> Result<Archive> {
+        Self::read_source_with_options(read_at::file_source(file), options)
+    }
+
+    /// Parses an archive from a positioned-read source with default read
+    /// options.
+    pub fn read_source(source: std::sync::Arc<dyn ReadAt>) -> Result<Archive> {
+        Self::read_source_with_options(source, ArchiveReadOptions::default())
+    }
+
+    /// Parses an archive from a positioned-read source using explicit read
+    /// options. The archive keeps `source` for member data.
+    pub fn read_source_with_options(
+        source: std::sync::Arc<dyn ReadAt>,
+        options: ArchiveReadOptions<'_>,
+    ) -> Result<Archive> {
+        let signature = source::scan_signature(source.as_ref())?;
         match signature.family {
-            ArchiveFamily::Rar13 => Ok(Archive::Rar13(rar13::Archive::parse_path_with_signature(
-                path, signature,
-            )?)),
+            ArchiveFamily::Rar13 => Ok(Archive::Rar13(
+                rar13::Archive::parse_source_with_signature(source, signature)?,
+            )),
             ArchiveFamily::Rar15To40 => Ok(Archive::Rar15To40(
-                rar15_40::Archive::parse_path_with_signature(path, signature, options)?,
+                rar15_40::Archive::parse_source_with_signature(source, signature, options)?,
             )),
             ArchiveFamily::Rar50Plus => Ok(Archive::Rar50Plus(
-                rar50::Archive::parse_path_with_signature(path, signature, options)?,
+                rar50::Archive::parse_source_with_signature(source, signature, options)?,
             )),
         }
     }
