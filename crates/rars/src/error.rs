@@ -58,6 +58,8 @@ pub enum Error {
         /// archive", "levels run from 0 to 5". Rendered after the format.
         because: Option<&'static str>,
     },
+    /// No longer produced by extraction, which streams every RAR 5 member;
+    /// kept for API compatibility.
     Rar50BufferedDecodeLimitExceeded {
         limit: u64,
         required: u64,

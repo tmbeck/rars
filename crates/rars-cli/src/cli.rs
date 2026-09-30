@@ -62,7 +62,7 @@ pub(crate) struct PasswordArgs {
 
 #[derive(Args)]
 pub(crate) struct ReadOptionsArgs {
-    /// Maximum RAR 5 filtered member size to buffer while decoding (e.g. 512m, 1g)
+    /// Largest RAR 5 member to decode whole in memory so members can be decoded in parallel (e.g. 512m, 1g); larger members stream
     #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
     pub rar50_buffered_decode_limit: Option<usize>,
 }

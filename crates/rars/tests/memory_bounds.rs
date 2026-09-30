@@ -219,3 +219,89 @@ fn rar5_filtered_member_streams_in_bounded_memory() {
     assert_eq!(n, 64 * MIB as u64);
     check("rar5 e8 64 MiB, 1 MiB dict", u, 8 * MIB);
 }
+
+fn default_opts() -> rars::ArchiveReadOptions<'static> {
+    rars::ArchiveReadOptions::new()
+}
+
+/// F4: members up to 512 MiB were decoded into a Vec (plus packed data, a
+/// filtered copy and a history copy): ~2.8x the member.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release only")]
+fn rar5_member_streams_by_default() {
+    let _g = serial();
+    let a = open_all(&cached("rar5-64m-v1", || {
+        rar5_member(64 * MIB, 1 << 20, Default::default())
+    }));
+    let (n, u) = measure(|| extract_all(&a, default_opts()).unwrap());
+    assert_eq!(n, 64 * MIB as u64);
+    check("rar5 64 MiB, 1 MiB dict", u, 8 * MIB);
+}
+
+/// F1: a member split across volumes was decoded into one Vec, no limit.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release only")]
+fn rar5_split_member_streams() {
+    let _g = serial();
+    let p = cached("rar5-64m-4vol-v1", || {
+        let opts = rars::rar50::WriterOptions::new(
+            rars::ArchiveVersion::Rar50,
+            rars::FeatureSet::default(),
+        )
+        .with_compression_level(1)
+        .with_dictionary_size(1 << 20);
+        let entry = rars::rar50::ArchiveEntry::new(
+            b"m".to_vec(),
+            rars::EntrySource::from_bytes(nibble_text(64 * MIB, 9)),
+        );
+        let mut sink = rars::rar50::CollectedVolumes::new();
+        rars::rar50::write_streaming_volumes_to(
+            &[entry],
+            opts,
+            rars::rar50::ArchiveExtras::default(),
+            12 * MIB as u64,
+            &mut sink,
+            &writer_resources(),
+        )
+        .unwrap();
+        sink.take()
+    });
+    assert!(p.len() >= 3, "a set of several volumes");
+    let a = open_all(&p);
+    let (n, u) = measure(|| extract_all(&a, default_opts()).unwrap());
+    assert_eq!(n, 64 * MIB as u64);
+    check("rar5 64 MiB over volumes", u, 8 * MIB);
+}
+
+/// F3: a large dictionary was cloned before every member, doubling the peak.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release only")]
+fn rar5_large_dictionary_is_held_once() {
+    let _g = serial();
+    let a = open_all(&cached("rar5-solid-32m-dict-v1", || {
+        let mut features = rars::FeatureSet::default();
+        features.solid = true;
+        let opts = rars::rar50::WriterOptions::new(rars::ArchiveVersion::Rar50, features)
+            .with_compression_level(1)
+            .with_dictionary_size(32 << 20);
+        let entries = vec![
+            rars::rar50::ArchiveEntry::new(
+                b"a".to_vec(),
+                rars::EntrySource::from_bytes(nibble_text(48 * MIB, 3)),
+            ),
+            rars::rar50::ArchiveEntry::new(
+                b"b".to_vec(),
+                rars::EntrySource::from_bytes(nibble_text(MIB, 4)),
+            ),
+        ];
+        let mut out = Vec::new();
+        rars::rar50::Rar50Writer::new(opts)
+            .entries(entries)
+            .write_to(&mut out, &writer_resources())
+            .unwrap();
+        vec![out]
+    }));
+    let (_, u) = measure(|| extract_all(&a, default_opts()).unwrap());
+    // The 32 MiB window, one block (≤ 1 MiB) and slack.
+    check("rar5 solid, 32 MiB dict", u, 32 * MIB + 8 * MIB);
+}

@@ -63,11 +63,12 @@ pub use write_progress::{WriteOperation, WriteProgress, WriteProgressEvent};
 pub struct ArchiveReadOptions<'a> {
     /// Password bytes used for encrypted headers or payloads.
     pub password: Option<&'a [u8]>,
-    /// Optional RAR 5 whole-member buffered decode limit.
+    /// Largest RAR 5 member `extract_to_parallel_buffered` decodes whole in
+    /// memory so members can be decoded in parallel (default 512 MiB).
     ///
-    /// Filtered RAR 5 members need whole-member transforms. Compressed members
-    /// above this limit use the streaming path and reject filtered streams
-    /// with an unsupported-feature error instead of buffering the full member.
+    /// An archive with a larger member is extracted sequentially instead. No
+    /// other extraction path consults it: they stream every compressed member
+    /// in bounded memory, whatever its size.
     pub rar50_buffered_decode_limit: Option<u64>,
 }
 
@@ -93,7 +94,8 @@ impl<'a> ArchiveReadOptions<'a> {
         }
     }
 
-    /// Sets the RAR 5 whole-member buffered decode limit.
+    /// Sets the largest RAR 5 member `extract_to_parallel_buffered` decodes
+    /// whole in memory; see [`Self::rar50_buffered_decode_limit`].
     pub fn with_rar50_buffered_decode_limit(mut self, limit: u64) -> Self {
         self.rar50_buffered_decode_limit = Some(limit);
         self

@@ -72,7 +72,7 @@ fn main() {
 
 impl From<rars::Error> for CliError {
     fn from(error: rars::Error) -> Self {
-        let message = format!("{error}{}", rar50_buffered_decode_limit_hint(&error));
+        let message = error.to_string();
         if error_is_password_class(&error) {
             Self::password(message)
         } else {
@@ -128,27 +128,6 @@ fn extract_options(
     match rar50_buffered_decode_limit {
         Some(limit) => options.with_rar50_buffered_decode_limit(limit as u64),
         None => options,
-    }
-}
-
-fn rar50_buffered_decode_limit_hint(error: &rars::Error) -> String {
-    let Some((_, required)) = find_rar50_buffered_decode_limit_error(error) else {
-        return String::new();
-    };
-    format!(
-        "\nhint: retry with --rar50-buffered-decode-limit {required} if you trust this archive and have enough memory"
-    )
-}
-
-fn find_rar50_buffered_decode_limit_error(error: &rars::Error) -> Option<(u64, u64)> {
-    match error {
-        rars::Error::Rar50BufferedDecodeLimitExceeded { limit, required } => {
-            Some((*limit, *required))
-        }
-        rars::Error::AtEntry { source, .. } | rars::Error::AtArchiveOffset { source, .. } => {
-            find_rar50_buffered_decode_limit_error(source)
-        }
-        _ => None,
     }
 }
 
@@ -588,11 +567,7 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
         })
         .map_err(|err| {
             classify_rars_error(err, |err| {
-                format!(
-                    "failed to test archive '{}': {err}{}",
-                    paths[0],
-                    rar50_buffered_decode_limit_hint(err)
-                )
+                format!("failed to test archive '{}': {err}", paths[0],)
             })
         })?;
         for entry in &entries {
@@ -615,11 +590,7 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
         })
         .map_err(|err| {
             classify_rars_error(err, |err| {
-                format!(
-                    "failed to test volume set '{}': {err}{}",
-                    paths.join(", "),
-                    rar50_buffered_decode_limit_hint(err)
-                )
+                format!("failed to test volume set '{}': {err}", paths.join(", "),)
             })
         })?;
         for entry in &entries {
@@ -658,9 +629,8 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
         extract_single_archive(&archive, options, &state).map_err(|err| {
             classify_rars_error(err, |err| {
                 format!(
-                    "failed to write extracted entry to '{}': {err}{}",
+                    "failed to write extracted entry to '{}': {err}",
                     out_dir.display(),
-                    rar50_buffered_decode_limit_hint(err)
                 )
             })
         })?;
@@ -688,11 +658,7 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
         );
         extract_volume_archives(&archives, options, &state).map_err(|err| {
             classify_rars_error(err, |err| {
-                format!(
-                    "failed to extract volume set '{}': {err}{}",
-                    paths.join(", "),
-                    rar50_buffered_decode_limit_hint(err)
-                )
+                format!("failed to extract volume set '{}': {err}", paths.join(", "),)
             })
         })?;
         let outputs = state.into_inner().outputs;
@@ -1931,7 +1897,7 @@ pub(crate) fn resolve_password_args(args: &PasswordArgs) -> CliResult<Option<Pas
 
 #[cfg(test)]
 mod tests {
-    use super::{display_text, parse_size, rar50_buffered_decode_limit_hint};
+    use super::{display_text, parse_size};
     use crate::output::{checked_output_path, output_relative_path, redirection_warning};
     use crate::password::{error_needs_password, should_prompt_password};
     use crate::volumes::{infer_part_index, rar50_volume_part_path, volume_part_path};
@@ -1985,23 +1951,6 @@ mod tests {
         assert_eq!(parse_size("2g").unwrap(), 2 * 1024 * 1024 * 1024);
         assert!(parse_size("m").is_err());
         assert!(parse_size("").is_err());
-    }
-
-    #[test]
-    fn rar50_buffered_decode_limit_hint_names_cli_option() {
-        let error = Error::AtEntry {
-            name: b"large.bin".to_vec(),
-            operation: "decoding",
-            source: Box::new(Error::Rar50BufferedDecodeLimitExceeded {
-                limit: 512 * 1024 * 1024,
-                required: 900 * 1024 * 1024,
-            }),
-        };
-
-        assert_eq!(
-            rar50_buffered_decode_limit_hint(&error),
-            "\nhint: retry with --rar50-buffered-decode-limit 943718400 if you trust this archive and have enough memory"
-        );
     }
 
     #[test]

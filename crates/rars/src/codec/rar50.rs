@@ -3124,11 +3124,19 @@ impl<'w> StreamingOutput<'w> {
     }
 }
 
+/// The input ending mid-block is truncation; any other read error is the
+/// caller's and passes through.
+fn block_read_error(error: std::io::Error) -> Error {
+    if error.kind() == std::io::ErrorKind::UnexpectedEof {
+        Error::NeedMoreInput
+    } else {
+        Error::Io(error.into())
+    }
+}
+
 fn read_compressed_block(input: &mut impl Read) -> Result<OwnedCompressedBlock> {
     let mut fixed = [0u8; 2];
-    input
-        .read_exact(&mut fixed)
-        .map_err(|_| Error::NeedMoreInput)?;
+    input.read_exact(&mut fixed).map_err(block_read_error)?;
     let flags = fixed[0];
     let checksum = fixed[1];
     let size_bytes_len = match (flags >> 3) & 0x03 {
@@ -3140,7 +3148,7 @@ fn read_compressed_block(input: &mut impl Read) -> Result<OwnedCompressedBlock> 
     let mut size_bytes = [0u8; 3];
     input
         .read_exact(&mut size_bytes[..size_bytes_len])
-        .map_err(|_| Error::NeedMoreInput)?;
+        .map_err(block_read_error)?;
 
     let actual = size_bytes[..size_bytes_len]
         .iter()
@@ -3156,9 +3164,7 @@ fn read_compressed_block(input: &mut impl Read) -> Result<OwnedCompressedBlock> 
             acc | (usize::from(byte) << (index * 8))
         });
     let mut payload = vec![0; payload_size];
-    input
-        .read_exact(&mut payload)
-        .map_err(|_| Error::NeedMoreInput)?;
+    input.read_exact(&mut payload).map_err(block_read_error)?;
     let final_byte_bits = ((flags & 0x07) + 1).min(8);
     let payload_bits = if payload_size == 0 {
         0
@@ -5862,6 +5868,39 @@ mod tests {
             b"BAAB"
         );
         assert_eq!(window_bytes(&decoder.window), b"BABAAB");
+    }
+
+    #[test]
+    fn block_reader_errors_pass_through_and_eof_is_truncation() {
+        struct Failing;
+        impl Read for Failing {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk gone"))
+            }
+        }
+        let decode = |input: &mut dyn Read| {
+            Unpack50Decoder::new().decode_member_from_reader_with_dictionary_to_sink(
+                &mut &mut *input,
+                0,
+                4,
+                6,
+                false,
+                |_| Ok::<(), std::io::Error>(()),
+            )
+        };
+
+        let err = decode(&mut Failing).unwrap_err();
+        assert!(
+            matches!(&err, StreamDecodeError::Decode(Error::Io(e)) if e.message == "disk gone"),
+            "{err:?}"
+        );
+        let payload = literal_only_payload(b"ABBA");
+        let block = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+        let err = decode(&mut std::io::Cursor::new(&block[..block.len() - 1])).unwrap_err();
+        assert!(
+            matches!(err, StreamDecodeError::Decode(Error::NeedMoreInput)),
+            "{err:?}"
+        );
     }
 
     #[test]

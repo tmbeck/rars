@@ -1,14 +1,13 @@
 use super::{blake2sp, Archive, ExtractedEntryMeta, FileHeader, FileRedirection, FHFL_UNPUNKNOWN};
 use crate::codec::rar50::{DecodeMode, DecodedChunk, StreamDecodeError, Unpack50Decoder};
-use crate::crc32::{crc32, Crc32};
+use crate::crc32::Crc32;
 use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
 use crate::error::{Error, Result};
 use crate::volume_extract::{ChainedReader, SplitVolumeState, SplitVolumeStep};
 use std::io::{Read, Write};
 
-// Filtered RAR5 members still need whole-member byte transforms. Members at or
-// below this boundary use the buffered path, while larger members stream once
-// and reject filtered streams through the codec's typed sentinel.
+// The largest member `extract_to_parallel_buffered` decodes whole in memory so
+// members can be decoded in parallel. Every other path streams.
 #[cfg(not(test))]
 const BUFFERED_DECODE_LIMIT: u64 = 512 * 1024 * 1024;
 #[cfg(test)]
@@ -104,52 +103,6 @@ impl FileHeader {
             .is_some_and(|hash| hash.hash_type == 0 && hash.data.len() == 32)
     }
 
-    fn verify_integrity_with_keys(&self, data: &[u8], keys: Option<&Rar50Keys>) -> Result<()> {
-        if let Some(expected) = self
-            .data_crc32
-            .filter(|_| !self.blake2sp_supersedes_crc32())
-        {
-            let actual = crc32(data);
-            let actual = if self.uses_hash_mac() {
-                let keys = keys.ok_or(Error::InvalidHeader(
-                    "RAR 5 encrypted hash MAC needs encryption keys",
-                ))?;
-                keys.mac_crc32(actual)
-            } else {
-                actual
-            };
-            if actual != expected {
-                return Err(Error::Crc32Mismatch { expected, actual });
-            }
-        }
-
-        let Some(hash) = &self.hash else {
-            return Ok(());
-        };
-        match hash.hash_type {
-            0 if hash.data.len() == 32 => {
-                let actual = blake2sp::hash(data);
-                let actual = if self.uses_hash_mac() {
-                    let keys = keys.ok_or(Error::InvalidHeader(
-                        "RAR 5 encrypted hash MAC needs encryption keys",
-                    ))?;
-                    keys.mac_hash32(actual)
-                } else {
-                    actual
-                };
-                if constant_time_eq(&hash.data, &actual) {
-                    Ok(())
-                } else {
-                    Err(Error::HashMismatch { hash_type: 0 })
-                }
-            }
-            0 => Err(Error::InvalidHeader(
-                "RAR 5 BLAKE2sp hash record has invalid length",
-            )),
-            _ => Ok(()),
-        }
-    }
-
     fn verify_streaming_integrity(
         &self,
         crc: Crc32,
@@ -222,7 +175,7 @@ impl FileHeader {
         password: Option<&[u8]>,
         out: &mut impl Write,
     ) -> Result<()> {
-        let mut session = DecoderSession::new_with_password(password, BUFFERED_DECODE_LIMIT);
+        let mut session = DecoderSession::new_with_password(password);
         session.write_file_to(archive, self, out)
     }
 
@@ -231,48 +184,14 @@ impl FileHeader {
         archive: &Archive,
         password: Option<&[u8]>,
     ) -> Result<Vec<u8>> {
-        let mut decoder = Unpack50Decoder::new();
-        Ok(self
-            .decoded_data_with_decoder(archive, &mut decoder, password)?
-            .data)
-    }
-
-    fn decoded_data_with_decoder(
-        &self,
-        archive: &Archive,
-        decoder: &mut Unpack50Decoder,
-        password: Option<&[u8]>,
-    ) -> Result<DecodedData> {
-        let (packed, keys) = self.packed_data_with_password(archive, password)?;
-        let data = self.decode_packed_with_decoder(&packed, decoder)?;
-        Ok(DecodedData { data, keys })
-    }
-
-    fn decoded_data_with_mode(
-        &self,
-        archive: &Archive,
-        decoder: &mut Unpack50Decoder,
-        password: Option<&[u8]>,
-        mode: DecodeMode,
-    ) -> Result<DecodedData> {
-        let (packed, keys) = self.packed_data_with_password(archive, password)?;
-        let data = self.decode_packed_with_decoder_mode(&packed, decoder, mode)?;
-        Ok(DecodedData { data, keys })
+        let (packed, _) = self.packed_data_with_password(archive, password)?;
+        self.decode_packed_with_decoder(&packed, &mut Unpack50Decoder::new())
     }
 
     fn decode_packed_with_decoder(
         &self,
         packed: &[u8],
         decoder: &mut Unpack50Decoder,
-    ) -> Result<Vec<u8>> {
-        self.decode_packed_with_decoder_mode(packed, decoder, DecodeMode::Lz)
-    }
-
-    fn decode_packed_with_decoder_mode(
-        &self,
-        packed: &[u8],
-        decoder: &mut Unpack50Decoder,
-        mode: DecodeMode,
     ) -> Result<Vec<u8>> {
         if self.is_stored() {
             if self.encrypted {
@@ -313,7 +232,7 @@ impl FileHeader {
             output_size,
             dictionary_size,
             info.solid,
-            mode,
+            DecodeMode::Lz,
         ) {
             Ok(data) => Ok(data),
             Err(error) => self.map_truncated_unverified_payload(error),
@@ -351,30 +270,42 @@ impl FileHeader {
             .map_err(|_| Error::InvalidHeader("RAR 5 unpacked size overflows host address size"))?;
         let mut crc = Crc32::new();
         let mut hash = streaming_hash_verifier(self)?;
-        decoder
-            .decode_member_from_reader_with_dictionary_to_sink(
-                packed,
-                info.algorithm_version,
-                output_size,
-                dictionary_size,
-                info.solid,
-                |chunk| match chunk {
-                    DecodedChunk::Bytes(chunk) => {
-                        crc.update(chunk);
-                        if let Some((_, hasher)) = &mut hash {
-                            hasher.update(chunk);
-                        }
-                        writer.write_all(chunk)
+        let mut written = 0u64;
+        let decoded = decoder.decode_member_from_reader_with_dictionary_to_sink(
+            packed,
+            info.algorithm_version,
+            output_size,
+            dictionary_size,
+            info.solid,
+            |chunk| match chunk {
+                DecodedChunk::Bytes(chunk) => {
+                    written += chunk.len() as u64;
+                    crc.update(chunk);
+                    if let Some((_, hasher)) = &mut hash {
+                        hasher.update(chunk);
                     }
-                    DecodedChunk::Repeated { byte, len } => {
-                        write_repeated_chunk(writer, &mut crc, &mut hash, byte, len)
-                    }
-                },
-            )
-            .map_err(|error| match error {
-                StreamDecodeError::Decode(error) => Error::from(error),
-                StreamDecodeError::Sink(error) => Error::from(error),
-            })?;
+                    writer.write_all(chunk)
+                }
+                DecodedChunk::Repeated { byte, len } => {
+                    written += len as u64;
+                    write_repeated_chunk(writer, &mut crc, &mut hash, byte, len)
+                }
+            },
+        );
+        match decoded {
+            Ok(()) => {}
+            // A stream that ends before any byte reached the writer makes an
+            // empty member when nothing records what it should hold, or when
+            // it should hold nothing (the checksums below then judge it).
+            // Once bytes are out, truncation is an error: they cannot be
+            // taken back.
+            Err(StreamDecodeError::Decode(crate::codec::Error::NeedMoreInput))
+                if written == 0
+                    && (self.unpacked_size == 0
+                        || (self.data_crc32.is_none() && self.hash.is_none())) => {}
+            Err(StreamDecodeError::Decode(error)) => return Err(Error::from(error)),
+            Err(StreamDecodeError::Sink(error)) => return Err(Error::from(error)),
+        }
         self.verify_streaming_integrity(crc, hash, keys)
     }
 
@@ -497,9 +428,7 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
     {
-        let buffered_decode_limit = rar50_buffered_decode_limit(options);
-        let mut session =
-            DecoderSession::new_with_password(options.password, buffered_decode_limit);
+        let mut session = DecoderSession::new_with_password(options.password);
         for file in self.files() {
             if let Some(redirection) = &file.redirection {
                 if emit_redirections {
@@ -541,10 +470,9 @@ impl Archive {
         }
 
         let password = options.password;
-        let buffered_decode_limit = rar50_buffered_decode_limit(options);
         let files: Vec<_> = self.files().collect();
         let entries = crate::parallel::map_collect(files, |file| {
-            decode_parallel_entry(self, file, password, buffered_decode_limit)
+            decode_parallel_entry(self, file, password)
         })?;
         for entry in entries {
             write_parallel_entry(entry, &mut open, &mut |_, _| Ok(()))?;
@@ -569,7 +497,6 @@ fn decode_parallel_entry(
     archive: &Archive,
     file: &FileHeader,
     password: Option<&[u8]>,
-    buffered_decode_limit: u64,
 ) -> Result<ParallelExtractedEntry> {
     if let Some(redirection) = &file.redirection {
         return Ok(ParallelExtractedEntry::Redirection {
@@ -587,7 +514,7 @@ fn decode_parallel_entry(
         return Ok(ParallelExtractedEntry::Directory(meta));
     }
     let mut data = Vec::new();
-    let mut session = DecoderSession::new_with_password(password, buffered_decode_limit);
+    let mut session = DecoderSession::new_with_password(password);
     session.write_file_to(archive, file, &mut data)?;
     Ok(ParallelExtractedEntry::File { meta, data })
 }
@@ -616,26 +543,25 @@ where
     Ok(())
 }
 
-struct DecodedData {
-    data: Vec<u8>,
-    keys: Option<Rar50Keys>,
-}
-
 struct DecoderSession<'a> {
     decoder: Unpack50Decoder,
     password: Option<&'a [u8]>,
-    buffered_decode_limit: u64,
 }
 
 impl<'a> DecoderSession<'a> {
-    fn new_with_password(password: Option<&'a [u8]>, buffered_decode_limit: u64) -> Self {
+    fn new_with_password(password: Option<&'a [u8]>) -> Self {
         Self {
             decoder: Unpack50Decoder::new(),
             password,
-            buffered_decode_limit,
         }
     }
 
+    /// Writes one member's bytes to `writer` as they are decoded, in memory
+    /// bounded by the dictionary and one filter block, whatever its size.
+    ///
+    /// The member's CRC32 or BLAKE2sp is checked after its last byte reaches
+    /// `writer`, so an error can follow bytes already written. A caller that
+    /// must not act on unverified bytes discards the member on error.
     fn write_file_to(
         &mut self,
         archive: &Archive,
@@ -645,35 +571,7 @@ impl<'a> DecoderSession<'a> {
         if file.is_stored() {
             return file.write_stored_to(archive, self.password, writer);
         }
-        if file.should_stream_decode(self.buffered_decode_limit) {
-            return self.stream_file_to(archive, file, writer);
-        }
-        let checkpoint = self.decoder.clone();
-        let decoded = self
-            .decoded_file_data(archive, file)
-            .map_err(|error| file.entry_error("decoding", error))?;
-        let decoded = match file.verify_integrity_with_keys(&decoded.data, decoded.keys.as_ref()) {
-            Ok(()) => decoded,
-            Err(filtered_error) => {
-                let mut unfiltered_decoder = checkpoint;
-                let unfiltered = file
-                    .decoded_data_with_mode(
-                        archive,
-                        &mut unfiltered_decoder,
-                        self.password,
-                        DecodeMode::LzNoFilters,
-                    )
-                    .map_err(|error| file.entry_error("decoding", error))?;
-                file.verify_integrity_with_keys(&unfiltered.data, unfiltered.keys.as_ref())
-                    .map_err(|_| file.entry_error("verifying", filtered_error))?;
-                self.decoder = unfiltered_decoder;
-                unfiltered
-            }
-        };
-        writer
-            .write_all(&decoded.data)
-            .map_err(Error::from)
-            .map_err(|error| file.entry_error("writing", error))
+        self.stream_file_to(archive, file, writer)
     }
 
     fn stream_file_to(
@@ -682,17 +580,13 @@ impl<'a> DecoderSession<'a> {
         file: &FileHeader,
         writer: &mut dyn Write,
     ) -> Result<()> {
-        // No checkpoint: an error ends the extraction, so the decoder state
-        // after it is never used again.
+        // An error ends the extraction, so the decoder state after it is
+        // never used again.
         let (mut packed, keys) = file
             .packed_reader_with_password(archive, self.password)
-            .map_err(|error| file.entry_error("reading", error))?;
+            .map_err(|error| file.entry_error("decoding", error))?;
         file.stream_packed_with_decoder(&mut packed, keys.as_ref(), &mut self.decoder, writer)
             .map_err(|error| file.entry_error("decoding", error))
-    }
-
-    fn decoded_file_data(&mut self, archive: &Archive, file: &FileHeader) -> Result<DecodedData> {
-        file.decoded_data_with_decoder(archive, &mut self.decoder, self.password)
     }
 
     fn split_decryptor(
@@ -701,16 +595,6 @@ impl<'a> DecoderSession<'a> {
         volumes: &[Archive],
     ) -> Result<Option<SplitDecryptor>> {
         split.split_decryptor(volumes, self.password)
-    }
-
-    fn decode_split(
-        &mut self,
-        volumes: &[Archive],
-        split: &PendingSplitRefs,
-        final_file: &FileHeader,
-        decryptor: Option<&SplitDecryptor>,
-    ) -> Result<Vec<u8>> {
-        final_file.decode_split_with_decoder(volumes, split, &mut self.decoder, decryptor)
     }
 }
 
@@ -768,8 +652,7 @@ where
 
     let password = options.password;
     let mut split = SplitVolumeState::new();
-    let buffered_decode_limit = rar50_buffered_decode_limit(options);
-    let mut session = DecoderSession::new_with_password(password, buffered_decode_limit);
+    let mut session = DecoderSession::new_with_password(password);
 
     for (volume_index, archive) in volumes.iter().enumerate() {
         for (file_index, file) in archive.files().enumerate() {
@@ -906,18 +789,22 @@ impl PendingSplitRefs {
                 .map_err(|error| final_file.entry_error("extracting", error));
         }
 
-        let data = session
-            .decode_split(volumes, &self, final_file, decryptor.as_ref())
+        // A damaged volume usually derails the decoder before the fragment it
+        // sits in is read to its end, so the reader's own check never fires and
+        // the member fails as "truncated" or with a checksum mismatch instead.
+        // `checksum_error` turns that into the volume's own mismatch.
+        let mut packed = self
+            .fragment_reader(volumes, decryptor.as_ref())
             .map_err(|error| final_file.entry_error("decoding", error))?;
         final_file
-            .verify_integrity_with_keys(&data, decryptor.as_ref().map(|decryptor| &decryptor.keys))
+            .stream_packed_with_decoder(
+                &mut packed,
+                decryptor.as_ref().map(|decryptor| &decryptor.keys),
+                &mut session.decoder,
+                &mut writer,
+            )
             .map_err(|error| self.checksum_error(volumes).unwrap_or(error))
-            .map_err(|error| final_file.entry_error("verifying", error))?;
-        writer
-            .write_all(&data)
-            .map_err(Error::from)
-            .map_err(|error| final_file.entry_error("writing", error))?;
-        Ok(())
+            .map_err(|error| final_file.entry_error("decoding", error))
     }
 
     fn write_stored_to(
@@ -1137,53 +1024,6 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
-impl FileHeader {
-    fn decode_split_with_decoder(
-        &self,
-        volumes: &[Archive],
-        split: &PendingSplitRefs,
-        decoder: &mut Unpack50Decoder,
-        decryptor: Option<&SplitDecryptor>,
-    ) -> Result<Vec<u8>> {
-        if self.is_stored() {
-            let mut data = Vec::new();
-            let mut reader = split.fragment_reader(volumes, decryptor)?;
-            reader.read_to_end(&mut data)?;
-            if data.len() as u64 != self.unpacked_size {
-                return Err(Error::InvalidHeader(
-                    "RAR 5 stored split file has mismatched packed and unpacked sizes",
-                ));
-            }
-            return Ok(data);
-        }
-
-        let info = self.decoded_compression_info()?;
-        let dictionary_size = usize::try_from(info.dictionary_size).map_err(|_| {
-            Error::InvalidHeader("RAR 5 dictionary size overflows host address size")
-        })?;
-        let mut reader = split.fragment_reader(volumes, decryptor)?;
-        let output_size = checked_unpacked_size(self.unpacked_size)?;
-        let decoded = decoder
-            .decode_member_from_reader_with_dictionary(
-                &mut reader,
-                info.algorithm_version,
-                output_size,
-                dictionary_size,
-                info.solid,
-                DecodeMode::Lz,
-            )
-            .map_err(Error::from);
-        // A damaged volume usually derails the decoder before the fragment it
-        // sits in is read to its end, so the reader's own check never fires and
-        // the member fails as "truncated" instead. Checking the fragments here
-        // turns that into the checksum mismatch it is.
-        match decoded {
-            Err(error) => Err(split.checksum_error(volumes).unwrap_or(error)),
-            decoded => decoded,
-        }
-    }
-}
-
 /// Feeds what it is given to a running CRC32 and keeps none of it.
 struct CrcSink<'a>(&'a mut Crc32);
 
@@ -1267,6 +1107,7 @@ mod tests {
         HFL_SPLIT_BEFORE,
     };
     use super::*;
+    use crate::crc32::crc32;
     use std::cell::RefCell;
     use std::io::Cursor;
     use std::rc::Rc;
@@ -1364,7 +1205,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_filtered_members_use_buffered_decode() {
+    fn small_filtered_members_extract() {
         let mut data = Vec::new();
         while data.len() + 29 <= BUFFERED_DECODE_LIMIT as usize {
             data.extend_from_slice(b"\xe8\0\0\0\0filtered payload block\n");
@@ -1388,8 +1229,6 @@ mod tests {
         .unwrap();
         let archive = Archive::parse(&archive).unwrap();
         let file = archive.files().next().unwrap();
-        assert!(!file.should_stream_decode(BUFFERED_DECODE_LIMIT));
-
         let mut out = Vec::new();
         file.write_to(&archive, None, &mut out).unwrap();
 
@@ -1426,6 +1265,47 @@ mod tests {
         file.write_to(&archive, None, &mut out).unwrap();
 
         assert_eq!(out, data);
+    }
+
+    #[test]
+    fn truncated_unverified_member_fails_once_bytes_are_written() {
+        // Varied text so the member compresses into several blocks.
+        let mut data = Vec::new();
+        let mut x = 1u32;
+        while data.len() < 1 << 20 {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            data.extend_from_slice(format!("{} ", x >> 20).as_bytes());
+        }
+        let archive = Rar50Writer::new(WriterOptions {
+            target: crate::ArchiveVersion::Rar50,
+            features: crate::FeatureSet::default(),
+            compression_level: Some(1),
+            dictionary_size: None,
+        })
+        .entries([entry(b"text.txt", &data)].to_vec())
+        .finish()
+        .unwrap();
+        let archive = Archive::parse(&archive).unwrap();
+        let mut file = archive.files().next().unwrap().clone();
+        assert!(!file.is_stored());
+        file.data_crc32 = None;
+        file.hash = None;
+        let (packed, _) = file.packed_data_with_password(&archive, None).unwrap();
+
+        let mut out = Vec::new();
+        let err = file
+            .stream_packed_with_decoder(
+                &mut Cursor::new(&packed[..packed.len() * 3 / 4]),
+                None,
+                &mut Unpack50Decoder::new(),
+                &mut out,
+            )
+            .unwrap_err();
+        assert!(out.len() > 64 * 1024, "{} bytes written", out.len());
+        assert!(
+            matches!(err, Error::Codec(crate::codec::Error::NeedMoreInput)),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -1491,6 +1371,17 @@ mod tests {
         }
     }
 
+    /// Checks `data` against `file`'s CRC32 and BLAKE2sp as extraction does.
+    fn verify(file: &FileHeader, data: &[u8]) -> Result<()> {
+        let mut crc = Crc32::new();
+        crc.update(data);
+        let mut hash = streaming_hash_verifier(file)?;
+        if let Some((_, hasher)) = &mut hash {
+            hasher.update(data);
+        }
+        file.verify_streaming_integrity(crc, hash, None)
+    }
+
     #[test]
     fn constant_time_hash_comparison_keeps_hash_validation_behaviour() {
         let data = b"hash me";
@@ -1518,35 +1409,14 @@ mod tests {
             crypto: None,
         };
 
-        file.verify_integrity_with_keys(data, None).unwrap();
+        verify(&file, data).unwrap();
 
         let mut wrong = file;
         wrong.hash.as_mut().unwrap().data[31] ^= 0x01;
         assert!(matches!(
-            wrong.verify_integrity_with_keys(data, None),
+            verify(&wrong, data),
             Err(Error::HashMismatch { hash_type: 0 })
         ));
-    }
-
-    #[test]
-    fn verify_integrity_rejects_bad_blake2sp_length_and_ignores_unknown_hash_type() {
-        let data = b"hash me";
-        let mut bad_length = plain_file(
-            b"a.txt",
-            data,
-            Some(FileHash {
-                hash_type: 0,
-                data: vec![0u8; 16],
-            }),
-        );
-        assert!(matches!(
-            bad_length.verify_integrity_with_keys(data, None),
-            Err(Error::InvalidHeader(_))
-        ));
-
-        bad_length.hash.as_mut().unwrap().hash_type = 99;
-        bad_length.hash.as_mut().unwrap().data = vec![0u8; 32];
-        bad_length.verify_integrity_with_keys(data, None).unwrap();
     }
 
     #[test]
@@ -2129,30 +1999,6 @@ mod tests {
             matches!(err, Error::HashMismatch { hash_type: 0 }),
             "expected hash mismatch, got {err:?}"
         );
-    }
-
-    #[test]
-    fn decoded_data_with_mode_dispatches_through_decode_packed_for_stored_files() {
-        let payload = b"decoded_data_with_mode stored payload";
-        let mut file = plain_file(b"a.txt", payload, None);
-        file.block.data_range = 0..payload.len();
-        file.block.data_size = Some(payload.len() as u64);
-        file.unpacked_size = payload.len() as u64;
-
-        let archive = archive_with_blocks(vec![Block::File(file.clone())], payload.to_vec());
-        let mut decoder = Unpack50Decoder::new();
-        let decoded = file
-            .decoded_data_with_mode(&archive, &mut decoder, None, DecodeMode::Lz)
-            .unwrap();
-        assert_eq!(decoded.data, payload);
-        assert!(decoded.keys.is_none());
-
-        // LzNoFilters dispatches through the same stored short-circuit.
-        let mut decoder = Unpack50Decoder::new();
-        let decoded = file
-            .decoded_data_with_mode(&archive, &mut decoder, None, DecodeMode::LzNoFilters)
-            .unwrap();
-        assert_eq!(decoded.data, payload);
     }
 
     #[test]
