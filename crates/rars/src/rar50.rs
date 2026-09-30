@@ -23,6 +23,9 @@ pub use write::{
     WriterOptions,
 };
 
+/// UnRAR's MAX_HEADER_SIZE_RAR5: no valid header is larger, and checking it
+/// before the read keeps a corrupt size from becoming a huge allocation.
+const MAX_HEADER_SIZE: usize = 2 * 1024 * 1024;
 const HEAD_MAIN: u64 = 1;
 const HEAD_FILE: u64 = 2;
 const HEAD_SERVICE: u64 = 3;
@@ -1767,6 +1770,9 @@ fn parse_block_header_bytes(
         .checked_add(header_size_len)
         .and_then(|size| size.checked_add(header_body_len))
         .ok_or(Error::InvalidHeader("RAR 5 header size overflows usize"))?;
+    if header_total > MAX_HEADER_SIZE {
+        return Err(Error::InvalidHeader("RAR 5 header is larger than 2 MiB"));
+    }
     if header_total > remaining {
         return Err(Error::TooShort);
     }
@@ -1812,6 +1818,9 @@ fn parse_encrypted_block_header_bytes(
         .checked_add(header_size_len)
         .and_then(|size| size.checked_add(header_body_len))
         .ok_or(Error::InvalidHeader("RAR 5 header size overflows usize"))?;
+    if header_total > MAX_HEADER_SIZE {
+        return Err(Error::InvalidHeader("RAR 5 header is larger than 2 MiB"));
+    }
     let encrypted_len = checked_align16(header_total, "RAR 5 encrypted header size overflows")?;
     let disk_header_len = 16usize
         .checked_add(encrypted_len)
@@ -1859,6 +1868,9 @@ fn read_block_header_at(
         .checked_add(header_size_len)
         .and_then(|size| size.checked_add(header_body_len))
         .ok_or(Error::InvalidHeader("RAR 5 header size overflows usize"))?;
+    if header_total > MAX_HEADER_SIZE {
+        return Err(Error::InvalidHeader("RAR 5 header is larger than 2 MiB"));
+    }
     if header_total > remaining {
         return Err(Error::TooShort);
     }
@@ -1899,6 +1911,9 @@ fn read_encrypted_block_header_at(
         .checked_add(header_size_len)
         .and_then(|size| size.checked_add(header_body_len))
         .ok_or(Error::InvalidHeader("RAR 5 header size overflows usize"))?;
+    if header_total > MAX_HEADER_SIZE {
+        return Err(Error::InvalidHeader("RAR 5 header is larger than 2 MiB"));
+    }
     let encrypted_len = checked_align16(header_total, "RAR 5 encrypted header size overflows")?;
     let disk_header_len = 16usize
         .checked_add(encrypted_len)
@@ -2430,5 +2445,45 @@ mod tests {
     fn parse_htime_rejects_a_short_record() {
         let rec = [0x02, 1, 2, 3];
         assert_eq!(parse_htime(&rec, 0..rec.len()), None);
+    }
+
+    /// UnRAR refuses a RAR 5 header over 2 MiB (MAX_HEADER_SIZE_RAR5). One
+    /// corrupt size vint must not become a gigabyte allocation.
+    #[test]
+    fn a_header_over_two_mib_is_refused_before_it_is_read() {
+        let dir = std::env::temp_dir().join(format!("rars-hdr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big-header.rar");
+        let mut head = RAR50_SIGNATURE.to_vec();
+        head.extend_from_slice(&[0, 0, 0, 0]); // header CRC (never reached)
+        head.extend_from_slice(&[0x80, 0x80, 0x80, 0x10]); // header size: 32 MiB
+        head.push(1); // HEAD_MAIN
+        std::fs::write(&path, &head).unwrap();
+        // Make the file long enough that the declared header "fits".
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(64 << 20)
+            .unwrap();
+        let err = crate::ArchiveReader::read_path(&path).unwrap_err();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            err,
+            Error::AtArchiveOffset {
+                offset: 8,
+                source: Box::new(Error::InvalidHeader("RAR 5 header is larger than 2 MiB")),
+            }
+        );
+
+        let mut bytes = head.clone();
+        bytes.resize(40 << 20, 0);
+        assert_eq!(
+            Archive::parse(&bytes).unwrap_err(),
+            Error::AtArchiveOffset {
+                offset: 8,
+                source: Box::new(Error::InvalidHeader("RAR 5 header is larger than 2 MiB")),
+            }
+        );
     }
 }
