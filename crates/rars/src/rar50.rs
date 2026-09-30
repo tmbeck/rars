@@ -212,6 +212,10 @@ pub struct FileHeader {
     pub hash: Option<FileHash>,
     pub redirection: Option<FileRedirection>,
     pub service_data: Option<Vec<u8>>,
+    /// Indexes into [`Archive::blocks`] of the `Service` blocks that follow
+    /// this file (NTFS streams, ACLs, a file comment). See
+    /// [`Archive::file_services`].
+    pub services: Vec<usize>,
     pub encrypted: bool,
     pub encryption: Option<FileEncryption>,
     crypto: Option<FileCryptoState>,
@@ -331,7 +335,27 @@ pub struct ExtractedEntryMeta {
     pub blake2sp: Option<[u8; 32]>,
     /// Unpacked size; `None` when the header flags it unknown.
     pub unpacked_size: Option<u64>,
+    /// Service records that follow the file, such as NTFS streams (`STM`)
+    /// and security descriptors (`ACL`). Filled by extraction;
+    /// [`FileHeader::metadata`] alone cannot see them and leaves it empty.
+    /// Read one's data with [`Archive::service_data`].
+    pub services: Vec<ServiceInfo>,
 }
+
+/// A service record attached to a file, as extraction reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ServiceInfo {
+    /// Service name, such as `STM` or `ACL`.
+    pub name: Vec<u8>,
+    /// The `FHEXTRA_SUBDATA` record: an `STM` service's stream name.
+    pub sub_data: Option<Vec<u8>>,
+    pub unpacked_size: u64,
+}
+
+/// The largest service payload [`Archive::service_data`] reads, as UnRAR's
+/// `ReadSubData`: no valid archive needs a bigger allocation.
+pub const SERVICE_DATA_LIMIT: u64 = 16 * 1024 * 1024;
 
 impl FileHeader {
     pub fn name_bytes(&self) -> &[u8] {
@@ -662,6 +686,48 @@ impl Archive {
             Block::Service(service) => Some(service),
             _ => None,
         })
+    }
+
+    /// The service blocks that follow `file`, which must come from this
+    /// archive's [`Self::files`].
+    pub fn file_services<'a>(
+        &'a self,
+        file: &'a FileHeader,
+    ) -> impl Iterator<Item = &'a FileHeader> + 'a {
+        file.services
+            .iter()
+            .filter_map(|&index| match self.blocks.get(index) {
+                Some(Block::Service(service)) => Some(service),
+                _ => None,
+            })
+    }
+
+    /// Reads a service block's data (such as one from [`Self::file_services`])
+    /// and verifies it against its CRC32 or BLAKE2sp. Refuses a service split
+    /// across volumes, and a payload whose size is unknown or over
+    /// [`SERVICE_DATA_LIMIT`].
+    pub fn service_data(&self, service: &FileHeader, password: Option<&[u8]>) -> Result<Vec<u8>> {
+        if service.is_split_before() || service.is_split_after() {
+            return Err(Error::InvalidHeader(
+                "RAR 5 split service requires multivolume extraction",
+            ));
+        }
+        let limit = service
+            .size_limit()
+            .filter(|&size| size <= SERVICE_DATA_LIMIT)
+            .ok_or(Error::InvalidHeader(
+                "RAR 5 service data size is unknown or too large",
+            ))?;
+        let mut data = Vec::new();
+        service.write_to(
+            self,
+            password,
+            &mut LimitedVec {
+                data: &mut data,
+                limit,
+            },
+        )?;
+        Ok(data)
     }
 
     /// Decodes the archive-level `CMT` service payload, if any.
@@ -1230,6 +1296,7 @@ fn parse_file_header_bytes(parsed: &ParsedBlockHeader) -> Result<FileHeader> {
         hash: None,
         redirection: None,
         service_data: None,
+        services: Vec::new(),
         encrypted: false,
         encryption: None,
         crypto: None,
@@ -1372,6 +1439,28 @@ fn parse_htime(input: &[u8], range: Range<usize>) -> Option<FileTimes> {
         ctime,
         atime,
     })
+}
+
+/// A `Vec` writer that refuses to grow past `limit` bytes.
+struct LimitedVec<'a> {
+    data: &'a mut Vec<u8>,
+    limit: u64,
+}
+
+impl Write for LimitedVec<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if (self.data.len() + buf.len()) as u64 > self.limit {
+            return Err(std::io::Error::other(
+                "RAR 5 service data exceeds its unpacked size",
+            ));
+        }
+        self.data.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Unix owner from the `FHEXTRA_UOWNER` record.
@@ -1636,6 +1725,10 @@ where
     pos = first.next_offset;
 
     let mut blocks = Vec::new();
+    // The file that service blocks attach to: the last one seen. Services
+    // before the first file (an archive comment) stay archive-level, as do
+    // quick open data and a recovery record, which sit after the last file.
+    let mut last_file = None;
     while pos < archive_len {
         let parsed = if let Some(keys) = &header_keys {
             read_encrypted_block(pos, keys).map_err(|error| error.at_archive_offset(pos))?
@@ -1649,6 +1742,7 @@ where
                     .map_err(|error| error.at_archive_offset(pos))?;
                 attach_file_crypto(&mut file, password)
                     .map_err(|error| error.at_archive_offset(pos))?;
+                last_file = Some(blocks.len());
                 blocks.push(Block::File(file));
             }
             HEAD_SERVICE => {
@@ -1656,6 +1750,14 @@ where
                     .map_err(|error| error.at_archive_offset(pos))?;
                 attach_service_crypto(&mut service, password)
                     .map_err(|error| error.at_archive_offset(pos))?;
+                let index = blocks.len();
+                let archive_level = service.name == b"QO" || service.name == b"RR";
+                if let Some(Block::File(file)) = last_file
+                    .filter(|_| !archive_level)
+                    .and_then(|i| blocks.get_mut(i))
+                {
+                    file.services.push(index);
+                }
                 blocks.push(Block::Service(service));
             }
             HEAD_CRYPT => {
@@ -2318,6 +2420,7 @@ mod tests {
             hash: None,
             redirection: None,
             service_data: None,
+            services: Vec::new(),
             encrypted: false,
             encryption: None,
             crypto: None,

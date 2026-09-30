@@ -1,4 +1,7 @@
-use super::{blake2sp, Archive, ExtractedEntryMeta, FileHeader, FileRedirection, FHFL_UNPUNKNOWN};
+use super::{
+    blake2sp, Archive, ExtractedEntryMeta, FileHeader, FileRedirection, ServiceInfo,
+    FHFL_UNPUNKNOWN,
+};
 use crate::codec::rar50::{DecodeMode, DecodedChunk, StreamDecodeError, Unpack50Decoder};
 use crate::crc32::Crc32;
 use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
@@ -167,6 +170,7 @@ impl FileHeader {
                 .filter(|h| h.hash_type == 0)
                 .and_then(|h| <[u8; 32]>::try_from(h.data.as_slice()).ok()),
             unpacked_size: self.size_limit(),
+            services: Vec::new(),
         }
     }
 
@@ -408,6 +412,20 @@ fn write_repeated_chunk(
 }
 
 impl Archive {
+    /// `file.metadata()` with the services that follow `file` in this archive.
+    fn entry_metadata(&self, file: &FileHeader) -> ExtractedEntryMeta {
+        let mut meta = file.metadata();
+        meta.services = self
+            .file_services(file)
+            .map(|service| ServiceInfo {
+                name: service.name.clone(),
+                sub_data: service.service_data.clone(),
+                unpacked_size: service.unpacked_size,
+            })
+            .collect();
+        meta
+    }
+
     pub fn extract_to<F>(&self, options: crate::ArchiveReadOptions<'_>, mut open: F) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -443,7 +461,7 @@ impl Archive {
         for file in self.files() {
             if let Some(redirection) = &file.redirection {
                 if emit_redirections {
-                    redirect(&file.metadata(), redirection)?;
+                    redirect(&self.entry_metadata(file), redirection)?;
                 }
                 continue;
             }
@@ -452,7 +470,7 @@ impl Archive {
                     "RAR 5 split entry requires multivolume extraction",
                 ));
             }
-            let meta = file.metadata();
+            let meta = self.entry_metadata(file);
             let mut writer = open(&meta)?;
             if !meta.is_directory {
                 session.write_file_to(self, file, &mut writer)?;
@@ -511,7 +529,7 @@ fn decode_parallel_entry(
 ) -> Result<ParallelExtractedEntry> {
     if let Some(redirection) = &file.redirection {
         return Ok(ParallelExtractedEntry::Redirection {
-            meta: file.metadata(),
+            meta: archive.entry_metadata(file),
             redirection: redirection.clone(),
         });
     }
@@ -520,7 +538,7 @@ fn decode_parallel_entry(
             "RAR 5 split entry requires multivolume extraction",
         ));
     }
-    let meta = file.metadata();
+    let meta = archive.entry_metadata(file);
     if meta.is_directory {
         return Ok(ParallelExtractedEntry::Directory(meta));
     }
@@ -612,7 +630,7 @@ impl<'a> DecoderSession<'a> {
 impl FileHeader {
     /// The unpacked size, or `None` when it is unknown (`rar -si` records a
     /// placeholder).
-    fn size_limit(&self) -> Option<u64> {
+    pub(super) fn size_limit(&self) -> Option<u64> {
         (self.file_flags & FHFL_UNPUNKNOWN == 0).then_some(self.unpacked_size)
     }
 
@@ -729,11 +747,11 @@ where
                 SplitVolumeStep::Regular => {
                     if let Some(redirection) = &file.redirection {
                         if emit_redirections {
-                            redirect(&file.metadata(), redirection)?;
+                            redirect(&archive.entry_metadata(file), redirection)?;
                         }
                         continue;
                     }
-                    let meta = file.metadata();
+                    let meta = archive.entry_metadata(file);
                     let mut writer = open(&meta)?;
                     if !meta.is_directory {
                         session.write_file_to(archive, file, &mut writer)?;
@@ -741,7 +759,9 @@ where
                 }
                 SplitVolumeStep::Start => {
                     validate_split_fragment(file, password)?;
-                    split.begin(PendingSplitRefs::new(file, volume_index, file_index));
+                    let mut pending = PendingSplitRefs::new(file, volume_index, file_index);
+                    pending.meta.services = archive.entry_metadata(file).services;
+                    split.begin(pending);
                 }
                 SplitVolumeStep::Continue(current) => {
                     validate_split_continuation_refs(current, file, password)?;
@@ -843,10 +863,19 @@ impl PendingSplitRefs {
         let decryptor = session.split_decryptor(&self, volumes)?;
         let mut meta = self.meta.clone();
         // The whole member's checksum and size live on its final fragment.
-        let last = final_file.metadata();
+        // `append` has recorded the final fragment, so `fragments` is never
+        // empty here.
+        let last = match self.fragments.last() {
+            Some(&(volume, _)) => volumes[volume].entry_metadata(final_file),
+            None => final_file.metadata(),
+        };
         meta.crc32 = last.crc32;
         meta.blake2sp = last.blake2sp;
         meta.unpacked_size = last.unpacked_size;
+        // Services follow the fragment they describe, normally the last.
+        if !last.services.is_empty() {
+            meta.services = last.services;
+        }
         let mut writer = open(&meta)?;
         // Whatever goes wrong with a member split across volumes, the fragment
         // checksums may know which volume to blame. Ask them before giving the
@@ -1208,6 +1237,7 @@ mod tests {
             hash,
             redirection: None,
             service_data: None,
+            services: Vec::new(),
             encrypted: false,
             encryption: None,
             crypto: None,
@@ -1533,6 +1563,7 @@ mod tests {
             }),
             redirection: None,
             service_data: None,
+            services: Vec::new(),
             encrypted: false,
             encryption: None,
             crypto: None,
@@ -1774,6 +1805,7 @@ mod tests {
                 }),
                 redirection: None,
                 service_data: None,
+                services: Vec::new(),
                 encrypted: false,
                 encryption: None,
                 crypto: None,
@@ -1818,6 +1850,7 @@ mod tests {
             hash: None,
             redirection: None,
             service_data: None,
+            services: Vec::new(),
             encrypted: false,
             encryption: None,
             crypto: None,

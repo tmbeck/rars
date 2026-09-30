@@ -424,6 +424,7 @@ struct PendingSplitRefs {
     unp_ver: u8,
     encrypted: bool,
     salt: Option<[u8; 8]>,
+    owner: Option<crate::rar50::UnixOwner>,
 }
 
 impl PendingSplitRefs {
@@ -442,11 +443,16 @@ impl PendingSplitRefs {
             unp_ver: file.unp_ver,
             encrypted: file.is_encrypted(),
             salt: file.salt,
+            owner: file.owner.clone(),
         }
     }
 
-    fn append(&mut self, _file: &FileHeader, volume_index: usize, file_index: usize) {
+    fn append(&mut self, file: &FileHeader, volume_index: usize, file_index: usize) {
         self.fragments.push((volume_index, file_index));
+        // A `UOW` subblock may follow any fragment; the last one wins.
+        if file.owner.is_some() {
+            self.owner = file.owner.clone();
+        }
     }
 
     fn write_to<F>(
@@ -471,6 +477,7 @@ impl PendingSplitRefs {
             atime: self.atime,
             crc32: final_file.file_crc,
             unpacked_size: final_file.unp_size,
+            owner: self.owner.clone(),
         };
         let mut writer = open(&meta)?;
         let mut reader = self.fragment_reader(volumes, password)?;
@@ -742,6 +749,8 @@ mod tests {
             file_comment: Vec::new(),
             ext_time: Vec::new(),
             packed_range: 0..0,
+            sub_data: Vec::new(),
+            owner: None,
         }
     }
 
@@ -1428,6 +1437,57 @@ mod tests {
         let opened = capture.opened.borrow();
         assert_eq!(opened.len(), 1);
         assert_eq!(opened[0].name, b"split.txt");
+    }
+
+    #[test]
+    fn a_split_member_takes_the_owner_of_its_last_fragment_that_has_one() {
+        let payload = b"owned payload across volumes".to_vec();
+        let split = 9usize;
+        let owner = |name: &[u8]| crate::rar50::UnixOwner {
+            user: Some(name.to_vec()),
+            group: Some(b"staff".to_vec()),
+            uid: None,
+            gid: None,
+        };
+        let cases = [
+            (
+                Some(owner(b"first")),
+                Some(owner(b"last")),
+                Some(owner(b"last")),
+            ),
+            (Some(owner(b"first")), None, Some(owner(b"first"))),
+            (None, None, None),
+        ];
+        for (first_owner, second_owner, expected) in cases {
+            let mut first = file(b"split.txt", FHD_SPLIT_AFTER);
+            first.unp_ver = 20;
+            first.pack_size = split as u64;
+            first.unp_size = payload.len() as u64;
+            first.packed_range = 0..split;
+            first.file_crc = super::super::crc32(&payload);
+            first.owner = first_owner;
+
+            let mut second = file(b"split.txt", FHD_SPLIT_BEFORE);
+            second.unp_ver = 20;
+            second.pack_size = (payload.len() - split) as u64;
+            second.unp_size = payload.len() as u64;
+            second.packed_range = 0..(payload.len() - split);
+            second.file_crc = super::super::crc32(&payload);
+            second.owner = second_owner;
+
+            let volumes = vec![
+                archive_with_source(vec![Block::File(first)], payload[..split].to_vec()),
+                archive_with_source(vec![Block::File(second)], payload[split..].to_vec()),
+            ];
+            let capture = Capture::default();
+            extract_volumes_to(
+                &volumes,
+                crate::ArchiveReadOptions::default(),
+                capture.opener(),
+            )
+            .unwrap();
+            assert_eq!(capture.opened.borrow()[0].owner, expected);
+        }
     }
 
     #[test]

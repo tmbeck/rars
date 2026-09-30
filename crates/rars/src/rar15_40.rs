@@ -159,6 +159,12 @@ pub struct FileHeader {
     pub file_comment: Vec<u8>,
     pub ext_time: Vec<u8>,
     pub packed_range: Range<usize>,
+    /// A NEWSUB block's service data: the header bytes between the name and
+    /// the salt. Empty for a file block.
+    pub sub_data: Vec<u8>,
+    /// Unix owner and group names from a `UOW` subblock (`rar -ow`) that
+    /// follows this file. RAR 1.5-4 records names only, never ids.
+    pub owner: Option<crate::rar50::UnixOwner>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -424,6 +430,8 @@ pub struct ExtractedEntryMeta {
     /// CRC32 of the unpacked data (of the whole member for a split one).
     pub crc32: u32,
     pub unpacked_size: u64,
+    /// Unix owner and group names from a `UOW` subblock.
+    pub owner: Option<crate::rar50::UnixOwner>,
 }
 
 impl FileHeader {
@@ -714,6 +722,7 @@ impl FileHeader {
             atime,
             crc32: self.file_crc,
             unpacked_size: self.unp_size,
+            owner: self.owner.clone(),
         }
     }
 
@@ -1229,6 +1238,7 @@ impl Archive {
             }
         }
 
+        link_owners(&mut blocks);
         Ok(Self {
             sfx_offset: sig.offset,
             main,
@@ -1342,6 +1352,7 @@ impl Archive {
             }
         }
 
+        link_owners(&mut blocks);
         Ok(Self {
             sfx_offset,
             main,
@@ -1549,6 +1560,42 @@ where
         }
     }
     Ok(())
+}
+
+/// Gives each file the owner of the `UOW` subblock that follows it. Like
+/// UnRAR, which applies a subblock to the file it last extracted, a subblock
+/// before any file, one with an unknown name, or one whose data has no NUL
+/// between owner and group is ignored.
+fn link_owners(blocks: &mut [Block]) {
+    let mut last_file = None;
+    for index in 0..blocks.len() {
+        match &blocks[index] {
+            Block::File(_) => last_file = Some(index),
+            Block::NewSub(sub) if sub.file.name == b"UOW" => {
+                let owner = parse_uow(&sub.file.sub_data);
+                if let (Some(owner), Some(file)) = (owner, last_file) {
+                    if let Block::File(file) = &mut blocks[file] {
+                        file.owner = Some(owner);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// UnRAR `ExtractUnixOwner30`: the owner name, a NUL, then the group name,
+/// which need not be NUL-terminated.
+fn parse_uow(sub_data: &[u8]) -> Option<crate::rar50::UnixOwner> {
+    let nul = sub_data.iter().position(|&byte| byte == 0)?;
+    let group = &sub_data[nul + 1..];
+    let group = &group[..group.iter().position(|&b| b == 0).unwrap_or(group.len())];
+    Some(crate::rar50::UnixOwner {
+        user: Some(sub_data[..nul].to_vec()),
+        group: Some(group.to_vec()),
+        uid: None,
+        gid: None,
+    })
 }
 
 fn classify_new_sub(name: &[u8]) -> NewSubKind {
@@ -2218,6 +2265,18 @@ fn parse_file_like_header(
     let name = decode_file_name(&input[pos..name_end], block.flags);
     pos = name_end;
 
+    // UnRAR reads a subblock's data before its salt: whatever the header holds
+    // past the name, less the salt at its end.
+    let sub_data = if block.head_type == NEWSUB_HEAD {
+        let salt_len = if block.flags & FHD_SALT != 0 { 8 } else { 0 };
+        let sub_end = head_end.saturating_sub(salt_len).max(pos);
+        let sub_data = input[pos..sub_end].to_vec();
+        pos = sub_end;
+        sub_data
+    } else {
+        Vec::new()
+    };
+
     let salt = if block.flags & FHD_SALT != 0 {
         let salt_end = pos
             .checked_add(8)
@@ -2279,6 +2338,8 @@ fn parse_file_like_header(
         file_comment,
         ext_time,
         packed_range: archive_offset + data_start..archive_offset + data_end,
+        sub_data,
+        owner: None,
     })
 }
 
@@ -2786,6 +2847,8 @@ mod tests {
             file_comment: Vec::new(),
             ext_time: Vec::new(),
             packed_range: 0..0,
+            sub_data: Vec::new(),
+            owner: None,
         }
     }
 
@@ -3210,5 +3273,159 @@ mod tests {
         // The decoder may emit further units from the trailing flag bits;
         // accept any output that begins with "Hi".
         assert!(decoded.starts_with(b"Hi"), "got {decoded:?}");
+    }
+
+    /// A RAR 1.5-4 block with a CRC16 (the low half of CRC32 over the header
+    /// after the CRC field).
+    fn rar4_block(head_type: u8, flags: u16, body: &[u8]) -> Vec<u8> {
+        let size = (7 + body.len()) as u16;
+        let mut h = vec![head_type];
+        h.extend_from_slice(&flags.to_le_bytes());
+        h.extend_from_slice(&size.to_le_bytes());
+        h.extend_from_slice(body);
+        let crc = (crate::crc32::crc32(&h) & 0xffff) as u16;
+        let mut out = crc.to_le_bytes().to_vec();
+        out.extend_from_slice(&h);
+        out
+    }
+
+    /// A NEWSUB block: pack/unpack size 0, host Unix, store, then `name`
+    /// followed by `sub_data`.
+    fn newsub_block(name: &[u8], sub_data: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes()); // pack size
+        body.extend_from_slice(&0u32.to_le_bytes()); // unp size
+        body.push(3); // host OS: Unix
+        body.extend_from_slice(&0u32.to_le_bytes()); // file CRC
+        body.extend_from_slice(&0u32.to_le_bytes()); // time
+        body.push(29); // unp ver
+        body.push(0x30); // method: store
+        body.extend_from_slice(&(name.len() as u16).to_le_bytes()); // name size
+        body.extend_from_slice(&0u32.to_le_bytes()); // attr
+        body.extend_from_slice(name);
+        body.extend_from_slice(sub_data);
+        rar4_block(0x7a, 0x8000, &body)
+    }
+
+    /// NEWSUB `UOW`: SubData "alice\0staff".
+    fn uow_block() -> Vec<u8> {
+        newsub_block(b"UOW", b"alice\0staff")
+    }
+
+    /// Two stored files `f` and `g`, with `blocks` inserted after `f`'s data.
+    fn two_files_with_after_first(blocks: &[u8]) -> Vec<u8> {
+        let mut b = crate::Builder::new(crate::ArchiveVersion::Rar29).store(true);
+        b.add_bytes(b"f".to_vec(), b"data".to_vec(), None, None)
+            .unwrap();
+        b.add_bytes(b"g".to_vec(), b"more".to_vec(), None, None)
+            .unwrap();
+        let bytes = b.to_bytes().unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        let at = archive.files().next().unwrap().packed_range.end;
+        let mut patched = bytes[..at].to_vec();
+        patched.extend_from_slice(blocks);
+        patched.extend_from_slice(&bytes[at..]);
+        patched
+    }
+
+    #[test]
+    fn a_uow_subblock_gives_its_file_an_owner() {
+        let patched = two_files_with_after_first(&uow_block());
+        let archive = Archive::parse(&patched).unwrap();
+        let files: Vec<_> = archive.files().collect();
+        let owner = files[0].owner.as_ref().expect("owner");
+        assert_eq!(owner.user.as_deref(), Some(&b"alice"[..]));
+        assert_eq!(owner.group.as_deref(), Some(&b"staff"[..]));
+        assert!(files[1].owner.is_none());
+        assert_eq!(files[0].metadata().owner.as_ref(), Some(owner));
+
+        // Extraction reports it too.
+        let mut owners = Vec::new();
+        archive
+            .extract_to(crate::ArchiveReadOptions::default(), |meta| {
+                owners.push(meta.owner.clone());
+                Ok(Box::new(std::io::sink()))
+            })
+            .unwrap();
+        assert_eq!(owners, vec![Some(owner.clone()), None]);
+    }
+
+    #[test]
+    fn a_salted_newsub_reads_its_sub_data_before_the_salt() {
+        // As UnRAR: name, SubData, then the salt at the end of the header.
+        let name = b"UOW";
+        let sub_data = b"alice\0staff";
+        let salt = *b"SALTSALT";
+        let head_size = 32 + name.len() + sub_data.len() + salt.len();
+        let mut header = vec![0u8; 7];
+        header.extend_from_slice(&0u32.to_le_bytes()); // pack size
+        header.extend_from_slice(&0u32.to_le_bytes()); // unp size
+        header.push(3);
+        header.extend_from_slice(&0u32.to_le_bytes());
+        header.extend_from_slice(&0u32.to_le_bytes());
+        header.push(29);
+        header.push(0x30);
+        header.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        header.extend_from_slice(&0u32.to_le_bytes());
+        header.extend_from_slice(name);
+        header.extend_from_slice(sub_data);
+        header.extend_from_slice(&salt);
+        assert_eq!(header.len(), head_size);
+
+        let block = BlockHeader {
+            head_crc: 0,
+            head_type: NEWSUB_HEAD,
+            flags: LONG_BLOCK | FHD_SALT,
+            head_size: head_size as u16,
+            add_size: Some(0),
+            offset: 0,
+        };
+        let sub = parse_file_like_header(&header, block, 0).unwrap();
+        assert_eq!(sub.name, name);
+        assert_eq!(sub.sub_data, sub_data);
+        assert_eq!(sub.salt, Some(salt));
+    }
+
+    #[test]
+    fn a_uow_subblock_is_linked_when_parsed_through_a_positioned_source() {
+        let patched = two_files_with_after_first(&uow_block());
+        let signature = crate::detect::find_archive_start(&patched, 0).unwrap();
+        let source: Arc<dyn ReadAt> = Arc::new(crate::read_at::SeekReader::new(
+            std::io::Cursor::new(patched),
+        ));
+        let archive = Archive::parse_source_with_signature(
+            source,
+            signature,
+            crate::ArchiveReadOptions::default(),
+        )
+        .unwrap();
+        let files: Vec<_> = archive.files().collect();
+        let owner = files[0].owner.as_ref().expect("owner");
+        assert_eq!(owner.user.as_deref(), Some(&b"alice"[..]));
+        assert_eq!(owner.group.as_deref(), Some(&b"staff"[..]));
+        assert!(files[1].owner.is_none());
+    }
+
+    #[test]
+    fn stray_or_malformed_subblocks_leave_owners_alone() {
+        // No NUL: ignored, as UnRAR does.
+        let patched = two_files_with_after_first(&newsub_block(b"UOW", b"alice"));
+        let archive = Archive::parse(&patched).unwrap();
+        assert!(archive.files().all(|file| file.owner.is_none()));
+
+        // An unknown service name is ignored.
+        let patched = two_files_with_after_first(&newsub_block(b"XYZ", b"a\0b"));
+        let archive = Archive::parse(&patched).unwrap();
+        assert!(archive.files().all(|file| file.owner.is_none()));
+
+        // A UOW before any file has nothing to describe.
+        let bytes = two_files_with_after_first(&[]);
+        let archive = Archive::parse(&bytes).unwrap();
+        let first = archive.files().next().unwrap().block.offset;
+        let mut patched = bytes[..first].to_vec();
+        patched.extend_from_slice(&uow_block());
+        patched.extend_from_slice(&bytes[first..]);
+        let archive = Archive::parse(&patched).unwrap();
+        assert!(archive.files().all(|file| file.owner.is_none()));
     }
 }

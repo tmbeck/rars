@@ -1487,6 +1487,10 @@ fn writes_rar50_quick_open_service_record() {
     let locator = archive.main.locator().unwrap();
     assert!(locator.quick_open_offset.unwrap() > 0);
     assert_eq!(service_names(&archive), ["CMT", "QO"]);
+    // Quick open data follows the last file but belongs to the archive.
+    assert!(archive
+        .files()
+        .all(|file| archive.file_services(file).count() == 0));
     let quick_open = archive
         .services()
         .find(|service| service.name == b"QO")
@@ -6266,4 +6270,101 @@ fn a_volume_set_missing_its_tail_is_refused() {
     let a = parse_all(&v[..v.len() - 1]);
     let err = rars::extract_volumes_to(&a, None, |_| Ok(Box::new(std::io::sink()))).unwrap_err();
     assert!(err.to_string().contains("missing volumes"), "{err}");
+}
+
+/// Each member's metadata, for tests that need fields `CollectedEntry` does
+/// not keep.
+fn collect_metas(archive: &Archive) -> Result<Vec<rar50::ExtractedEntryMeta>, Error> {
+    let metas = RefCell::new(Vec::new());
+    archive.extract_to(ArchiveReadOptions::default(), |meta| {
+        metas.borrow_mut().push(meta.clone());
+        Ok(Box::new(std::io::sink()))
+    })?;
+    Ok(metas.into_inner())
+}
+
+#[test]
+fn service_records_after_a_file_are_linked_to_it() {
+    use rars::rar50::{ArchiveEntry, Rar50Writer, WriterOptions};
+    let opts = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::default());
+    let bytes = Rar50Writer::new(opts)
+        .entry(
+            ArchiveEntry::new(b"f".to_vec(), rars::EntrySource::from_bytes(&b"body"[..]))
+                .with_service(ServiceEntry::new(
+                    b"ACL".to_vec(),
+                    b"\x01\x00\x04\x80".to_vec(),
+                )),
+        )
+        .entry(ArchiveEntry::new(
+            b"g".to_vec(),
+            rars::EntrySource::from_bytes(&b"x"[..]),
+        ))
+        .finish()
+        .unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    let files: Vec<_> = archive.files().collect();
+    let services: Vec<_> = archive.file_services(files[0]).collect();
+    assert_eq!(services.len(), 1);
+    assert_eq!(services[0].name, b"ACL");
+    assert_eq!(
+        archive.service_data(services[0], None).unwrap(),
+        b"\x01\x00\x04\x80"
+    );
+    assert_eq!(archive.file_services(files[1]).count(), 0);
+    let metas = collect_metas(&archive).unwrap();
+    assert_eq!(metas[0].services[0].name, b"ACL");
+    assert_eq!(metas[0].services[0].unpacked_size, 4);
+    assert!(metas[1].services.is_empty());
+
+    // The data is verified: a flipped payload byte fails its CRC32.
+    let at = services[0].block.data_range.start;
+    let mut corrupt = bytes.clone();
+    corrupt[at] ^= 0xff;
+    let archive = Archive::parse(&corrupt).unwrap();
+    let file = archive.files().next().unwrap();
+    let service = archive.file_services(file).next().unwrap();
+    assert!(archive.service_data(service, None).is_err());
+}
+
+#[test]
+fn service_data_refuses_unknown_huge_or_split_services() {
+    use rars::rar50::{ArchiveEntry, Rar50Writer, WriterOptions, SERVICE_DATA_LIMIT};
+    const FHFL_UNPUNKNOWN: u64 = 0x0008;
+    const HFL_SPLIT_BEFORE: u64 = 0x0008;
+    const HFL_SPLIT_AFTER: u64 = 0x0010;
+    let opts = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::default());
+    let bytes = Rar50Writer::new(opts)
+        .entry(
+            ArchiveEntry::new(b"f".to_vec(), rars::EntrySource::from_bytes(&b"body"[..]))
+                .with_service(ServiceEntry::new(b"ACL".to_vec(), b"acl".to_vec())),
+        )
+        .finish()
+        .unwrap();
+    let archive = Archive::parse(&bytes).unwrap();
+    let file = archive.files().next().unwrap();
+    let service = archive.file_services(file).next().unwrap();
+    assert_eq!(archive.service_data(service, None).unwrap(), b"acl");
+
+    let mut unknown = service.clone();
+    unknown.file_flags |= FHFL_UNPUNKNOWN;
+    let mut huge = service.clone();
+    huge.unpacked_size = SERVICE_DATA_LIMIT + 1;
+    let mut split_after = service.clone();
+    split_after.block.flags |= HFL_SPLIT_AFTER;
+    let mut split_before = service.clone();
+    split_before.block.flags |= HFL_SPLIT_BEFORE;
+    for (what, bad) in [
+        ("unknown size", unknown),
+        ("over the limit", huge),
+        ("split after", split_after),
+        ("split before", split_before),
+    ] {
+        assert!(
+            matches!(
+                archive.service_data(&bad, None),
+                Err(Error::InvalidHeader(_))
+            ),
+            "{what}"
+        );
+    }
 }
