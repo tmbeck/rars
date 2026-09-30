@@ -305,3 +305,42 @@ fn rar5_large_dictionary_is_held_once() {
     // The 32 MiB window, one block (≤ 1 MiB) and slack.
     check("rar5 solid, 32 MiB dict", u, 32 * MIB + 8 * MIB);
 }
+
+fn legacy(version: rars::ArchiveVersion, size: usize, volume: Option<usize>) -> Vec<Vec<u8>> {
+    let mut b = rars::Builder::new(version).compression_level(Some(1));
+    b.add_bytes(b"m".to_vec(), nibble_text(size, 11), None, None)
+        .unwrap();
+    match volume {
+        None => vec![b.to_bytes().unwrap()],
+        Some(v) => b.volume_size(Some(v)).build_volumes(None).unwrap(),
+    }
+}
+
+/// F2: the whole packed member was read into memory and copied again into
+/// the bit reader (~2x packed).
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release only")]
+fn rar29_member_reads_input_incrementally() {
+    let _g = serial();
+    let a = open_all(&cached("rar29-32m-v1", || {
+        legacy(rars::ArchiveVersion::Rar29, 32 * MIB, None)
+    }));
+    let (n, u) = measure(|| extract_all(&a, default_opts()).unwrap());
+    assert_eq!(n, 32 * MIB as u64);
+    check("rar29 32 MiB", u, 12 * MIB);
+}
+
+/// F2: a split RAR 2.9 member read every volume's packed data at once.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release only")]
+fn rar29_split_member_reads_input_incrementally() {
+    let _g = serial();
+    let p = cached("rar29-32m-4vol-v1", || {
+        legacy(rars::ArchiveVersion::Rar29, 32 * MIB, Some(6 * MIB))
+    });
+    assert!(p.len() >= 3);
+    let a = open_all(&p);
+    let (n, u) = measure(|| extract_all(&a, default_opts()).unwrap());
+    assert_eq!(n, 32 * MIB as u64);
+    check("rar29 32 MiB over volumes", u, 12 * MIB);
+}

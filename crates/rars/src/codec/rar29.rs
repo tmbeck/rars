@@ -14,6 +14,12 @@ const LEVEL_COUNT: usize = 20;
 const TABLE_COUNT: usize = MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT + LENGTH_COUNT;
 const MAX_HISTORY: usize = 4 * 1024 * 1024;
 const STREAM_CHUNK: usize = 1024 * 1024;
+/// Packed bytes kept ahead of the decoder when it reads from a `Read`: more
+/// than the largest single decode step (a VM filter record, at most 64 KiB of
+/// code and 8 KiB of globals).
+const REFILL_MARGIN: usize = 256 * 1024;
+/// Most packed bytes read in one top-up.
+const REFILL_CHUNK: usize = 1024 * 1024;
 const MAX_VM_FILTER_BLOCK_SIZE: usize = 128 * 1024;
 // The standard AUDIO bytecode uses separate input/output regions inside RARVM
 // memory. Keep generated blocks below the overlap boundary accepted by period
@@ -2359,14 +2365,11 @@ impl Unpack29 {
             self.bits = BitReader::new();
         }
         self.bits.append(input);
-        self.decode_until(target).map_err(|error| match error {
-            Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
-            error => error,
-        })?;
-        self.finish_member().map_err(|error| match error {
-            Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
-            error => error,
-        })?;
+        let mut refill = Refill::slice();
+        self.decode_until(target, &mut refill)
+            .map_err(|error| refill.truncation(error))?;
+        self.finish_member(&mut refill)
+            .map_err(|error| refill.truncation(error))?;
         let out = self.filtered_range(start, target, start)?;
         self.trim_history(target, target);
         Ok(out)
@@ -2386,11 +2389,12 @@ impl Unpack29 {
             self.bits = BitReader::new();
         }
         self.bits.append(input);
+        let mut refill = Refill::slice();
 
         let mut flushed = start;
         let mut target = start.saturating_add(STREAM_CHUNK).min(final_target);
         while flushed < final_target {
-            self.decode_until(target)?;
+            self.decode_until(target, &mut refill)?;
             let safe_end = self.safe_flush_end(flushed, target, final_target)?;
             if safe_end <= flushed {
                 if target == final_target {
@@ -2414,7 +2418,7 @@ impl Unpack29 {
                 .saturating_add(STREAM_CHUNK)
                 .min(final_target);
         }
-        self.finish_member()?;
+        self.finish_member(&mut refill)?;
         Ok(())
     }
 
@@ -2431,29 +2435,25 @@ impl Unpack29 {
             .ok_or(Error::InvalidData("RAR 2.9 output size overflows"))?;
         let mut flushed = start;
         let mut target = start.saturating_add(STREAM_CHUNK).min(final_target);
-        let mut packed = Vec::new();
-        input
-            .read_to_end(&mut packed)
-            .map_err(|e| Error::Io(e.into()))?;
-        self.bits.append(&packed);
+        let mut refill = Refill {
+            input: Some(input),
+            eof: false,
+        };
+        refill.top_up(&mut self.bits)?;
         // Empty members in solid mode still carry their own block init bytes
         // (typically the (esc, 0) end-of-block marker + 4-byte range coder
         // flush). When output_size is zero, decode_until skips its loop body
         // and never reads tables, so do the init here so finish_member can
         // observe the block end.
-        if final_target == start && !self.in_lz_block && !packed.is_empty() {
-            self.read_tables().map_err(|error| match error {
-                Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
-                error => error,
-            })?;
+        if final_target == start && !self.in_lz_block && self.bits.remaining_bytes() > 0 {
+            self.read_tables()
+                .map_err(|error| refill.truncation(error))?;
             self.in_lz_block = true;
         }
 
         while flushed < final_target {
-            self.decode_until(target).map_err(|error| match error {
-                Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
-                error => error,
-            })?;
+            self.decode_until(target, &mut refill)
+                .map_err(|error| refill.truncation(error))?;
 
             let safe_end = self.safe_flush_end(flushed, target, final_target)?;
             if safe_end <= flushed {
@@ -2478,14 +2478,12 @@ impl Unpack29 {
                 .saturating_add(STREAM_CHUNK)
                 .min(final_target);
         }
-        self.finish_member().map_err(|error| match error {
-            Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
-            error => error,
-        })?;
+        self.finish_member(&mut refill)
+            .map_err(|error| refill.truncation(error))?;
         Ok(())
     }
 
-    fn decode_until(&mut self, target: usize) -> Result<()> {
+    fn decode_until(&mut self, target: usize, refill: &mut Refill<'_>) -> Result<()> {
         while self.current_pos() < target {
             self.drain_pending_match(target)?;
             if self.current_pos() >= target {
@@ -2502,12 +2500,13 @@ impl Unpack29 {
                 ) {
                     self.member_ended_early = true;
                 }
+                refill.top_up(&mut self.bits)?;
                 self.read_tables()?;
                 self.in_lz_block = true;
             }
             match self.block_mode {
-                BlockMode::Lz => self.decode_lz(target)?,
-                BlockMode::Ppmd => self.decode_ppmd(target)?,
+                BlockMode::Lz => self.decode_lz(target, refill)?,
+                BlockMode::Ppmd => self.decode_ppmd(target, refill)?,
             }
         }
         Ok(())
@@ -2602,8 +2601,11 @@ impl Unpack29 {
         Ok(lengths)
     }
 
-    fn decode_lz(&mut self, output_size: usize) -> Result<()> {
+    fn decode_lz(&mut self, output_size: usize, refill: &mut Refill<'_>) -> Result<()> {
         while self.current_pos() < output_size {
+            // One symbol with its extra bits, or one VM filter record: well
+            // inside the margin.
+            refill.top_up(&mut self.bits)?;
             let symbol = self.main.decode(&mut self.bits)?;
             match symbol {
                 0..=255 => self.output.push(symbol as u8),
@@ -2670,8 +2672,9 @@ impl Unpack29 {
         Ok(())
     }
 
-    fn decode_ppmd(&mut self, output_size: usize) -> Result<()> {
+    fn decode_ppmd(&mut self, output_size: usize, refill: &mut Refill<'_>) -> Result<()> {
         while self.current_pos() < output_size {
+            refill.top_up(&mut self.bits)?;
             let Some(symbol) = self.ppmd.decode_symbol(&mut self.bits)? else {
                 return Ok(());
             };
@@ -2694,7 +2697,7 @@ impl Unpack29 {
                     return Ok(());
                 }
                 3 => {
-                    self.read_vm_code_ppmd()?;
+                    self.read_vm_code_ppmd(refill)?;
                 }
                 4 => {
                     let mut offset = 0usize;
@@ -2720,10 +2723,11 @@ impl Unpack29 {
             .ok_or(Error::InvalidData("RAR 2.9 PPMd stream ended early"))
     }
 
-    fn finish_ppmd_member(&mut self) -> Result<()> {
+    fn finish_ppmd_member(&mut self, refill: &mut Refill<'_>) -> Result<()> {
         if self.block_mode != BlockMode::Ppmd {
             return Ok(());
         }
+        refill.top_up(&mut self.bits)?;
         let Some(symbol) = self.ppmd.decode_symbol(&mut self.bits)? else {
             return Ok(());
         };
@@ -2746,24 +2750,28 @@ impl Unpack29 {
         }
     }
 
-    fn finish_member(&mut self) -> Result<()> {
+    fn finish_member(&mut self, refill: &mut Refill<'_>) -> Result<()> {
         match self.block_mode {
-            BlockMode::Lz => self.finish_lz_member(),
-            BlockMode::Ppmd => self.finish_ppmd_member(),
+            BlockMode::Lz => self.finish_lz_member(refill),
+            BlockMode::Ppmd => self.finish_ppmd_member(refill),
         }
     }
 
-    fn finish_lz_member(&mut self) -> Result<()> {
+    fn finish_lz_member(&mut self, refill: &mut Refill<'_>) -> Result<()> {
         loop {
             if !self.in_lz_block {
                 return Ok(());
             }
+            refill.top_up(&mut self.bits)?;
             let symbol = self.main.decode(&mut self.bits)?;
             if symbol != 256 {
                 return Err(Error::InvalidData("RAR 2.9 LZ member has trailing data"));
             }
             match self.read_end_of_block()? {
                 LzBlockEnd::SameFileNewTable => {
+                    // Sees only buffered bytes: all of them at EOF, at least
+                    // the refill margin before it, and 256 KiB of zero padding
+                    // after a terminator is not a real archive.
                     if self.bits.remaining_bits_are_zero() {
                         // rars wrote this bit set on every member it packed
                         // until the terminator fix, so what follows is the byte
@@ -2771,8 +2779,10 @@ impl Unpack29 {
                         self.stale_terminator = true;
                         return Ok(());
                     }
+                    // Only the end of the input ends the member here; running
+                    // out while input remains is a refill-margin error.
                     if let Err(error) = self.read_tables() {
-                        if error == Error::NeedMoreInput {
+                        if error == Error::NeedMoreInput && refill.eof {
                             return Ok(());
                         }
                         return Err(error);
@@ -2854,7 +2864,7 @@ impl Unpack29 {
         self.parse_vm_code(first_byte, data)
     }
 
-    fn read_vm_code_ppmd(&mut self) -> Result<()> {
+    fn read_vm_code_ppmd(&mut self, refill: &mut Refill<'_>) -> Result<()> {
         let first_byte = u32::from(self.read_ppmd_required_byte()?);
         let mut len = (first_byte & 7) + 1;
         if len == 7 {
@@ -2865,6 +2875,9 @@ impl Unpack29 {
         }
         let mut data = Vec::with_capacity(len as usize);
         for _ in 0..len {
+            // A PPMd symbol can take many packed bytes, so a 64 KiB record
+            // is not bounded by the margin: top up per byte.
+            refill.top_up(&mut self.bits)?;
             data.push(self.read_ppmd_required_byte()?);
         }
 
@@ -3286,6 +3299,62 @@ fn validate_huffman_counts(count: &[u16; 16]) -> Result<()> {
     Ok(())
 }
 
+/// Feeds packed input to the bit reader as it is decoded. The bit buffer is
+/// topped up before every decode step, so a step never runs out while input
+/// remains, and a half-read symbol is never resumed.
+struct Refill<'r> {
+    input: Option<&'r mut dyn Read>,
+    eof: bool,
+}
+
+impl Refill<'_> {
+    /// For a member whose whole packed data is already in the bit reader.
+    fn slice() -> Self {
+        Self {
+            input: None,
+            eof: true,
+        }
+    }
+
+    fn top_up(&mut self, bits: &mut BitReader) -> Result<()> {
+        if self.eof || bits.remaining_bytes() >= REFILL_MARGIN {
+            return Ok(());
+        }
+        let Some(input) = self.input.as_mut() else {
+            return Ok(());
+        };
+        bits.compact();
+        // Allocated once: after `compact` fewer than `REFILL_MARGIN` bytes
+        // remain, so a chunk always fits and the buffer never reallocates.
+        bits.input
+            .reserve_exact((REFILL_MARGIN + REFILL_CHUNK).saturating_sub(bits.input.len()));
+        // `read_to_end` over `take` loops over short reads (one byte at a
+        // time, if that is what the reader gives) and stops at the chunk or
+        // at end of input.
+        let read = input
+            .by_ref()
+            .take(REFILL_CHUNK as u64)
+            .read_to_end(&mut bits.input)
+            .map_err(|e| Error::Io(e.into()))?;
+        if read < REFILL_CHUNK {
+            self.eof = true;
+        }
+        Ok(())
+    }
+
+    /// Running out of input is truncation at the end of the input, and a
+    /// refill-margin bug before it.
+    fn truncation(&self, error: Error) -> Error {
+        match error {
+            Error::NeedMoreInput if self.eof => {
+                Error::InvalidData("RAR 2.9 bitstream is truncated")
+            }
+            Error::NeedMoreInput => Error::InvalidData("RAR 2.9 refill margin exceeded"),
+            error => error,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct BitReader {
     input: Vec<u8>,
@@ -3310,6 +3379,11 @@ impl BitReader {
     fn append(&mut self, input: &[u8]) {
         self.compact();
         self.input.extend_from_slice(input);
+    }
+
+    /// Unread bytes, counting a partly read byte.
+    fn remaining_bytes(&self) -> usize {
+        self.input.len().saturating_sub(self.bit_pos / 8)
     }
 
     fn compact(&mut self) {
@@ -4953,6 +5027,75 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
             .unwrap();
 
         assert_eq!(output, expected_text());
+    }
+
+    /// The refill logic's regression guard: one-byte reads make every top-up
+    /// cross every boundary, in the LZ, VM-filter and PPMd paths.
+    #[test]
+    fn one_byte_reads_decode_lz_and_ppmd_members_with_filters() {
+        let data = crate::codec::refill_test_bytes(768 * 1024);
+        let e8 = crate::FilterSpec::whole(crate::FilterKind::E8);
+        for packed in [
+            super::Unpack29Encoder::new()
+                .encode_member_with_filter(&data, e8.clone())
+                .unwrap(),
+            super::unpack29_encode_ppmd_with_filter(&data, e8, 4 << 20).unwrap(),
+        ] {
+            assert!(
+                packed.len() > 300 * 1024,
+                "packed input spans several refills"
+            );
+            let mut out = Vec::new();
+            Unpack29::new()
+                .decode_member_from_reader(
+                    &mut crate::codec::OneByteReader(&packed),
+                    data.len(),
+                    &mut out,
+                )
+                .unwrap();
+            assert_eq!(out, data);
+        }
+    }
+
+    /// Only the end of the input is truncation: a reader error passes
+    /// through, and running out while input remains is the margin's fault.
+    #[test]
+    fn reader_input_errors_map_to_io_truncation_or_margin() {
+        struct FailAfter<'a>(&'a [u8]);
+        impl std::io::Read for FailAfter<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                if self.0.is_empty() {
+                    return Err(std::io::Error::other("volume unreadable"));
+                }
+                let n = self.0.len().min(out.len());
+                out[..n].copy_from_slice(&self.0[..n]);
+                self.0 = &self.0[n..];
+                Ok(n)
+            }
+        }
+        let data = crate::codec::refill_test_bytes(4 << 20);
+        let packed = super::Unpack29Encoder::new().encode_member(&data).unwrap();
+        let half = &packed[..packed.len() / 2];
+        let mut sink = Vec::new();
+        let error = Unpack29::new()
+            .decode_member_from_reader(&mut FailAfter(half), data.len(), &mut sink)
+            .unwrap_err();
+        assert!(matches!(error, Error::Io(_)), "{error:?}");
+        let error = Unpack29::new()
+            .decode_member_from_reader(&mut &half[..], data.len(), &mut sink)
+            .unwrap_err();
+        assert_eq!(error, Error::InvalidData("RAR 2.9 bitstream is truncated"));
+        // The margin's safety net is unreachable from a real decode by design
+        // (every step fits inside the margin), so only its mapping is tested.
+        let mut input: &[u8] = &[];
+        let refill = super::Refill {
+            input: Some(&mut input),
+            eof: false,
+        };
+        assert_eq!(
+            refill.truncation(Error::NeedMoreInput),
+            Error::InvalidData("RAR 2.9 refill margin exceeded")
+        );
     }
 
     #[test]
