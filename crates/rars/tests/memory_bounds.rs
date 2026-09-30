@@ -410,3 +410,18 @@ fn ppmd_model_stays_near_its_declared_size() {
     // bit buffer.
     check("ppmd 25 MiB model", u, 25 * MIB * 7 / 2 + 8 * MIB);
 }
+
+/// F14: opening an archive read up to 8 MiB of it to look for an SFX stub.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release only")]
+fn opening_an_archive_does_not_scan_it() {
+    let _g = serial();
+    let p = cached("rar5-stored-16m-v1", || {
+        let mut b = rars::Builder::new(rars::ArchiveVersion::Rar50).store(true);
+        b.add_bytes(b"s".to_vec(), nibble_text(16 * MIB, 1), None, None)
+            .unwrap();
+        vec![b.to_bytes().unwrap()]
+    });
+    let (_, u) = measure(|| rars::ArchiveReader::read_path(&p[0]).unwrap());
+    check("open a 16 MiB archive", u, MIB);
+}

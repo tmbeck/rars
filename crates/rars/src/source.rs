@@ -1,7 +1,8 @@
-use crate::detect::{find_archive_start, ArchiveSignature, SFX_SCAN_LIMIT};
+use crate::detect::{detect_archive_family, find_archive_start, ArchiveSignature, SFX_SCAN_LIMIT};
 use crate::error::{Error, Result};
 use crate::io_util::read_exact_at;
 use crate::read_at::ReadAt;
+use crate::version::ArchiveFamily;
 use std::io::{Cursor, Read, Write};
 use std::ops::Range;
 use std::sync::Arc;
@@ -21,9 +22,19 @@ impl std::fmt::Debug for ArchiveSource {
     }
 }
 
-/// Finds the archive signature within the first `SFX_SCAN_LIMIT` bytes.
+/// Finds the archive signature: at offset 0 from the first 8 bytes, else
+/// within the first `SFX_SCAN_LIMIT` bytes (an SFX stub precedes it).
 pub(crate) fn scan_signature(src: &dyn ReadAt) -> Result<ArchiveSignature> {
-    let len = src.size()?.min(SFX_SCAN_LIMIT as u64) as usize;
+    let size = src.size()?;
+    let head = read_exact_at(src, 0, size.min(8) as usize)?;
+    // A RAR 1.3 signature at 0 can still lose to a later 1.5+ one in
+    // `find_archive_start`, so only the other families short-circuit.
+    if let Some(sig) = detect_archive_family(&head) {
+        if sig.family != ArchiveFamily::Rar13 {
+            return Ok(sig);
+        }
+    }
+    let len = size.min(SFX_SCAN_LIMIT as u64) as usize;
     let scan = read_exact_at(src, 0, len)?;
     find_archive_start(&scan, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)
 }
