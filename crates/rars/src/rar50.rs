@@ -57,6 +57,7 @@ const MHEXTRA_LOCATOR_RECOVERY: u64 = 0x0002;
 
 const FHEXTRA_CRYPT: u64 = 0x01;
 const FHEXTRA_HASH: u64 = 0x02;
+const FHEXTRA_VERSION: u64 = 0x04;
 const FHEXTRA_HTIME: u64 = 0x03;
 const FHEXTRA_REDIR: u64 = 0x05;
 const FHEXTRA_UOWNER: u64 = 0x06;
@@ -208,6 +209,7 @@ pub struct FileHeader {
     /// The extended timestamp record converted to signed Unix timestamps.
     pub times: FileTimes,
     pub owner: Option<UnixOwner>,
+    pub version: Option<u64>,
     pub data_crc32: Option<u32>,
     pub compression_info: u64,
     pub host_os: u64,
@@ -382,6 +384,7 @@ pub struct ExtractedEntryMeta {
     pub ctime: Option<crate::UnixTimestamp>,
     pub atime: Option<crate::UnixTimestamp>,
     pub owner: Option<UnixOwner>,
+    pub version: Option<u64>,
     pub crc32: Option<u32>,
     pub blake2sp: Option<[u8; 32]>,
     pub unpacked_size: Option<u64>,
@@ -1436,6 +1439,7 @@ fn parse_file_header_bytes(parsed: &ParsedBlockHeader) -> Result<FileHeader> {
         file_times: None,
         times: FileTimes::default(),
         owner: None,
+        version: None,
         data_crc32,
         compression_info,
         host_os,
@@ -1516,6 +1520,7 @@ fn parse_file_extra_area(
             FHEXTRA_UOWNER => {
                 file.owner = parse_unix_owner(input, data);
             }
+            FHEXTRA_VERSION => file.version = parse_file_version(input, data),
             FHEXTRA_SUBDATA => {
                 file.rewrite_metadata_complete &=
                     is_service && (data.is_empty() || file.name == b"RR");
@@ -1659,6 +1664,13 @@ fn parse_unix_owner(input: &[u8], range: Range<usize>) -> Option<UnixOwner> {
         owner.gid = Some(id);
     }
     Some(owner)
+}
+
+fn parse_file_version(input: &[u8], range: Range<usize>) -> Option<u64> {
+    let (_flags, used) = read_vint_at(input, range.start, range.end).ok()?;
+    read_vint_at(input, range.start.checked_add(used)?, range.end)
+        .ok()
+        .map(|(version, _)| version)
 }
 
 fn read_owner_name(input: &[u8], at: &mut usize, end: usize) -> Option<Vec<u8>> {
@@ -3597,6 +3609,7 @@ mod tests {
             file_times: None,
             times: FileTimes::default(),
             owner: None,
+            version: None,
             data_crc32: None,
             compression_info: 0,
             host_os: 0,

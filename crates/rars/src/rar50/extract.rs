@@ -284,6 +284,7 @@ impl FileHeader {
             ctime: self.times.ctime,
             atime: self.times.atime,
             owner: self.owner.clone(),
+            version: self.version,
             crc32: self.data_crc32,
             blake2sp: self
                 .hash
@@ -385,6 +386,7 @@ impl FileHeader {
             file_times: self.file_times,
             times: self.times,
             owner: self.owner.clone(),
+            version: self.version,
             data_crc32: None,
             compression_info: self.compression_info,
             host_os: self.host_os,
@@ -1421,6 +1423,7 @@ impl<B: Budget> PendingSplitRefs<B> {
             ctime: None,
             atime: None,
             owner: None,
+            version: None,
             crc32: final_file.data_crc32,
             blake2sp: final_file
                 .hash
@@ -2097,6 +2100,7 @@ mod tests {
             file_times: None,
             times: FileTimes::default(),
             owner: None,
+            version: None,
             data_crc32: None,
             compression_info: 0,
             host_os: 2,
@@ -2643,6 +2647,7 @@ mod tests {
             file_times: None,
             times: FileTimes::default(),
             owner: None,
+            version: None,
             data_crc32: None,
             compression_info: 0,
             host_os: 2,
@@ -2969,6 +2974,7 @@ mod tests {
                 file_times: None,
             times: FileTimes::default(),
             owner: None,
+            version: None,
                 data_crc32: Some(crc),
                 compression_info: 0,
                 host_os: 2,
@@ -3018,6 +3024,7 @@ mod tests {
             file_times: None,
             times: FileTimes::default(),
             owner: None,
+            version: None,
             data_crc32: None,
             compression_info: 0,
             host_os: 2,
