@@ -1,6 +1,5 @@
 use super::filters::{self, DeltaErrorMessages, FilterOp};
 use super::{huffman, match_finder, Error, Result};
-use std::collections::VecDeque;
 use std::io::Read;
 #[cfg(test)]
 use std::io::Write;
@@ -2534,7 +2533,7 @@ pub struct Unpack50Decoder {
     tables: Option<DecodeTables>,
     reps: [usize; 4],
     last_length: usize,
-    history: Vec<u8>,
+    window: Window,
 }
 
 impl Unpack50Decoder {
@@ -2543,7 +2542,7 @@ impl Unpack50Decoder {
             tables: None,
             reps: [0; 4],
             last_length: 0,
-            history: Vec::new(),
+            window: Window::new(),
         }
     }
 
@@ -2612,136 +2611,39 @@ impl Unpack50Decoder {
         solid: bool,
         mode: DecodeMode,
     ) -> Result<Vec<u8>> {
-        if dictionary_size == 0 {
-            return Err(Error::InvalidData("RAR 5 dictionary size is zero"));
-        }
-        if !solid {
-            self.reset();
-        }
-
         let mut output = Vec::with_capacity(output_size.min(MAX_INITIAL_OUTPUT_CAPACITY));
         let mut filters = Vec::new();
-
-        loop {
-            let block = read_compressed_block(input)?;
-            let payload = block.payload.as_slice();
-            let mut payload_bit_pos = 0;
-            if block.header.has_tables {
-                let (lengths, table_bits) = read_table_lengths(payload, algorithm_version)?;
-                self.tables = Some(DecodeTables::from_lengths(&lengths)?);
-                payload_bit_pos = table_bits;
-            }
-            let tables = self
-                .tables
-                .take()
-                .ok_or(Error::InvalidData("RAR 5 block reuses missing tables"))?;
-            let mut bits = BitReader::new(payload);
-            bits.bit_pos = payload_bit_pos;
-
-            while bits.bit_pos < block.header.payload_bits && output.len() < output_size {
-                let symbol = tables.main.decode(&mut bits)?;
-                match symbol {
-                    0..=255 => output.push(symbol as u8),
-                    256 if mode.uses_lz() => {
-                        filters.push(read_filter(&mut bits, output.len())?);
-                    }
-                    257 if mode.uses_lz() => {
-                        if self.last_length != 0 {
-                            self.copy_match(
-                                &mut output,
-                                self.reps[0],
-                                self.last_length,
-                                output_size,
-                                dictionary_size,
-                            )?;
-                        }
-                    }
-                    258..=261 if mode.uses_lz() => {
-                        let rep_index = symbol - 258;
-                        let distance = self.reps[rep_index];
-                        if distance == 0 {
-                            return Err(Error::InvalidData(
-                                "RAR 5 repeat distance is not initialized",
-                            ));
-                        }
-                        let length_slot = tables.length.decode(&mut bits)?;
-                        let length_extra = bits.read_bits(length_slot_extra_bits(length_slot)?)?;
-                        let length = slot_to_length(length_slot, length_extra)?;
-                        self.reps[..=rep_index].rotate_right(1);
-                        self.reps[0] = distance;
-                        self.last_length = length;
-                        self.copy_match(
-                            &mut output,
-                            distance,
-                            length,
-                            output_size,
-                            dictionary_size,
-                        )?;
-                    }
-                    262.. if mode.uses_lz() => {
-                        let length_slot = symbol - 262;
-                        let length_extra = bits.read_bits(length_slot_extra_bits(length_slot)?)?;
-                        let mut length = slot_to_length(length_slot, length_extra)?;
-                        let distance_slot = tables.distance.decode(&mut bits)?;
-                        let distance_bit_count = distance_slot_bit_count(distance_slot)?;
-                        let distance_extra = if distance_bit_count >= 4 && tables.align_mode {
-                            let high = bits.read_bits((distance_bit_count - 4) as u8)?;
-                            let low = tables.align.decode(&mut bits)? as u32;
-                            (high << 4) | low
-                        } else {
-                            bits.read_bits(distance_bit_count as u8)?
-                        };
-                        let distance = slot_to_distance(distance_slot, distance_extra)?;
-                        length += length_bonus(distance);
-                        self.reps.rotate_right(1);
-                        self.reps[0] = distance;
-                        self.last_length = length;
-                        self.copy_match(
-                            &mut output,
-                            distance,
-                            length,
-                            output_size,
-                            dictionary_size,
-                        )?;
-                    }
-                    _ if mode == DecodeMode::LiteralOnly => {
-                        return Err(Error::InvalidData(
-                            "RAR 5 literal-only decoder encountered non-literal symbol",
-                        ));
-                    }
-                    _ => {
-                        return Err(Error::InvalidData(
-                            "RAR 5 decoder encountered unsupported control symbol",
-                        ));
+        let decoded = self.decode(
+            input,
+            algorithm_version,
+            output_size,
+            dictionary_size,
+            solid,
+            mode,
+            Some(&mut filters),
+            &mut |chunk| {
+                match chunk {
+                    DecodedChunk::Bytes(bytes) => output.extend_from_slice(bytes),
+                    DecodedChunk::Repeated { byte, len } => {
+                        output.resize(output.len() + len, byte);
                     }
                 }
+                Ok::<(), std::convert::Infallible>(())
+            },
+        );
+        match decoded {
+            Ok(()) => {}
+            Err(StreamDecodeError::Decode(error)) => return Err(error),
+            // Not produced: this entry point collects the filters.
+            Err(StreamDecodeError::FilteredMember) => {
+                return Err(Error::InvalidData("RAR 5 filter was not collected"));
             }
-
-            self.tables = Some(tables);
-            if block.header.is_last || output.len() >= output_size {
-                break;
-            }
+            Err(StreamDecodeError::Sink(never)) => match never {},
         }
-
-        if output.len() == output_size {
-            let history_output = if mode.applies_filters() && !filters.is_empty() {
-                Some(output.clone())
-            } else {
-                None
-            };
-            if mode.applies_filters() {
-                apply_filters(&mut output, &filters)?;
-            }
-            self.history
-                .extend_from_slice(history_output.as_deref().unwrap_or(&output));
-            if self.history.len() > dictionary_size {
-                let discard = self.history.len() - dictionary_size;
-                self.history.drain(..discard);
-            }
-            Ok(output)
-        } else {
-            Err(Error::NeedMoreInput)
+        if mode.applies_filters() {
+            apply_filters(&mut output, &filters)?;
         }
+        Ok(output)
     }
 
     pub fn decode_member_from_reader_with_dictionary_to_sink<E>(
@@ -2753,28 +2655,41 @@ impl Unpack50Decoder {
         solid: bool,
         mut sink: impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
+        self.decode(
+            input,
+            algorithm_version,
+            output_size,
+            dictionary_size,
+            solid,
+            DecodeMode::Lz,
+            None,
+            &mut sink,
+        )
+    }
+
+    /// The decode loop behind every entry point. A filter record is pushed to
+    /// `filters`; without it, a filtered member is refused with
+    /// `FilteredMember`.
+    #[allow(clippy::too_many_arguments)]
+    fn decode<E>(
+        &mut self,
+        input: &mut impl Read,
+        algorithm_version: u8,
+        output_size: usize,
+        dictionary_size: usize,
+        solid: bool,
+        mode: DecodeMode,
+        mut filters: Option<&mut Vec<PendingFilter>>,
+        sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), StreamDecodeError<E>> {
         if dictionary_size == 0 {
             return Err(Error::InvalidData("RAR 5 dictionary size is zero").into());
         }
         if !solid {
             self.reset();
         }
-
-        // VecDeque grows as decoded bytes arrive, so using the declared
-        // dictionary here does not allocate a potentially huge RAR 7 window
-        // up front. It does, however, retain every byte that a legal match may
-        // reference instead of silently truncating the window at 64 MiB.
-        let history_limit = dictionary_size;
-        if self.history.len() > history_limit {
-            let discard = self.history.len() - history_limit;
-            self.history.drain(..discard);
-        }
-        let mut output = StreamingOutput::new(
-            std::mem::take(&mut self.history),
-            output_size,
-            dictionary_size,
-            history_limit,
-        );
+        self.window.set_dictionary(dictionary_size);
+        let mut output = StreamingOutput::new(&mut self.window, Some(output_size), dictionary_size);
 
         loop {
             let block = read_compressed_block(input)?;
@@ -2795,16 +2710,17 @@ impl Unpack50Decoder {
             while bits.bit_pos < block.header.payload_bits && output.written() < output_size {
                 let symbol = tables.main.decode(&mut bits)?;
                 match symbol {
-                    0..=255 => output.push(symbol as u8, &mut sink)?,
-                    256 => {
-                        return Err(StreamDecodeError::FilteredMember);
-                    }
-                    257 => {
+                    0..=255 => output.push(symbol as u8, sink)?,
+                    256 if mode.uses_lz() => match filters.as_deref_mut() {
+                        Some(filters) => filters.push(read_filter(&mut bits, output.written())?),
+                        None => return Err(StreamDecodeError::FilteredMember),
+                    },
+                    257 if mode.uses_lz() => {
                         if self.last_length != 0 {
-                            output.copy_match(self.reps[0], self.last_length, &mut sink)?;
+                            output.copy_match(self.reps[0], self.last_length, sink)?;
                         }
                     }
-                    258..=261 => {
+                    258..=261 if mode.uses_lz() => {
                         let rep_index = symbol - 258;
                         let distance = self.reps[rep_index];
                         if distance == 0 {
@@ -2819,9 +2735,9 @@ impl Unpack50Decoder {
                         self.reps[..=rep_index].rotate_right(1);
                         self.reps[0] = distance;
                         self.last_length = length;
-                        output.copy_match(distance, length, &mut sink)?;
+                        output.copy_match(distance, length, sink)?;
                     }
-                    262.. => {
+                    262.. if mode.uses_lz() => {
                         let length_slot = symbol - 262;
                         let length_extra = bits.read_bits(length_slot_extra_bits(length_slot)?)?;
                         let mut length = slot_to_length(length_slot, length_extra)?;
@@ -2839,7 +2755,19 @@ impl Unpack50Decoder {
                         self.reps.rotate_right(1);
                         self.reps[0] = distance;
                         self.last_length = length;
-                        output.copy_match(distance, length, &mut sink)?;
+                        output.copy_match(distance, length, sink)?;
+                    }
+                    _ if mode == DecodeMode::LiteralOnly => {
+                        return Err(Error::InvalidData(
+                            "RAR 5 literal-only decoder encountered non-literal symbol",
+                        )
+                        .into());
+                    }
+                    _ => {
+                        return Err(Error::InvalidData(
+                            "RAR 5 decoder encountered unsupported control symbol",
+                        )
+                        .into());
                     }
                 }
             }
@@ -2851,9 +2779,7 @@ impl Unpack50Decoder {
         }
 
         if output.written() == output_size {
-            output.finish(&mut sink)?;
-            self.history = output.into_history();
-            Ok(())
+            output.finish(sink)
         } else {
             Err(Error::NeedMoreInput.into())
         }
@@ -2863,90 +2789,136 @@ impl Unpack50Decoder {
         self.tables = None;
         self.reps = [0; 4];
         self.last_length = 0;
-        self.history.clear();
-    }
-
-    fn copy_match(
-        &self,
-        output: &mut Vec<u8>,
-        distance: usize,
-        length: usize,
-        output_limit: usize,
-        dictionary_size: usize,
-    ) -> Result<()> {
-        if output
-            .len()
-            .checked_add(length)
-            .is_none_or(|end| end > output_limit)
-        {
-            return Err(Error::InvalidData("RAR 5 match exceeds output limit"));
-        }
-        // A match reaching past the start of the window writes zeroes rather
-        // than failing. WinRAR never clears its window and guards the copy
-        // with a first-wrap flag instead, so those bytes read as zero there,
-        // and an archive that leans on it stays readable here. Nothing is
-        // swallowed: a stream that is damaged rather than merely odd still
-        // fails its file hash.
-        if distance == 0
-            || distance > dictionary_size
-            || distance > self.history.len() + output.len()
-        {
-            output.resize(output.len() + length, 0);
-            return Ok(());
-        }
-        let mut remaining = length;
-        while remaining > 0 {
-            if distance <= output.len() {
-                // The match lies entirely in already-decoded output: copy in
-                // runs rather than one byte at a time.
-                if distance == 1 {
-                    // A one-byte repeat is a fill, not a copy.
-                    let b = output[output.len() - 1];
-                    output.resize(output.len() + remaining, b);
-                    remaining = 0;
-                } else {
-                    let start = output.len() - distance;
-                    let take = remaining.min(distance);
-                    output.extend_from_within(start..start + take);
-                    remaining -= take;
-                }
-            } else {
-                let history_distance = distance - output.len();
-                let index = self.history.len() - history_distance;
-                let take = remaining.min(history_distance);
-                output.extend_from_slice(&self.history[index..index + take]);
-                remaining -= take;
-            }
-        }
-        Ok(())
+        self.window.clear();
+        // The next `set_dictionary` sizes the window for this member alone.
+        self.window.cap = 0;
     }
 }
 
-struct StreamingOutput {
-    history: VecDeque<u8>,
-    pending: Vec<u8>,
-    written: usize,
-    output_limit: usize,
-    dictionary_size: usize,
-    history_limit: usize,
+/// The LZ window: the most recent bytes of the solid stream, before filters.
+/// Linear while it fills (`buf.len() < cap`, `head == buf.len()`), a ring
+/// once full (`buf.len() == cap`, `head` = next write index). Never moves
+/// bytes except once, when a larger dictionary arrives after wrapping.
+#[derive(Debug, Clone)]
+struct Window {
+    buf: Vec<u8>,
+    head: usize,
+    cap: usize,
+    /// Every byte since the last `clear` was zero (the sparse fast path).
     all_zero: bool,
 }
 
-impl StreamingOutput {
-    fn new(
-        history: Vec<u8>,
-        output_limit: usize,
-        dictionary_size: usize,
-        history_limit: usize,
-    ) -> Self {
+impl Window {
+    fn new() -> Self {
         Self {
-            all_zero: history.iter().all(|&byte| byte == 0),
-            history: history.into(),
-            pending: Vec::with_capacity(STREAM_FLUSH_THRESHOLD),
+            buf: Vec::new(),
+            head: 0,
+            cap: 0,
+            all_zero: true,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.head = 0;
+        self.all_zero = true;
+    }
+
+    /// A smaller dictionary keeps the larger window: distances are still
+    /// checked against the member's own dictionary.
+    fn set_dictionary(&mut self, dictionary: usize) {
+        if dictionary > self.cap {
+            if self.buf.len() == self.cap {
+                self.buf.rotate_left(self.head);
+                self.head = self.buf.len();
+            }
+            self.cap = dictionary;
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// The index of the byte `distance` back, for `1..=len()`.
+    fn index_of(&self, distance: usize) -> usize {
+        let len = self.buf.len();
+        (self.head + len - distance) % len
+    }
+
+    fn byte_at(&self, distance: usize) -> u8 {
+        self.buf[self.index_of(distance)]
+    }
+
+    fn extend(&mut self, data: &[u8]) {
+        if self.all_zero && data.iter().any(|&byte| byte != 0) {
+            self.all_zero = false;
+        }
+        self.append(data.len(), |dst, from| {
+            dst.copy_from_slice(&data[from..from + dst.len()]);
+        });
+    }
+
+    fn extend_fill(&mut self, byte: u8, n: usize) {
+        if byte != 0 {
+            self.all_zero = false;
+        }
+        self.append(n, |dst, _| dst.fill(byte));
+    }
+
+    /// Appends `n` bytes, keeping the last `cap`. `write(dst, from)` fills
+    /// `dst` with source bytes `from..from + dst.len()`.
+    fn append(&mut self, n: usize, mut write: impl FnMut(&mut [u8], usize)) {
+        let mut from = n.saturating_sub(self.cap);
+        let len = self.buf.len();
+        if len < self.cap {
+            let linear = (n - from).min(self.cap - len);
+            if self.buf.capacity() < len + linear {
+                let target = len
+                    .saturating_mul(2)
+                    .max(64 * 1024)
+                    .max(len + (n - from))
+                    .min(self.cap);
+                self.buf.reserve_exact(target - len);
+            }
+            self.buf.resize(len + linear, 0);
+            write(&mut self.buf[len..], from);
+            from += linear;
+            self.head = self.buf.len();
+        }
+        while from < n {
+            if self.head == self.cap {
+                self.head = 0;
+            }
+            let take = (n - from).min(self.cap - self.head);
+            write(&mut self.buf[self.head..self.head + take], from);
+            self.head += take;
+            from += take;
+        }
+        if self.head == self.cap && self.buf.len() == self.cap {
+            self.head = 0;
+        }
+    }
+}
+
+/// One member's output: appended to the window as it is produced and sent
+/// to the sink in chunks of up to `STREAM_FLUSH_THRESHOLD`.
+struct StreamingOutput<'w> {
+    window: &'w mut Window,
+    pending: Vec<u8>,
+    written: usize,
+    limit: Option<usize>,
+    dictionary: usize,
+}
+
+impl<'w> StreamingOutput<'w> {
+    fn new(window: &'w mut Window, limit: Option<usize>, dictionary: usize) -> Self {
+        Self {
+            window,
+            pending: Vec::new(),
             written: 0,
-            output_limit,
-            dictionary_size,
-            history_limit,
+            limit,
+            dictionary,
         }
     }
 
@@ -2954,17 +2926,24 @@ impl StreamingOutput {
         self.written
     }
 
+    fn check_room<E>(&self, count: usize) -> std::result::Result<(), StreamDecodeError<E>> {
+        if self
+            .written
+            .checked_add(count)
+            .is_none_or(|end| self.limit.is_some_and(|limit| end > limit))
+        {
+            return Err(Error::InvalidData("RAR 5 match exceeds output limit").into());
+        }
+        Ok(())
+    }
+
     fn push<E>(
         &mut self,
         byte: u8,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
-        if self.written >= self.output_limit {
-            return Err(Error::InvalidData("RAR 5 match exceeds output limit").into());
-        }
-        if byte != 0 {
-            self.all_zero = false;
-        }
+        self.check_room(1)?;
+        self.window.extend(&[byte]);
         self.pending.push(byte);
         self.written += 1;
         if self.pending.len() >= STREAM_FLUSH_THRESHOLD {
@@ -2973,57 +2952,22 @@ impl StreamingOutput {
         Ok(())
     }
 
-    fn push_repeated<E>(
+    /// `count` copies of `byte`, through `pending`.
+    fn fill<E>(
         &mut self,
         byte: u8,
         mut count: usize,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
-        if self
-            .written
-            .checked_add(count)
-            .is_none_or(|end| end > self.output_limit)
-        {
-            return Err(Error::InvalidData("RAR 5 match exceeds output limit").into());
-        }
-        if byte != 0 {
-            self.all_zero = false;
-        }
         while count > 0 {
-            let available = STREAM_FLUSH_THRESHOLD - self.pending.len();
-            let take = count.min(available.max(1));
-            let old_len = self.pending.len();
-            self.pending.resize(old_len + take, byte);
+            let take = count.min(STREAM_FLUSH_THRESHOLD - self.pending.len());
+            self.pending.resize(self.pending.len() + take, byte);
+            self.window.extend_fill(byte, take);
             self.written += take;
             count -= take;
             if self.pending.len() >= STREAM_FLUSH_THRESHOLD {
                 self.flush(sink)?;
             }
-        }
-        Ok(())
-    }
-
-    fn push_zeroes<E>(
-        &mut self,
-        count: usize,
-        sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
-    ) -> std::result::Result<(), StreamDecodeError<E>> {
-        if self
-            .written
-            .checked_add(count)
-            .is_none_or(|end| end > self.output_limit)
-        {
-            return Err(Error::InvalidData("RAR 5 match exceeds output limit").into());
-        }
-        self.flush(sink)?;
-        sink(DecodedChunk::Repeated {
-            byte: 0,
-            len: count,
-        })
-        .map_err(StreamDecodeError::Sink)?;
-        self.written += count;
-        if self.history.is_empty() && self.history_limit != 0 {
-            self.history.push_back(0);
         }
         Ok(())
     }
@@ -3034,47 +2978,59 @@ impl StreamingOutput {
         length: usize,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
-        if self.all_zero && distance <= self.written + self.history.len() {
-            return self.push_zeroes(length, sink);
+        self.check_room(length)?;
+        if self.window.all_zero && distance <= self.window.len() {
+            // A run of zeros: top up `pending`, then send the rest as one
+            // repeated chunk.
+            let mut remaining = length;
+            while remaining > 0 {
+                if self.pending.is_empty() {
+                    sink(DecodedChunk::Repeated {
+                        byte: 0,
+                        len: remaining,
+                    })
+                    .map_err(StreamDecodeError::Sink)?;
+                    self.window.extend_fill(0, remaining);
+                    self.written += remaining;
+                    break;
+                }
+                let take = remaining.min(STREAM_FLUSH_THRESHOLD - self.pending.len());
+                self.fill(0, take, sink)?;
+                remaining -= take;
+            }
+            return Ok(());
         }
-        // Zero-fill out-of-window matches, as the buffered decoder does.
-        if distance == 0
-            || distance > self.dictionary_size
-            || distance > self.history.len() + self.pending.len()
-        {
-            return self.push_repeated(0, length, sink);
-        }
-        if self
-            .written
-            .checked_add(length)
-            .is_none_or(|end| end > self.output_limit)
-        {
-            return Err(Error::InvalidData("RAR 5 match exceeds output limit").into());
+        // A match reaching past the start of the window writes zeroes rather
+        // than failing. WinRAR never clears its window and guards the copy
+        // with a first-wrap flag instead, so those bytes read as zero there,
+        // and an archive that leans on it stays readable here. Nothing is
+        // swallowed: a stream that is damaged rather than merely odd still
+        // fails its file hash.
+        if distance == 0 || distance > self.dictionary || distance > self.window.len() {
+            return self.fill(0, length, sink);
         }
         if distance == 1 {
-            let byte = self.byte_at_distance(1)?;
-            return self.push_repeated(byte, length, sink);
+            let byte = self.window.byte_at(1);
+            return self.fill(byte, length, sink);
         }
-        for _ in 0..length {
-            let byte = self.byte_at_distance(distance)?;
-            self.push(byte, sink)?;
+        let mut remaining = length;
+        while remaining > 0 {
+            let src = self.window.index_of(distance);
+            let take = remaining
+                .min(distance)
+                .min(self.window.len() - src)
+                .min(STREAM_FLUSH_THRESHOLD - self.pending.len());
+            let start = self.pending.len();
+            self.pending
+                .extend_from_slice(&self.window.buf[src..src + take]);
+            self.window.extend(&self.pending[start..]);
+            self.written += take;
+            remaining -= take;
+            if self.pending.len() >= STREAM_FLUSH_THRESHOLD {
+                self.flush(sink)?;
+            }
         }
         Ok(())
-    }
-
-    fn byte_at_distance(&self, distance: usize) -> Result<u8> {
-        if distance <= self.pending.len() {
-            Ok(self.pending[self.pending.len() - distance])
-        } else {
-            let history_distance = distance - self.pending.len();
-            if history_distance > self.history.len() {
-                return Err(Error::InvalidData("RAR 5 match distance exceeds window"));
-            }
-            Ok(*self
-                .history
-                .get(self.history.len() - history_distance)
-                .ok_or(Error::InvalidData("RAR 5 match distance exceeds window"))?)
-        }
     }
 
     fn flush<E>(
@@ -3085,11 +3041,7 @@ impl StreamingOutput {
             return Ok(());
         }
         sink(DecodedChunk::Bytes(&self.pending)).map_err(StreamDecodeError::Sink)?;
-        self.history.extend(self.pending.iter().copied());
         self.pending.clear();
-        while self.history.len() > self.history_limit {
-            self.history.pop_front();
-        }
         Ok(())
     }
 
@@ -3098,10 +3050,6 @@ impl StreamingOutput {
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
         self.flush(sink)
-    }
-
-    fn into_history(self) -> Vec<u8> {
-        self.history.into()
     }
 }
 
@@ -3842,6 +3790,225 @@ fn write_level_lengths(writer: &mut BitWriter, lengths: &[u8; LEVEL_TABLE_SIZE])
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn window_reads_back_across_the_wrap() {
+        let mut w = Window::new();
+        w.set_dictionary(8);
+        w.extend(b"abcdef");
+        assert_eq!((w.len(), w.byte_at(1), w.byte_at(6)), (6, b'f', b'a'));
+        w.extend(b"ghijk"); // wraps: holds "defghijk"
+        assert_eq!(w.len(), 8);
+        let got: Vec<u8> = (1..=8).rev().map(|d| w.byte_at(d)).collect();
+        assert_eq!(got, b"defghijk");
+    }
+
+    #[test]
+    fn window_keeps_only_the_last_dictionary_of_a_long_extend() {
+        let mut w = Window::new();
+        w.set_dictionary(4);
+        w.extend(b"0123456789");
+        let got: Vec<u8> = (1..=4).rev().map(|d| w.byte_at(d)).collect();
+        assert_eq!(got, b"6789");
+        assert!(w.buf.capacity() <= 4 * 2, "capacity follows the dictionary");
+    }
+
+    #[test]
+    fn window_growing_the_dictionary_after_a_wrap_keeps_order() {
+        let mut w = Window::new();
+        w.set_dictionary(4);
+        w.extend(b"abcdef"); // "cdef", wrapped
+        w.extend(b"g"); // "defg": buf "gdef", head 1
+        assert_eq!(w.head, 1);
+        w.set_dictionary(8);
+        w.extend(b"hi");
+        let got: Vec<u8> = (1..=6).rev().map(|d| w.byte_at(d)).collect();
+        assert_eq!(got, b"defghi");
+    }
+
+    /// A non-solid member starts a window sized by its own dictionary, not
+    /// the largest one seen earlier in the archive.
+    #[test]
+    fn window_non_solid_reset_forgets_an_earlier_larger_dictionary() {
+        let payload = literal_only_payload(b"ABBAABBA");
+        let block = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+        let mut decoder = Unpack50Decoder::new();
+        decoder
+            .decode_member_with_dictionary(&block, 0, 8, 1 << 20, false, DecodeMode::LiteralOnly)
+            .unwrap();
+        assert_eq!(decoder.window.len(), 8);
+        decoder
+            .decode_member_with_dictionary(&block, 0, 8, 4, false, DecodeMode::LiteralOnly)
+            .unwrap();
+        assert_eq!((decoder.window.cap, decoder.window.len()), (4, 4));
+        assert_eq!(window_bytes(&decoder.window), b"ABBA");
+    }
+
+    #[test]
+    fn window_clear_forgets_bytes_and_zero_state() {
+        let mut w = Window::new();
+        w.set_dictionary(16);
+        w.extend(b"xyz");
+        assert!(!w.all_zero);
+        w.clear();
+        assert_eq!(w.len(), 0);
+        assert!(w.all_zero);
+        w.extend_fill(0, 5);
+        assert!(w.all_zero);
+        assert_eq!(w.byte_at(5), 0);
+    }
+
+    /// Matches through `StreamingOutput` give the bytes a naive copy over the
+    /// whole stream gives: across the wrap, over a member boundary (a second
+    /// `StreamingOutput` on the same window), after the dictionary grows, and
+    /// in the all-zero fast path.
+    #[test]
+    fn window_matches_equal_a_naive_copy() {
+        fn run(
+            window: &mut Window,
+            limit: usize,
+            dictionary: usize,
+            ops: &[(usize, usize)],
+            stream: &mut Vec<u8>,
+            chunks: &mut Vec<String>,
+        ) {
+            window.set_dictionary(dictionary);
+            let mut out = StreamingOutput::new(window, Some(limit), dictionary);
+            let mut sink = |c: DecodedChunk<'_>| {
+                match c {
+                    DecodedChunk::Bytes(b) => {
+                        chunks.push(format!("bytes {}", b.len()));
+                        stream.extend_from_slice(b);
+                    }
+                    DecodedChunk::Repeated { byte, len } => {
+                        chunks.push(format!("repeated {byte} {len}"));
+                        stream.resize(stream.len() + len, byte);
+                    }
+                }
+                Ok::<(), ()>(())
+            };
+            for &(literal_or_distance, length) in ops {
+                if length == 0 {
+                    out.push(literal_or_distance as u8, &mut sink).unwrap();
+                } else {
+                    out.copy_match(literal_or_distance, length, &mut sink)
+                        .unwrap();
+                }
+            }
+            assert_eq!(out.written(), limit);
+            out.finish(&mut sink).unwrap();
+        }
+        fn naive(stream: &[u8], dictionary: usize, ops: &[(usize, usize)]) -> Vec<u8> {
+            let mut s = stream.to_vec();
+            for &(x, length) in ops {
+                if length == 0 {
+                    s.push(x as u8);
+                }
+                for _ in 0..length {
+                    let b = if x == 0 || x > dictionary || x > s.len() {
+                        0
+                    } else {
+                        s[s.len() - x]
+                    };
+                    s.push(b);
+                }
+            }
+            s
+        }
+
+        let mut window = Window::new();
+        let mut stream = Vec::new();
+        let mut chunks = Vec::new();
+        // All-zero fast path: zeros, then matches into them go out as runs.
+        let zeros = [(0, 0), (1, 70_000), (3, 5)];
+        let expected = naive(&stream, 64, &zeros);
+        run(&mut window, 70_006, 64, &zeros, &mut stream, &mut chunks);
+        assert_eq!(stream, expected);
+        assert!(
+            chunks.iter().any(|c| c.starts_with("repeated 0 ")),
+            "{chunks:?}"
+        );
+        // Next member, same 64-byte window, now wrapped many times: literals,
+        // a match straddling the wrap, an overlapping one, one out of range.
+        let text: Vec<(usize, usize)> = b"the quick brown fox jumps over"
+            .iter()
+            .map(|&b| (usize::from(b), 0))
+            .collect();
+        let mut ops = text.clone();
+        ops.extend([(29, 100), (64, 64), (7, 20), (65, 3), (2, 9)]);
+        let expected = naive(&stream, 64, &ops);
+        let limit = expected.len() - stream.len();
+        run(&mut window, limit, 64, &ops, &mut stream, &mut chunks);
+        assert_eq!(stream, expected);
+        // The dictionary grows after the wrap: old bytes keep their distances.
+        let mut ops = text;
+        ops.extend([(94, 94), (150, 300), (1, 7)]);
+        let expected = naive(&stream, 256, &ops);
+        let limit = expected.len() - stream.len();
+        run(&mut window, limit, 256, &ops, &mut stream, &mut chunks);
+        assert_eq!(stream, expected);
+    }
+
+    /// A solid chain decoded member by member through the streaming entry
+    /// point gives the writer's input back, with matches reaching into the
+    /// previous members.
+    #[test]
+    fn streaming_solid_members_reach_into_earlier_members() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let members: Vec<Vec<u8>> = (0..20u8)
+            .map(|i| {
+                format!("member {i}: the quick brown fox ")
+                    .repeat(40 + usize::from(i))
+                    .into_bytes()
+            })
+            .collect();
+        let features = crate::FeatureSet {
+            solid: true,
+            ..crate::FeatureSet::default()
+        };
+        let opts = crate::rar50::WriterOptions::new(crate::ArchiveVersion::Rar50, features)
+            .with_dictionary_size(128 * 1024);
+        let entries: Vec<_> = members
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                crate::rar50::ArchiveEntry::new(
+                    format!("m{i}"),
+                    crate::EntrySource::from_bytes(m.clone()),
+                )
+            })
+            .collect();
+        let bytes = crate::rar50::Rar50Writer::new(opts)
+            .entries(entries)
+            .finish()
+            .unwrap();
+        let archive = crate::rar50::Archive::parse(&bytes).unwrap();
+        let options = crate::ArchiveReadOptions::new().with_rar50_buffered_decode_limit(0);
+        struct Sink(Rc<RefCell<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let got = RefCell::new(Vec::<Rc<RefCell<Vec<u8>>>>::new());
+        archive
+            .extract_to(options, |_| {
+                let data = Rc::new(RefCell::new(Vec::new()));
+                got.borrow_mut().push(Rc::clone(&data));
+                Ok(Box::new(Sink(data)))
+            })
+            .unwrap();
+        let got: Vec<Vec<u8>> = got
+            .into_inner()
+            .iter()
+            .map(|d| d.borrow().clone())
+            .collect();
+        assert_eq!(got, members);
+    }
 
     #[test]
     fn repricing_keeps_the_smallest_actual_block_including_filters() {
@@ -5509,50 +5676,77 @@ mod tests {
         );
     }
 
+    /// One match through a `StreamingOutput` over a window holding
+    /// `history`: the result and what reached the sink.
+    fn match_after(
+        history: &[u8],
+        dictionary: usize,
+        limit: usize,
+        distance: usize,
+        length: usize,
+    ) -> (bool, Vec<u8>) {
+        let mut window = Window::new();
+        window.set_dictionary(dictionary.max(history.len()));
+        window.extend(history);
+        let mut output = StreamingOutput::new(&mut window, Some(limit), dictionary);
+        let mut decoded = Vec::new();
+        let mut sink = |chunk: DecodedChunk<'_>| {
+            match chunk {
+                DecodedChunk::Bytes(bytes) => decoded.extend_from_slice(bytes),
+                DecodedChunk::Repeated { byte, len } => {
+                    decoded.extend(std::iter::repeat_n(byte, len));
+                }
+            }
+            Ok::<(), ()>(())
+        };
+        let result = match output.copy_match(distance, length, &mut sink) {
+            Ok(()) => output.finish(&mut sink),
+            Err(error) => Err(error),
+        };
+        let ok = match result {
+            Ok(()) => true,
+            Err(StreamDecodeError::Decode(Error::InvalidData(
+                "RAR 5 match exceeds output limit",
+            ))) => false,
+            Err(error) => panic!("{error:?}"),
+        };
+        (ok, decoded)
+    }
+
+    fn window_bytes(window: &Window) -> Vec<u8> {
+        (1..=window.len())
+            .rev()
+            .map(|d| window.byte_at(d))
+            .collect()
+    }
+
     #[test]
     fn copies_lz_matches_with_overlap() {
-        let decoder = Unpack50Decoder::new();
-        let mut output = b"AB".to_vec();
-
-        decoder
-            .copy_match(&mut output, 2, 6, 8, DEFAULT_DICTIONARY_SIZE)
-            .unwrap();
-
-        assert_eq!(output, b"ABABABAB");
+        assert_eq!(
+            match_after(b"AB", DEFAULT_DICTIONARY_SIZE, 6, 2, 6),
+            (true, b"ABABAB".to_vec())
+        );
     }
 
     #[test]
     fn zero_fills_a_match_that_reaches_past_the_window() {
-        let decoder = Unpack50Decoder::new();
-        let mut output = b"AB".to_vec();
-
-        decoder
-            .copy_match(&mut output, 3, 1, 3, DEFAULT_DICTIONARY_SIZE)
-            .unwrap();
-
-        assert_eq!(output, b"AB\0");
+        assert_eq!(
+            match_after(b"AB", DEFAULT_DICTIONARY_SIZE, 1, 3, 1),
+            (true, b"\0".to_vec())
+        );
     }
 
     #[test]
     fn rejects_a_match_that_runs_past_the_output_limit() {
-        let decoder = Unpack50Decoder::new();
-        let mut output = b"AB".to_vec();
-
         assert_eq!(
-            decoder.copy_match(&mut output, 1, 2, 3, DEFAULT_DICTIONARY_SIZE),
-            Err(Error::InvalidData("RAR 5 match exceeds output limit"))
+            match_after(b"AB", DEFAULT_DICTIONARY_SIZE, 1, 1, 2),
+            (false, Vec::new())
         );
-        assert_eq!(output, b"AB");
     }
 
     #[test]
     fn zero_fills_a_match_distance_beyond_the_dictionary() {
-        let decoder = Unpack50Decoder::new();
-        let mut output = b"ABCD".to_vec();
-
-        decoder.copy_match(&mut output, 4, 1, 5, 3).unwrap();
-
-        assert_eq!(output, b"ABCD\0");
+        assert_eq!(match_after(b"ABCD", 3, 1, 4, 1), (true, b"\0".to_vec()));
     }
 
     #[test]
@@ -5571,7 +5765,7 @@ mod tests {
                 .unwrap(),
             b"ABBA"
         );
-        assert_eq!(decoder.history, b"ABBA");
+        assert_eq!(window_bytes(&decoder.window), b"ABBA");
 
         assert_eq!(
             decoder
@@ -5579,7 +5773,7 @@ mod tests {
                 .unwrap(),
             b"BAAB"
         );
-        assert_eq!(decoder.history, b"BABAAB");
+        assert_eq!(window_bytes(&decoder.window), b"BABAAB");
     }
 
     #[test]
@@ -5612,7 +5806,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(decoded, b"ABBA");
-        assert_eq!(decoder.history, b"ABBA");
+        assert_eq!(window_bytes(&decoder.window), b"ABBA");
 
         decoded.clear();
         decoder
@@ -5634,7 +5828,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(decoded, b"BAAB");
-        assert_eq!(decoder.history, b"BABAAB");
+        assert_eq!(window_bytes(&decoder.window), b"BABAAB");
     }
 
     #[test]
@@ -5642,64 +5836,15 @@ mod tests {
         const OLD_STREAM_HISTORY_LIMIT: usize = 64 * 1024 * 1024;
         let distance = OLD_STREAM_HISTORY_LIMIT + 1;
         let history = vec![b'A'; distance];
-        let mut output = StreamingOutput::new(history, 1, distance, distance);
-        let mut decoded = Vec::new();
-
-        output
-            .copy_match(distance, 1, &mut |chunk| {
-                match chunk {
-                    DecodedChunk::Bytes(bytes) => decoded.extend_from_slice(bytes),
-                    DecodedChunk::Repeated { byte, len } => {
-                        decoded.extend(std::iter::repeat_n(byte, len));
-                    }
-                }
-                Ok::<(), std::io::Error>(())
-            })
-            .unwrap();
-        output
-            .finish(&mut |chunk| {
-                match chunk {
-                    DecodedChunk::Bytes(bytes) => decoded.extend_from_slice(bytes),
-                    DecodedChunk::Repeated { byte, len } => {
-                        decoded.extend(std::iter::repeat_n(byte, len));
-                    }
-                }
-                Ok::<(), std::io::Error>(())
-            })
-            .unwrap();
-
-        assert_eq!(decoded, b"A");
+        assert_eq!(
+            match_after(&history, distance, 1, distance, 1),
+            (true, b"A".to_vec())
+        );
     }
 
     #[test]
     fn streaming_window_zero_fills_match_beyond_declared_dictionary() {
-        let mut output = StreamingOutput::new(vec![b'A'; 8], 1, 7, 8);
-        let mut decoded = Vec::new();
-
-        output
-            .copy_match(8, 1, &mut |chunk| {
-                match chunk {
-                    DecodedChunk::Bytes(bytes) => decoded.extend_from_slice(bytes),
-                    DecodedChunk::Repeated { byte, len } => {
-                        decoded.extend(std::iter::repeat_n(byte, len));
-                    }
-                }
-                Ok::<(), std::io::Error>(())
-            })
-            .unwrap();
-        output
-            .flush(&mut |chunk| {
-                match chunk {
-                    DecodedChunk::Bytes(bytes) => decoded.extend_from_slice(bytes),
-                    DecodedChunk::Repeated { byte, len } => {
-                        decoded.extend(std::iter::repeat_n(byte, len));
-                    }
-                }
-                Ok::<(), std::io::Error>(())
-            })
-            .unwrap();
-
-        assert_eq!(decoded, b"\0");
+        assert_eq!(match_after(&[b'A'; 8], 7, 1, 8, 1), (true, b"\0".to_vec()));
     }
 
     fn literal_only_payload(data: &[u8]) -> Vec<u8> {

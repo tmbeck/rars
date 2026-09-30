@@ -687,20 +687,19 @@ impl<'a> DecoderSession<'a> {
         file: &FileHeader,
         writer: &mut dyn Write,
     ) -> Result<()> {
-        let mut streaming_decoder = self.decoder.clone();
+        // No checkpoint: an error ends the extraction, so the decoder state
+        // after it is never used again.
         let (mut packed, keys) = file
             .packed_reader_with_password(archive, self.password)
             .map_err(|error| file.entry_error("reading", error))?;
         file.stream_packed_with_decoder(
             &mut packed,
             keys.as_ref(),
-            &mut streaming_decoder,
+            &mut self.decoder,
             self.buffered_decode_limit,
             writer,
         )
-        .map_err(|error| file.entry_error("decoding", error))?;
-        self.decoder = streaming_decoder;
-        Ok(())
+        .map_err(|error| file.entry_error("decoding", error))
     }
 
     fn decoded_file_data(&mut self, archive: &Archive, file: &FileHeader) -> Result<DecodedData> {
