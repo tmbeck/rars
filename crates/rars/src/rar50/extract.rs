@@ -335,7 +335,6 @@ impl FileHeader {
         packed: &mut R,
         keys: Option<&Rar50Keys>,
         decoder: &mut Unpack50Decoder,
-        buffered_decode_limit: u64,
         writer: &mut dyn Write,
     ) -> Result<()> {
         if self.is_stored() {
@@ -374,10 +373,6 @@ impl FileHeader {
             )
             .map_err(|error| match error {
                 StreamDecodeError::Decode(error) => Error::from(error),
-                StreamDecodeError::FilteredMember => Error::Rar50BufferedDecodeLimitExceeded {
-                    limit: buffered_decode_limit,
-                    required: self.unpacked_size,
-                },
                 StreamDecodeError::Sink(error) => Error::from(error),
             })?;
         self.verify_streaming_integrity(crc, hash, keys)
@@ -692,14 +687,8 @@ impl<'a> DecoderSession<'a> {
         let (mut packed, keys) = file
             .packed_reader_with_password(archive, self.password)
             .map_err(|error| file.entry_error("reading", error))?;
-        file.stream_packed_with_decoder(
-            &mut packed,
-            keys.as_ref(),
-            &mut self.decoder,
-            self.buffered_decode_limit,
-            writer,
-        )
-        .map_err(|error| file.entry_error("decoding", error))
+        file.stream_packed_with_decoder(&mut packed, keys.as_ref(), &mut self.decoder, writer)
+            .map_err(|error| file.entry_error("decoding", error))
     }
 
     fn decoded_file_data(&mut self, archive: &Archive, file: &FileHeader) -> Result<DecodedData> {
@@ -1408,7 +1397,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_filtered_members_return_typed_error_without_preflight_decode() {
+    fn streaming_filtered_members_extract() {
         let mut data = Vec::new();
         while data.len() as u64 <= BUFFERED_DECODE_LIMIT {
             data.extend_from_slice(b"\xe8\0\0\0\0filtered payload block\n");
@@ -1434,16 +1423,9 @@ mod tests {
         assert!(file.should_stream_decode(BUFFERED_DECODE_LIMIT));
 
         let mut out = Vec::new();
-        let error = file.write_to(&archive, None, &mut out).unwrap_err();
+        file.write_to(&archive, None, &mut out).unwrap();
 
-        assert!(matches!(
-            error,
-            Error::AtEntry {
-                operation: "decoding",
-                source,
-                ..
-            } if matches!(*source, Error::Rar50BufferedDecodeLimitExceeded { .. })
-        ));
+        assert_eq!(out, data);
     }
 
     #[test]
@@ -2059,7 +2041,6 @@ mod tests {
                 &mut Cursor::new(Vec::<u8>::new()),
                 None,
                 &mut decoder,
-                BUFFERED_DECODE_LIMIT,
                 &mut out,
             )
             .unwrap_err();

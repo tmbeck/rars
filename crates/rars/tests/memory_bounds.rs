@@ -176,3 +176,46 @@ fn solid_rar5_scales_linearly() {
     let time = tl.as_secs_f64() / ts.as_secs_f64();
     assert!(time <= 6.0, "time ×{time:.1} for ×4 members");
 }
+
+/// Memory the writer may use to build a test archive. The default (256 MiB)
+/// refuses an explicitly filtered 64 MiB member and a 32 MiB dictionary.
+fn writer_resources() -> rars::WriterResources {
+    rars::WriterResources::new(2 << 30)
+}
+
+fn rar5_member(size: usize, dictionary: u64, policy: rars::rar50::FilterPolicy) -> Vec<Vec<u8>> {
+    let opts =
+        rars::rar50::WriterOptions::new(rars::ArchiveVersion::Rar50, rars::FeatureSet::default())
+            .with_compression_level(1)
+            .with_dictionary_size(dictionary);
+    let entry = rars::rar50::ArchiveEntry::new(
+        b"m".to_vec(),
+        rars::EntrySource::from_bytes(nibble_text(size, 7)),
+    );
+    let mut out = Vec::new();
+    rars::rar50::Rar50Writer::new(opts)
+        .filter_policy(policy)
+        .entry(entry)
+        .write_to(&mut out, &writer_resources())
+        .unwrap();
+    vec![out]
+}
+
+/// F5: a filtered member above the buffered limit failed; below it, it was
+/// buffered whole. Streaming holds at most one filter block.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release only")]
+fn rar5_filtered_member_streams_in_bounded_memory() {
+    let _g = serial();
+    let a = open_all(&cached("rar5-64m-e8-v1", || {
+        rar5_member(
+            64 * MIB,
+            1 << 20,
+            rars::rar50::FilterPolicy::explicit(rars::rar50::FilterKind::E8),
+        )
+    }));
+    let opts = rars::ArchiveReadOptions::new().with_rar50_buffered_decode_limit(0);
+    let (n, u) = measure(|| extract_all(&a, opts).unwrap());
+    assert_eq!(n, 64 * MIB as u64);
+    check("rar5 e8 64 MiB, 1 MiB dict", u, 8 * MIB);
+}

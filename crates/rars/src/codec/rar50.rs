@@ -1,5 +1,6 @@
 use super::filters::{self, DeltaErrorMessages, FilterOp};
 use super::{huffman, match_finder, Error, Result};
+use std::collections::VecDeque;
 use std::io::Read;
 #[cfg(test)]
 use std::io::Write;
@@ -14,6 +15,13 @@ pub const LENGTH_TABLE_SIZE: usize = 44;
 const DEFAULT_DICTIONARY_SIZE: usize = 4 * 1024 * 1024;
 const MAX_INITIAL_OUTPUT_CAPACITY: usize = 1024 * 1024;
 const STREAM_FLUSH_THRESHOLD: usize = 64 * 1024;
+/// The longest filter block. libarchive refuses longer ones; UnRAR ignores them.
+const MAX_FILTER_LENGTH: usize = 0x40_0000;
+/// UnRAR's `MAX_UNPACK_FILTERS`.
+const MAX_PENDING_FILTERS: usize = 8192;
+/// Output held back for queued filters before a stream is refused. Filters in
+/// `start` order (every writer's) hold at most one block, `MAX_FILTER_LENGTH`.
+const MAX_HELD_OUTPUT: usize = 8 * 1024 * 1024;
 const MAX_ENCODER_MATCH_OFFSET: usize = DEFAULT_DICTIONARY_SIZE;
 const MAX_ENCODER_MATCH_LENGTH: usize = 4096;
 /// The largest block the format allows a writer to emit.
@@ -207,7 +215,6 @@ struct OwnedCompressedBlock {
 #[doc(hidden)]
 pub enum StreamDecodeError<E> {
     Decode(Error),
-    FilteredMember,
     Sink(E),
 }
 
@@ -2612,7 +2619,6 @@ impl Unpack50Decoder {
         mode: DecodeMode,
     ) -> Result<Vec<u8>> {
         let mut output = Vec::with_capacity(output_size.min(MAX_INITIAL_OUTPUT_CAPACITY));
-        let mut filters = Vec::new();
         let decoded = self.decode(
             input,
             algorithm_version,
@@ -2620,7 +2626,6 @@ impl Unpack50Decoder {
             dictionary_size,
             solid,
             mode,
-            Some(&mut filters),
             &mut |chunk| {
                 match chunk {
                     DecodedChunk::Bytes(bytes) => output.extend_from_slice(bytes),
@@ -2634,14 +2639,7 @@ impl Unpack50Decoder {
         match decoded {
             Ok(()) => {}
             Err(StreamDecodeError::Decode(error)) => return Err(error),
-            // Not produced: this entry point collects the filters.
-            Err(StreamDecodeError::FilteredMember) => {
-                return Err(Error::InvalidData("RAR 5 filter was not collected"));
-            }
             Err(StreamDecodeError::Sink(never)) => match never {},
-        }
-        if mode.applies_filters() {
-            apply_filters(&mut output, &filters)?;
         }
         Ok(output)
     }
@@ -2662,14 +2660,12 @@ impl Unpack50Decoder {
             dictionary_size,
             solid,
             DecodeMode::Lz,
-            None,
             &mut sink,
         )
     }
 
-    /// The decode loop behind every entry point. A filter record is pushed to
-    /// `filters`; without it, a filtered member is refused with
-    /// `FilteredMember`.
+    /// The decode loop behind every entry point. The sink receives filtered
+    /// output (`Lz`) or unfiltered output (`LzNoFilters`).
     #[allow(clippy::too_many_arguments)]
     fn decode<E>(
         &mut self,
@@ -2679,7 +2675,6 @@ impl Unpack50Decoder {
         dictionary_size: usize,
         solid: bool,
         mode: DecodeMode,
-        mut filters: Option<&mut Vec<PendingFilter>>,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
         if dictionary_size == 0 {
@@ -2711,10 +2706,12 @@ impl Unpack50Decoder {
                 let symbol = tables.main.decode(&mut bits)?;
                 match symbol {
                     0..=255 => output.push(symbol as u8, sink)?,
-                    256 if mode.uses_lz() => match filters.as_deref_mut() {
-                        Some(filters) => filters.push(read_filter(&mut bits, output.written())?),
-                        None => return Err(StreamDecodeError::FilteredMember),
-                    },
+                    256 if mode.uses_lz() => {
+                        let filter = read_filter(&mut bits, output.written())?;
+                        if mode.applies_filters() {
+                            output.add_filter(filter)?;
+                        }
+                    }
                     257 if mode.uses_lz() => {
                         if self.last_length != 0 {
                             output.copy_match(self.reps[0], self.last_length, sink)?;
@@ -2901,12 +2898,19 @@ impl Window {
     }
 }
 
-/// One member's output: appended to the window as it is produced and sent
-/// to the sink in chunks of up to `STREAM_FLUSH_THRESHOLD`.
+/// One member's output: appended to the window unfiltered as it is produced,
+/// and sent to the sink filtered, every `STREAM_FLUSH_THRESHOLD` bytes.
+/// Output from the smallest queued filter `start` on is held until the
+/// filters over it have been applied.
 struct StreamingOutput<'w> {
     window: &'w mut Window,
+    /// Output not yet sent: member offsets `written - pending.len()..written`.
     pending: Vec<u8>,
     written: usize,
+    /// `written` at the last flush.
+    flushed: usize,
+    /// Filters not yet applied, in declaration order.
+    filters: VecDeque<PendingFilter>,
     limit: Option<usize>,
     dictionary: usize,
 }
@@ -2917,6 +2921,8 @@ impl<'w> StreamingOutput<'w> {
             window,
             pending: Vec::new(),
             written: 0,
+            flushed: 0,
+            filters: VecDeque::new(),
             limit,
             dictionary,
         }
@@ -2924,6 +2930,32 @@ impl<'w> StreamingOutput<'w> {
 
     fn written(&self) -> usize {
         self.written
+    }
+
+    /// Bytes until the next flush is due.
+    fn room(&self) -> usize {
+        STREAM_FLUSH_THRESHOLD - (self.written - self.flushed)
+    }
+
+    fn add_filter(&mut self, filter: PendingFilter) -> Result<()> {
+        if filter.length > MAX_FILTER_LENGTH {
+            return Err(Error::InvalidData(
+                "RAR 5 filter block is longer than 4 MiB",
+            ));
+        }
+        if self.filters.len() >= MAX_PENDING_FILTERS {
+            // As UnRAR's AddFilter: make room first, refuse only if still full.
+            self.apply_complete_filters()?;
+        }
+        if self.filters.len() >= MAX_PENDING_FILTERS {
+            return Err(Error::InvalidData("RAR 5 has too many pending filters"));
+        }
+        filter
+            .start
+            .checked_add(filter.length)
+            .ok_or(Error::InvalidData("RAR 5 filter range overflows"))?;
+        self.filters.push_back(filter);
+        Ok(())
     }
 
     fn check_room<E>(&self, count: usize) -> std::result::Result<(), StreamDecodeError<E>> {
@@ -2946,7 +2978,7 @@ impl<'w> StreamingOutput<'w> {
         self.window.extend(&[byte]);
         self.pending.push(byte);
         self.written += 1;
-        if self.pending.len() >= STREAM_FLUSH_THRESHOLD {
+        if self.room() == 0 {
             self.flush(sink)?;
         }
         Ok(())
@@ -2960,12 +2992,12 @@ impl<'w> StreamingOutput<'w> {
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
         while count > 0 {
-            let take = count.min(STREAM_FLUSH_THRESHOLD - self.pending.len());
+            let take = count.min(self.room());
             self.pending.resize(self.pending.len() + take, byte);
             self.window.extend_fill(byte, take);
             self.written += take;
             count -= take;
-            if self.pending.len() >= STREAM_FLUSH_THRESHOLD {
+            if self.room() == 0 {
                 self.flush(sink)?;
             }
         }
@@ -2981,10 +3013,10 @@ impl<'w> StreamingOutput<'w> {
         self.check_room(length)?;
         if self.window.all_zero && distance <= self.window.len() {
             // A run of zeros: top up `pending`, then send the rest as one
-            // repeated chunk.
+            // repeated chunk, unless a filter may cover it.
             let mut remaining = length;
             while remaining > 0 {
-                if self.pending.is_empty() {
+                if self.pending.is_empty() && self.filters.is_empty() {
                     sink(DecodedChunk::Repeated {
                         byte: 0,
                         len: remaining,
@@ -2992,9 +3024,10 @@ impl<'w> StreamingOutput<'w> {
                     .map_err(StreamDecodeError::Sink)?;
                     self.window.extend_fill(0, remaining);
                     self.written += remaining;
+                    self.flushed = self.written;
                     break;
                 }
-                let take = remaining.min(STREAM_FLUSH_THRESHOLD - self.pending.len());
+                let take = remaining.min(self.room());
                 self.fill(0, take, sink)?;
                 remaining -= take;
             }
@@ -3019,29 +3052,63 @@ impl<'w> StreamingOutput<'w> {
             let take = remaining
                 .min(distance)
                 .min(self.window.len() - src)
-                .min(STREAM_FLUSH_THRESHOLD - self.pending.len());
+                .min(self.room());
             let start = self.pending.len();
             self.pending
                 .extend_from_slice(&self.window.buf[src..src + take]);
             self.window.extend(&self.pending[start..]);
             self.written += take;
             remaining -= take;
-            if self.pending.len() >= STREAM_FLUSH_THRESHOLD {
+            if self.room() == 0 {
                 self.flush(sink)?;
             }
         }
         Ok(())
     }
 
+    /// Applies the complete filters at the front of the queue to `pending`,
+    /// in declaration order.
+    fn apply_complete_filters(&mut self) -> Result<()> {
+        let pending_start = self.written - self.pending.len();
+        while let Some(&filter) = self.filters.front() {
+            // `add_filter` checked the sum.
+            let end = filter.start + filter.length;
+            if end > self.written {
+                break;
+            }
+            let data = filter
+                .start
+                .checked_sub(pending_start)
+                .and_then(|from| self.pending.get_mut(from..end - pending_start))
+                .ok_or(Error::InvalidData("RAR 5 filter range exceeds output"))?;
+            apply_filter(data, &filter)?;
+            self.filters.pop_front();
+        }
+        Ok(())
+    }
+
+    /// Applies the complete filters at the front of the queue, then sends `pending` up to the smallest queued
+    /// filter start.
     fn flush<E>(
         &mut self,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
-        if self.pending.is_empty() {
-            return Ok(());
+        self.flushed = self.written;
+        self.apply_complete_filters()?;
+        let pending_start = self.written - self.pending.len();
+        let boundary = self
+            .filters
+            .iter()
+            .map(|filter| filter.start)
+            .fold(self.written, usize::min);
+        let send = boundary.saturating_sub(pending_start);
+        if send > 0 {
+            sink(DecodedChunk::Bytes(&self.pending[..send])).map_err(StreamDecodeError::Sink)?;
+            self.pending.drain(..send);
         }
-        sink(DecodedChunk::Bytes(&self.pending)).map_err(StreamDecodeError::Sink)?;
-        self.pending.clear();
+        if self.pending.len() > MAX_HELD_OUTPUT {
+            return Err(Error::InvalidData("RAR 5 filters hold too much output").into());
+        }
         Ok(())
     }
 
@@ -3049,7 +3116,11 @@ impl<'w> StreamingOutput<'w> {
         &mut self,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
-        self.flush(sink)
+        self.flush(sink)?;
+        if !self.filters.is_empty() {
+            return Err(Error::InvalidData("RAR 5 filter range exceeds output").into());
+        }
+        Ok(())
     }
 }
 
@@ -3206,6 +3277,8 @@ fn write_filter_data(writer: &mut BitWriter, value: u32) {
     }
 }
 
+/// The whole-output filter pass the streaming hold must reproduce.
+#[cfg(test)]
 fn apply_filters(output: &mut [u8], filters: &[PendingFilter]) -> Result<()> {
     for filter in filters {
         let end = filter
@@ -3215,15 +3288,21 @@ fn apply_filters(output: &mut [u8], filters: &[PendingFilter]) -> Result<()> {
         let data = output
             .get_mut(filter.start..end)
             .ok_or(Error::InvalidData("RAR 5 filter range exceeds output"))?;
-        match filter.filter_type {
-            FilterType::Delta => {
-                let decoded = filters::delta_decode(data, filter.channels, rar50_delta_messages())?;
-                data.copy_from_slice(&decoded);
-            }
-            FilterType::E8 => e8e9_decode(data, filter.start as u32, false),
-            FilterType::E8E9 => e8e9_decode(data, filter.start as u32, true),
-            FilterType::Arm => arm_decode(data, filter.start as u32),
+        apply_filter(data, filter)?;
+    }
+    Ok(())
+}
+
+/// Applies `filter` to `data`, its block (`filter.start..` in the member).
+fn apply_filter(data: &mut [u8], filter: &PendingFilter) -> Result<()> {
+    match filter.filter_type {
+        FilterType::Delta => {
+            let decoded = filters::delta_decode(data, filter.channels, rar50_delta_messages())?;
+            data.copy_from_slice(&decoded);
         }
+        FilterType::E8 => e8e9_decode(data, filter.start as u32, false),
+        FilterType::E8E9 => e8e9_decode(data, filter.start as u32, true),
+        FilterType::Arm => arm_decode(data, filter.start as u32),
     }
     Ok(())
 }
@@ -4952,24 +5031,33 @@ mod tests {
     }
 
     #[test]
-    fn streaming_decode_reports_filtered_member_with_typed_sentinel() {
+    fn streaming_decode_applies_a_filter() {
         let data = b"\xe8\0\0\0\0plain text after call".to_vec();
         let input = encode_lz_member_with_filter(&data, crate::FilterKind::E8).unwrap();
         let mut reader = input.as_slice();
         let mut decoder = Unpack50Decoder::new();
+        let mut output = Vec::new();
 
-        let error = decoder
+        decoder
             .decode_member_from_reader_with_dictionary_to_sink(
                 &mut reader,
                 0,
                 data.len(),
                 128 * 1024,
                 false,
-                |_chunk| Ok::<_, std::convert::Infallible>(()),
+                |chunk| {
+                    match chunk {
+                        DecodedChunk::Bytes(bytes) => output.extend_from_slice(bytes),
+                        DecodedChunk::Repeated { byte, len } => {
+                            output.resize(output.len() + len, byte);
+                        }
+                    }
+                    Ok::<_, std::convert::Infallible>(())
+                },
             )
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(error, StreamDecodeError::FilteredMember));
+        assert_eq!(output, data);
     }
 
     #[test]
@@ -5914,5 +6002,306 @@ mod tests {
             writer.write_bits(0, 1); // length slot 0
         }
         writer.finish()
+    }
+
+    /// Runs `data` through a `StreamingOutput` as the decode loop would,
+    /// adding each filter once the output reaches its start. Returns what the
+    /// sink got and where each `Bytes` chunk ended.
+    fn run_stream(filters: &[PendingFilter], data: &[u8]) -> (Vec<u8>, Vec<usize>) {
+        let mut window = Window::new();
+        window.set_dictionary(1 << 20);
+        let mut sent = Vec::new();
+        let mut ends = Vec::new();
+        let mut sink = |c: DecodedChunk<'_>| -> std::result::Result<(), ()> {
+            match c {
+                DecodedChunk::Bytes(b) => {
+                    sent.extend_from_slice(b);
+                    ends.push(sent.len());
+                }
+                DecodedChunk::Repeated { byte, len } => sent.resize(sent.len() + len, byte),
+            }
+            Ok(())
+        };
+        let mut out = StreamingOutput::new(&mut window, Some(data.len()), 1 << 20);
+        let mut next = filters.iter().peekable();
+        for (i, &b) in data.iter().enumerate() {
+            while let Some(f) = next.next_if(|f| f.start <= i) {
+                out.add_filter(*f).unwrap();
+            }
+            out.push(b, &mut sink).unwrap();
+        }
+        out.finish(&mut sink).unwrap();
+        (sent, ends)
+    }
+
+    /// Bytes an E8 filter changes: an 0xE8 opcode every fifth byte.
+    fn e8_bytes(n: usize) -> Vec<u8> {
+        (0..n)
+            .map(|i| {
+                if i.is_multiple_of(5) {
+                    0xe8
+                } else {
+                    (i % 251) as u8
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stream_hold_applies_each_filter_in_place() {
+        let data = e8_bytes(300_000);
+        let filter = |start, length, filter_type, channels| PendingFilter {
+            start,
+            length,
+            filter_type,
+            channels,
+        };
+        let filters = [
+            filter(1000, 70_000, FilterType::Delta, 3),
+            filter(100_000, 150_000, FilterType::E8, 0),
+            filter(260_000, 40_000, FilterType::Delta, 2),
+        ];
+        let (sent, _) = run_stream(&filters, &data);
+        let mut expect = data.clone();
+        apply_filters(&mut expect, &filters).unwrap();
+        assert_ne!(expect, data, "the filters change the bytes");
+        assert_eq!(sent, expect);
+    }
+
+    /// Bytes before a filter are released at the flush threshold; the filtered
+    /// range is held until the filter is complete and then released filtered.
+    #[test]
+    fn stream_hold_holds_a_filtered_range_until_it_is_complete() {
+        let data = e8_bytes(200_000);
+        let f = PendingFilter {
+            start: 150_000,
+            length: 10_000,
+            filter_type: FilterType::E8,
+            channels: 0,
+        };
+        let (sent, ends) = run_stream(&[f], &data);
+        let mut expect = data.clone();
+        apply_filters(&mut expect, &[f]).unwrap();
+        assert_ne!(expect[150_000..160_000], data[150_000..160_000]);
+        assert_eq!(sent, expect);
+        assert!(
+            ends[0] <= 150_000,
+            "bytes before the filter are not held: {ends:?}"
+        );
+        assert!(
+            !ends.iter().any(|&e| e > 150_000 && e < 160_000),
+            "no chunk ends inside the filtered range: {ends:?}"
+        );
+    }
+
+    #[test]
+    fn stream_hold_refuses_an_overlong_filter() {
+        let mut window = Window::new();
+        window.set_dictionary(1 << 20);
+        let mut out = StreamingOutput::new(&mut window, None, 1 << 20);
+        let f = PendingFilter {
+            start: 0,
+            length: 0x40_0001,
+            filter_type: FilterType::E8,
+            channels: 0,
+        };
+        assert_eq!(
+            out.add_filter(f),
+            Err(Error::InvalidData(
+                "RAR 5 filter block is longer than 4 MiB"
+            ))
+        );
+    }
+
+    /// Back-to-back 0x3ffff filters (WinRAR's block size) straddle every
+    /// flush threshold, and the last one ends at the member end.
+    #[test]
+    fn stream_hold_applies_back_to_back_filters_up_to_the_member_end() {
+        let len = 0x3ffff;
+        let data = e8_bytes(3 * len);
+        let filters: Vec<_> = [FilterType::E8E9, FilterType::Arm, FilterType::E8]
+            .into_iter()
+            .enumerate()
+            .map(|(i, filter_type)| PendingFilter {
+                start: i * len,
+                length: len,
+                filter_type,
+                channels: 0,
+            })
+            .collect();
+        let (sent, _) = run_stream(&filters, &data);
+        let mut expect = data.clone();
+        apply_filters(&mut expect, &filters).unwrap();
+        assert_ne!(expect, data);
+        assert_eq!(sent, expect);
+    }
+
+    /// Declared `later`, then `earlier`, both before any output. Returns the
+    /// bytes sent, or the first error.
+    fn run_out_of_order(
+        data: &[u8],
+        later: PendingFilter,
+        earlier: PendingFilter,
+    ) -> std::result::Result<Vec<u8>, StreamDecodeError<()>> {
+        let mut window = Window::new();
+        window.set_dictionary(1 << 20);
+        let mut sent = Vec::new();
+        let mut sink = |c: DecodedChunk<'_>| -> std::result::Result<(), ()> {
+            if let DecodedChunk::Bytes(b) = c {
+                sent.extend_from_slice(b);
+            }
+            Ok(())
+        };
+        let mut out = StreamingOutput::new(&mut window, Some(data.len()), 1 << 20);
+        out.add_filter(later)?;
+        out.add_filter(earlier)?;
+        for &b in data {
+            out.push(b, &mut sink)?;
+        }
+        out.finish(&mut sink)?;
+        Ok(sent)
+    }
+
+    /// Out-of-order filters apply in declaration order, as the whole-output
+    /// pass does, while the hold stays within `MAX_HELD_OUTPUT`; beyond it
+    /// the stream is refused.
+    #[test]
+    fn stream_hold_bounds_out_of_order_filters() {
+        let filter = |start, length| PendingFilter {
+            start,
+            length,
+            filter_type: FilterType::E8,
+            channels: 0,
+        };
+        let data = e8_bytes(300_000);
+        let (later, earlier) = (filter(200_000, 50_000), filter(10_000, 20_000));
+        let mut expect = data.clone();
+        apply_filters(&mut expect, &[later, earlier]).unwrap();
+        assert_eq!(run_out_of_order(&data, later, earlier).unwrap(), expect);
+
+        let data = e8_bytes(MAX_HELD_OUTPUT + 200_000);
+        let later = filter(MAX_HELD_OUTPUT + 100_000, 1000);
+        assert!(matches!(
+            run_out_of_order(&data, later, earlier),
+            Err(StreamDecodeError::Decode(Error::InvalidData(
+                "RAR 5 filters hold too much output"
+            )))
+        ));
+    }
+
+    #[test]
+    fn stream_hold_refuses_too_many_filters_and_an_unfinished_one() {
+        let mut window = Window::new();
+        window.set_dictionary(1 << 20);
+        let mut out = StreamingOutput::new(&mut window, None, 1 << 20);
+        let f = PendingFilter {
+            start: 10,
+            length: 1,
+            filter_type: FilterType::E8,
+            channels: 0,
+        };
+        for _ in 0..MAX_PENDING_FILTERS {
+            out.add_filter(f).unwrap();
+        }
+        assert_eq!(
+            out.add_filter(f),
+            Err(Error::InvalidData("RAR 5 has too many pending filters"))
+        );
+        let mut sink = |_: DecodedChunk<'_>| -> std::result::Result<(), ()> { Ok(()) };
+        out.push(0, &mut sink).unwrap();
+        assert!(matches!(
+            out.finish(&mut sink),
+            Err(StreamDecodeError::Decode(Error::InvalidData(
+                "RAR 5 filter range exceeds output"
+            )))
+        ));
+    }
+
+    /// More than `MAX_PENDING_FILTERS` filters within one flush interval are
+    /// accepted once the earlier ones are complete, as in UnRAR.
+    #[test]
+    fn stream_hold_applies_complete_filters_to_make_room() {
+        let count = MAX_PENDING_FILTERS + 1000;
+        let data = e8_bytes(count * 6);
+        assert!(data.len() < STREAM_FLUSH_THRESHOLD);
+        let filters: Vec<_> = (0..count)
+            .map(|i| PendingFilter {
+                start: i * 6,
+                length: 5,
+                filter_type: FilterType::E8,
+                channels: 0,
+            })
+            .collect();
+        let (sent, _) = run_stream(&filters, &data);
+        let mut expect = data.clone();
+        apply_filters(&mut expect, &filters).unwrap();
+        assert_eq!(sent, expect);
+    }
+
+    /// A filter over bytes already sent is an error, not a panic.
+    #[test]
+    fn stream_hold_refuses_a_filter_over_sent_output() {
+        let mut window = Window::new();
+        window.set_dictionary(1 << 20);
+        let mut sink = |_: DecodedChunk<'_>| -> std::result::Result<(), ()> { Ok(()) };
+        let mut out = StreamingOutput::new(&mut window, None, 1 << 20);
+        for b in e8_bytes(STREAM_FLUSH_THRESHOLD + 10) {
+            out.push(b, &mut sink).unwrap();
+        }
+        out.add_filter(PendingFilter {
+            start: 0,
+            length: 10,
+            filter_type: FilterType::E8,
+            channels: 0,
+        })
+        .unwrap();
+        assert!(matches!(
+            out.finish(&mut sink),
+            Err(StreamDecodeError::Decode(Error::InvalidData(
+                "RAR 5 filter range exceeds output"
+            )))
+        ));
+    }
+
+    /// A zero run from an all-zero window goes through `pending`, not a
+    /// `Repeated` chunk, while a filter is queued.
+    #[test]
+    fn stream_hold_routes_a_zero_run_through_a_queued_filter() {
+        let tail = e8_bytes(100_000);
+        let mut data = vec![0; 100_001];
+        data.extend_from_slice(&tail);
+        let f = PendingFilter {
+            start: 1000,
+            length: 150_000,
+            filter_type: FilterType::Delta,
+            channels: 3,
+        };
+        let mut window = Window::new();
+        window.set_dictionary(1 << 20);
+        let mut sent = Vec::new();
+        let mut repeated = false;
+        let mut sink = |c: DecodedChunk<'_>| -> std::result::Result<(), ()> {
+            match c {
+                DecodedChunk::Bytes(b) => sent.extend_from_slice(b),
+                DecodedChunk::Repeated { byte, len } => {
+                    repeated = true;
+                    sent.resize(sent.len() + len, byte);
+                }
+            }
+            Ok(())
+        };
+        let mut out = StreamingOutput::new(&mut window, Some(data.len()), 1 << 20);
+        out.push(0, &mut sink).unwrap();
+        out.add_filter(f).unwrap();
+        out.copy_match(1, 100_000, &mut sink).unwrap();
+        for &b in &tail {
+            out.push(b, &mut sink).unwrap();
+        }
+        out.finish(&mut sink).unwrap();
+        let mut expect = data.clone();
+        apply_filters(&mut expect, &[f]).unwrap();
+        assert_ne!(expect, data);
+        assert!(!repeated);
+        assert_eq!(sent, expect);
     }
 }

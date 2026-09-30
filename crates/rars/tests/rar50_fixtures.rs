@@ -117,8 +117,15 @@ fn collect_extract_with_password(
     archive: &Archive,
     password: Option<&[u8]>,
 ) -> Result<Vec<CollectedEntry>, Error> {
+    collect_extract_with_options(archive, read_options(password))
+}
+
+fn collect_extract_with_options(
+    archive: &Archive,
+    options: ArchiveReadOptions<'_>,
+) -> Result<Vec<CollectedEntry>, Error> {
     let entries = RefCell::new(Vec::new());
-    archive.extract_to(read_options(password), |meta| {
+    archive.extract_to(options, |meta| {
         let data = Rc::new(RefCell::new(Vec::new()));
         entries.borrow_mut().push((meta.clone(), Rc::clone(&data)));
         Ok(Box::new(CollectWriter { data }))
@@ -6063,5 +6070,50 @@ fn volume_meta_carries_the_whole_member_checksum_and_size() {
                 "{set:?}"
             );
         }
+    }
+}
+
+/// x86-like bytes: frequent E8/E9 opcodes followed by 32-bit operands.
+fn x86ish(n: usize) -> Vec<u8> {
+    let mut x = 0x9e37_79b9u32;
+    let mut v = Vec::with_capacity(n);
+    while v.len() < n {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        v.push(if x.is_multiple_of(7) {
+            0xe8
+        } else if x.is_multiple_of(11) {
+            0xe9
+        } else {
+            (x >> 24) as u8
+        });
+    }
+    v
+}
+
+#[test]
+fn streaming_filters_match_the_input() {
+    use rars::rar50::{ArchiveEntry, Rar50Writer, WriterOptions};
+    let data = x86ish(3 * 1024 * 1024 + 12345);
+    for kind in [
+        FilterKind::E8,
+        FilterKind::E8E9,
+        FilterKind::Arm,
+        FilterKind::Delta { channels: 4 },
+    ] {
+        let opts = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::default())
+            .with_compression_level(1);
+        let bytes = Rar50Writer::new(opts)
+            .filter_policy(FilterPolicy::explicit(kind))
+            .entry(ArchiveEntry::new(
+                b"x".to_vec(),
+                rars::EntrySource::from_bytes(data.clone()),
+            ))
+            .finish()
+            .unwrap();
+        let archive = Archive::parse(&bytes).unwrap();
+        // Limit 0 forces the streaming path (the only path after Task 6).
+        let options = ArchiveReadOptions::new().with_rar50_buffered_decode_limit(0);
+        let got = collect_extract_with_options(&archive, options).unwrap();
+        assert_eq!(got[0].data, data, "{kind:?}");
     }
 }
