@@ -60,6 +60,7 @@ const MHEXTRA_LOCATOR_RECOVERY: u64 = 0x0002;
 
 const FHEXTRA_CRYPT: u64 = 0x01;
 const FHEXTRA_HASH: u64 = 0x02;
+const FHEXTRA_VERSION: u64 = 0x04;
 const FHEXTRA_HTIME: u64 = 0x03;
 const FHEXTRA_REDIR: u64 = 0x05;
 const FHEXTRA_UOWNER: u64 = 0x06;
@@ -200,6 +201,8 @@ pub struct FileHeader {
     pub htime_mtime: Option<u32>,
     pub times: FileTimes,
     pub owner: Option<UnixOwner>,
+    /// File version number from `FHEXTRA_VERSION` (`rar -ver`).
+    pub version: Option<u64>,
     pub data_crc32: Option<u32>,
     pub compression_info: u64,
     pub host_os: u64,
@@ -318,6 +321,8 @@ pub struct ExtractedEntryMeta {
     pub ctime: Option<crate::UnixTimestamp>,
     pub atime: Option<crate::UnixTimestamp>,
     pub owner: Option<UnixOwner>,
+    /// File version number from `FHEXTRA_VERSION` (`rar -ver`).
+    pub version: Option<u64>,
     /// CRC32 of the unpacked data, when recorded.
     pub crc32: Option<u32>,
     /// BLAKE2sp of the unpacked data, when recorded.
@@ -1232,6 +1237,7 @@ fn parse_file_header_bytes(parsed: &ParsedBlockHeader) -> Result<FileHeader> {
         htime_mtime: None,
         times: FileTimes::default(),
         owner: None,
+        version: None,
         data_crc32,
         compression_info,
         host_os,
@@ -1284,6 +1290,7 @@ fn parse_file_extra_area(
             FHEXTRA_UOWNER => {
                 file.owner = parse_unix_owner(input, data);
             }
+            FHEXTRA_VERSION => file.version = parse_file_version(input, data),
             FHEXTRA_SUBDATA => {
                 file.service_data = Some(input[data].to_vec());
             }
@@ -1291,6 +1298,14 @@ fn parse_file_extra_area(
         }
         Ok(())
     })
+}
+
+/// `FHEXTRA_VERSION`: flags (none defined), then the file's version number.
+/// A malformed record yields `None`, like the other optional records.
+fn parse_file_version(input: &[u8], range: Range<usize>) -> Option<u64> {
+    let (_flags, used) = read_vint_at(input, range.start, range.end).ok()?;
+    let (version, _) = read_vint_at(input, range.start.checked_add(used)?, range.end).ok()?;
+    Some(version)
 }
 
 /// Reads the modification time out of an `FHEXTRA_HTIME` record.
@@ -2211,6 +2226,15 @@ mod tests {
     use crate::UnixTimestamp;
 
     #[test]
+    fn parse_file_version_reads_flags_then_version() {
+        // flags 0, version 3
+        assert_eq!(parse_file_version(&[0x00, 0x03], 0..2), Some(3));
+        // a multi-byte version vint
+        assert_eq!(parse_file_version(&[0x00, 0x96, 0x01], 0..3), Some(150));
+        assert_eq!(parse_file_version(&[0x00], 0..1), None);
+    }
+
+    #[test]
     fn parse_unix_owner_reads_names_and_ids() {
         // flags 0x0f; "timb"; "staff"; uid 1000 (vint e8 07); gid 20.
         let rec = [
@@ -2301,6 +2325,7 @@ mod tests {
             htime_mtime: None,
             times: FileTimes::default(),
             owner: None,
+            version: None,
             data_crc32: None,
             compression_info: 0,
             host_os: 0,
