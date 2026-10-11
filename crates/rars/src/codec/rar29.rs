@@ -3174,10 +3174,15 @@ impl Unpack29 {
             ))
     }
 
+    // Drops the flushed bytes the window no longer needs. Only once half a
+    // window of them has piled up: every drain moves the 4 MiB kept, so
+    // draining per 1 MiB chunk moved four bytes per byte decoded. The Vec
+    // already holds 8 MiB of capacity once the window is full, which the
+    // extra 2 MiB fits in.
     fn trim_history(&mut self, flushed_pos: usize, current_pos: usize) {
         let keep_from = current_pos.saturating_sub(MAX_HISTORY);
         let keep_from = keep_from.min(flushed_pos);
-        if keep_from <= self.base_offset {
+        if keep_from < self.base_offset + MAX_HISTORY / 2 {
             return;
         }
         let drain = keep_from - self.base_offset;
@@ -4458,6 +4463,26 @@ exercise LZSS block table selection.</P></BODY></HTML>\n"
         decoder.copy_match(4, 9, 6).unwrap();
 
         assert_eq!(decoder.output, b"AB\0\0\0\0");
+    }
+
+    #[test]
+    fn history_is_trimmed_in_half_window_steps() {
+        const MAX: usize = super::MAX_HISTORY;
+        let mut decoder = Unpack29::new();
+        decoder.output.resize(MAX + MAX / 2 - 1, 7);
+        let end = decoder.current_pos();
+        decoder.trim_history(end, end);
+        assert_eq!((decoder.base_offset, decoder.output.len()), (0, end));
+
+        decoder.output.push(7);
+        let end = decoder.current_pos();
+        decoder.trim_history(end, end);
+        assert_eq!((decoder.base_offset, decoder.output.len()), (MAX / 2, MAX));
+
+        // Unflushed bytes are never dropped, however far behind they are.
+        decoder.output.resize(3 * MAX, 7);
+        decoder.trim_history(MAX / 2, decoder.current_pos());
+        assert_eq!(decoder.base_offset, MAX / 2);
     }
 
     #[test]
