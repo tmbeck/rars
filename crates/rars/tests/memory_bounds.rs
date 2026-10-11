@@ -374,7 +374,8 @@ fn rar15_member_reads_input_incrementally() {
 
 /// F8: the PPMd model used about 5.9x its declared size (152 MiB for the
 /// writer's 25 MiB model, measured at e0e4d30 by decoding straight from the
-/// codec). 8 MiB of input already fills the model.
+/// codec), then 2.6x; it is now one arena of exactly the declared size.
+/// 8 MiB of input already fills the model.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release only")]
 fn ppmd_model_stays_near_its_declared_size() {
@@ -406,9 +407,10 @@ fn ppmd_model_stays_near_its_declared_size() {
         vec![bytes]
     }));
     let (_, u) = measure(|| extract_all(&a, default_opts()).unwrap());
-    // 3.5x the model, plus the 4 MiB window, the 1 MiB output chunk and the
-    // bit buffer.
-    check("ppmd 25 MiB model", u, 25 * MIB * 7 / 2 + 8 * MIB);
+    // The model (1x, with a tenth to spare), plus what RAR 2.9 extraction
+    // holds without it: the 4 MiB window, the 1 MiB output chunk, the bit
+    // buffer and the window copies, about 10 MiB.
+    check("ppmd 25 MiB model", u, 25 * MIB * 11 / 10 + 12 * MIB);
 }
 
 /// F14: opening an archive read up to 8 MiB of it to look for an SFX stub.

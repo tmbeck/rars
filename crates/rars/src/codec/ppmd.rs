@@ -1,7 +1,6 @@
 use super::{Error, Result};
 
 const MAX_FREQ: u32 = 124;
-const MIN_MODEL_CONTEXTS: usize = 1;
 
 // PPMd-H suballocator parameters, per the format-level spec at
 // rar-research/doc/PPMD_ALGORITHM_SPECIFICATION.md §4.
@@ -430,11 +429,14 @@ pub struct PpmdDecoder {
     bin_summ: [[u16; 64]; 128],
     see: [[See; 16]; 25],
     dummy_see: See,
-    contexts: Vec<Context>,
-    text: Vec<u8>,
+    // The model's memory, laid out as Ppmd7's: the text area grows up from
+    // byte 0, and contexts and state arrays sit at the units the suballocator
+    // hands out (byte `unit * 12 + rem`). It is exactly the size the stream
+    // declares, and nothing else in the model grows with the input.
+    heap: Vec<u8>,
+    text_len: usize,
     range: RangeDecoder,
     allocated: bool,
-    max_contexts: usize,
     suballoc: Suballocator,
 }
 
@@ -445,73 +447,19 @@ pub struct PpmdEncoder {
     esc_char: u8,
 }
 
-#[derive(Debug, Clone)]
-struct Context {
-    states: States,
-    summ_freq: u16,
-    // Index of the suffix context, or NO_SUFFIX for the root.
-    suffix: u32,
-    // Simulated suballoc offsets so gluing (spec §4.3) can detect adjacency.
-    // header_offset: from Hi side (1 unit). array_offset: from Lo side,
-    // set to NULL_OFFSET for binary contexts (states.len() == 1) which
-    // carry their state inline.
-    header_offset: u32,
-    array_offset: u32,
-}
+// A context is one unit, as Ppmd7's CPpmd7_Context:
+//   0..2 num_stats, 2..4 summ_freq, 4..8 stats (unit of the state array),
+//   8..12 suffix (a context id, or NO_SUFFIX for the root).
+// A binary context keeps its single state at 2..8 in place of summ_freq and
+// stats; only multi-state contexts read summ_freq. A context's id is the unit
+// it lives at.
+const CTX_SUMM: usize = 2;
+const CTX_STATS: usize = 4;
+const CTX_SUFFIX: usize = 8;
+// A state is symbol, freq and a 4-byte successor: two to a unit.
+const STATE_BYTES: usize = 6;
 
 const NO_SUFFIX: u32 = u32::MAX;
-
-impl Context {
-    fn suffix(&self) -> Option<usize> {
-        (self.suffix != NO_SUFFIX).then_some(self.suffix as usize)
-    }
-}
-
-// A context's states. Most contexts are binary (one state), and those keep
-// it inline, so they allocate nothing.
-#[derive(Debug, Clone)]
-enum States {
-    One(State),
-    Many(Vec<State>),
-}
-
-impl States {
-    fn push(&mut self, state: State) {
-        match self {
-            States::One(first) => *self = States::Many(vec![*first, state]),
-            States::Many(states) => states.push(state),
-        }
-    }
-}
-
-impl From<Vec<State>> for States {
-    fn from(states: Vec<State>) -> Self {
-        match states.as_slice() {
-            [state] => States::One(*state),
-            _ => States::Many(states),
-        }
-    }
-}
-
-impl std::ops::Deref for States {
-    type Target = [State];
-
-    fn deref(&self) -> &[State] {
-        match self {
-            States::One(state) => std::slice::from_ref(state),
-            States::Many(states) => states,
-        }
-    }
-}
-
-impl std::ops::DerefMut for States {
-    fn deref_mut(&mut self) -> &mut [State] {
-        match self {
-            States::One(state) => std::slice::from_mut(state),
-            States::Many(states) => states,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy)]
 struct State {
@@ -520,13 +468,9 @@ struct State {
     successor: Successor,
 }
 
-const _: () = assert!(std::mem::size_of::<State>() == 8);
-const _: () = assert!(std::mem::size_of::<Context>() <= 40);
-
 // Where a state leads: nothing (0), a position in the text area (1 + pos),
-// or a context (CONTEXT_TAG | index). Text positions stay below 256 MiB (the
-// largest model) and context indices below the model's unit count, so both
-// fit in 31 bits.
+// or a context (CONTEXT_TAG | id). Text positions and context units stay
+// below 256 MiB (the largest model), so both fit in 31 bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Successor(u32);
 
@@ -626,11 +570,10 @@ impl PpmdDecoder {
                 shift: PERIOD_BITS,
                 count: 64,
             },
-            contexts: Vec::new(),
-            text: Vec::new(),
+            heap: Vec::new(),
+            text_len: 0,
             range: RangeDecoder::new(),
             allocated: false,
-            max_contexts: MIN_MODEL_CONTEXTS,
             suballoc: Suballocator::default(),
         }
     }
@@ -645,6 +588,148 @@ impl PpmdDecoder {
             n.div_ceil(2)
         }
     }
+
+    // Size the model's memory to `bytes`. The old model goes first, so a
+    // block that changes the size never holds both.
+    fn reset_pool(&mut self, bytes: usize) {
+        if self.heap.len() != bytes {
+            self.heap = Vec::new();
+            self.heap = vec![0; bytes];
+        }
+        self.suballoc.reset(bytes);
+    }
+
+    // ---- Model memory ---------------------------------------------------
+
+    fn pos(&self, unit: usize) -> usize {
+        unit * ALLOC_UNIT_BYTES + self.suballoc.rem as usize
+    }
+
+    fn u16_at(&self, p: usize) -> u16 {
+        u16::from_le_bytes([self.heap[p], self.heap[p + 1]])
+    }
+
+    fn set_u16(&mut self, p: usize, value: u16) {
+        self.heap[p..p + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn u32_at(&self, p: usize) -> u32 {
+        u32::from_le_bytes([
+            self.heap[p],
+            self.heap[p + 1],
+            self.heap[p + 2],
+            self.heap[p + 3],
+        ])
+    }
+
+    fn set_u32(&mut self, p: usize, value: u32) {
+        self.heap[p..p + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn num_stats(&self, c: usize) -> usize {
+        self.u16_at(self.pos(c)) as usize
+    }
+
+    fn set_num_stats(&mut self, c: usize, n: usize) {
+        let p = self.pos(c);
+        self.set_u16(p, n as u16);
+    }
+
+    fn summ_freq(&self, c: usize) -> u16 {
+        self.u16_at(self.pos(c) + CTX_SUMM)
+    }
+
+    fn set_summ_freq(&mut self, c: usize, value: u16) {
+        let p = self.pos(c) + CTX_SUMM;
+        self.set_u16(p, value);
+    }
+
+    fn stats(&self, c: usize) -> u32 {
+        self.u32_at(self.pos(c) + CTX_STATS)
+    }
+
+    fn set_stats(&mut self, c: usize, unit: u32) {
+        let p = self.pos(c) + CTX_STATS;
+        self.set_u32(p, unit);
+    }
+
+    fn suffix(&self, c: usize) -> Option<usize> {
+        let suffix = self.u32_at(self.pos(c) + CTX_SUFFIX);
+        (suffix != NO_SUFFIX).then_some(suffix as usize)
+    }
+
+    // Byte position of a context's first state.
+    fn states_base(&self, c: usize) -> usize {
+        if self.num_stats(c) == 1 {
+            self.pos(c) + CTX_SUMM
+        } else {
+            self.pos(self.stats(c) as usize)
+        }
+    }
+
+    fn read_state(&self, p: usize) -> State {
+        State {
+            symbol: self.heap[p],
+            freq: self.heap[p + 1],
+            successor: Successor(self.u32_at(p + 2)),
+        }
+    }
+
+    fn write_state(&mut self, p: usize, state: State) {
+        self.heap[p] = state.symbol;
+        self.heap[p + 1] = state.freq;
+        self.set_u32(p + 2, state.successor.0);
+    }
+
+    fn state_at(&self, c: usize, index: usize) -> State {
+        self.read_state(self.states_base(c) + index * STATE_BYTES)
+    }
+
+    fn swap_states(&mut self, c: usize, i: usize, j: usize) {
+        let base = self.states_base(c);
+        let a = self.read_state(base + i * STATE_BYTES);
+        let b = self.read_state(base + j * STATE_BYTES);
+        self.write_state(base + i * STATE_BYTES, b);
+        self.write_state(base + j * STATE_BYTES, a);
+    }
+
+    fn find_symbol(&self, c: usize, symbol: u8) -> Option<usize> {
+        let base = self.states_base(c);
+        (0..self.num_stats(c)).find(|i| self.heap[base + i * STATE_BYTES] == symbol)
+    }
+
+    // A context id the model handed out never fails this; it guards the
+    // `Result` paths against a reference that went stale.
+    fn state_pos(&self, state: StateRef) -> Result<usize> {
+        let invalid = Error::InvalidData("RAR PPMd state reference is invalid");
+        let fits = state
+            .context
+            .checked_mul(ALLOC_UNIT_BYTES)
+            .and_then(|p| p.checked_add(self.suballoc.rem as usize + ALLOC_UNIT_BYTES))
+            .is_some_and(|end| end <= self.heap.len());
+        if !fits || state.index >= self.num_stats(state.context) {
+            return Err(invalid);
+        }
+        Ok(self.states_base(state.context) + state.index * STATE_BYTES)
+    }
+
+    fn state(&self, state: StateRef) -> Result<State> {
+        Ok(self.read_state(self.state_pos(state)?))
+    }
+
+    fn set_freq(&mut self, state: StateRef, freq: u8) -> Result<()> {
+        let p = self.state_pos(state)?;
+        self.heap[p + 1] = freq;
+        Ok(())
+    }
+
+    fn set_successor(&mut self, state: StateRef, successor: Successor) -> Result<()> {
+        let p = self.state_pos(state)?;
+        self.set_u32(p + 2, successor.0);
+        Ok(())
+    }
+
+    // ---- Decoding -------------------------------------------------------
 
     pub fn decode_init(
         &mut self,
@@ -671,9 +756,7 @@ impl PpmdDecoder {
                 return Err(Error::InvalidData("RAR PPMd order is invalid"));
             }
             let dictionary_mb = max_mb.unwrap_or(0) as usize + 1;
-            self.max_contexts = model_context_limit(dictionary_mb);
-            self.suballoc
-                .reset(dictionary_mb.saturating_mul(1024 * 1024));
+            self.reset_pool(dictionary_mb * 1024 * 1024);
             self.init_model(max_order);
             self.allocated = true;
         } else if !self.allocated {
@@ -689,15 +772,18 @@ impl PpmdDecoder {
     fn decode_symbol_inner(&mut self, input: &mut impl PpmdByteReader) -> Result<Option<u8>> {
         let mut mask = [true; 256];
         let min = self.min_context;
-        if self.contexts[min].states.len() != 1 {
-            let summ_freq = self.contexts[min].summ_freq as u32;
+        if self.num_stats(min) != 1 {
+            let summ_freq = self.summ_freq(min) as u32;
             if summ_freq > self.range.range {
                 return Err(Error::InvalidData("RAR PPMd range is invalid"));
             }
             let mut count = self.range.get_threshold(summ_freq)?;
             let mut hi_cnt = 0u32;
             let mut found = None;
-            for (index, state) in self.contexts[min].states.iter().enumerate() {
+            let base = self.states_base(min);
+            let n = self.num_stats(min);
+            for index in 0..n {
+                let state = self.read_state(base + index * STATE_BYTES);
                 if count < state.freq as u32 {
                     found = Some((index, hi_cnt, state.freq as u32, state.symbol));
                     break;
@@ -726,11 +812,11 @@ impl PpmdDecoder {
             self.prev_success = 0;
             self.range.decode(hi_cnt, summ_freq - hi_cnt);
             self.hi_bits_flag = hi_bits_flag(self.state(self.found_state)?.symbol, 3);
-            for state in self.contexts[min].states.iter() {
-                mask[state.symbol as usize] = false;
+            for index in 0..n {
+                mask[self.heap[base + index * STATE_BYTES] as usize] = false;
             }
         } else {
-            let state = self.contexts[min].states[0];
+            let state = self.state_at(min, 0);
             let idx = self.bin_summ_index(state)?;
             let prob = self.bin_summ[idx.0][idx.1] as u32;
             let size0 = (self.range.range >> 14).wrapping_mul(prob);
@@ -756,22 +842,23 @@ impl PpmdDecoder {
         loop {
             self.range.normalize(input)?;
             let mut mc = self.min_context;
-            let num_masked = self.contexts[mc].states.len();
+            let num_masked = self.num_stats(mc);
             loop {
                 self.order_fall += 1;
-                let Some(suffix) = self.contexts[mc].suffix() else {
+                let Some(suffix) = self.suffix(mc) else {
                     return Ok(None);
                 };
                 mc = suffix;
-                if self.contexts[mc].states.len() != num_masked {
+                if self.num_stats(mc) != num_masked {
                     break;
                 }
             }
             self.min_context = mc;
 
-            let hi_cnt = self.contexts[mc]
-                .states
-                .iter()
+            let base = self.states_base(mc);
+            let n = self.num_stats(mc);
+            let hi_cnt = (0..n)
+                .map(|i| self.read_state(base + i * STATE_BYTES))
                 .filter(|state| mask[state.symbol as usize])
                 .map(|state| state.freq as u32)
                 .sum::<u32>();
@@ -783,7 +870,8 @@ impl PpmdDecoder {
             let mut count = self.range.get_threshold(freq_sum)?;
             if count < hi_cnt {
                 let mut start = 0u32;
-                for (index, state) in self.contexts[mc].states.iter().enumerate() {
+                for index in 0..n {
+                    let state = self.read_state(base + index * STATE_BYTES);
                     if !mask[state.symbol as usize] {
                         continue;
                     }
@@ -807,8 +895,8 @@ impl PpmdDecoder {
             }
             self.range.decode(hi_cnt, freq_sum - hi_cnt);
             self.add_see_summ(see_ref, freq_sum);
-            for state in self.contexts[mc].states.iter() {
-                mask[state.symbol as usize] = false;
+            for index in 0..n {
+                mask[self.heap[base + index * STATE_BYTES] as usize] = false;
             }
         }
     }
@@ -816,11 +904,14 @@ impl PpmdDecoder {
     fn encode_symbol(&mut self, symbol: u8, output: &mut RangeEncoder) -> Result<()> {
         let mut mask = [true; 256];
         let min = self.min_context;
-        if self.contexts[min].states.len() != 1 {
-            let summ_freq = self.contexts[min].summ_freq as u32;
+        if self.num_stats(min) != 1 {
+            let summ_freq = self.summ_freq(min) as u32;
             let mut start = 0u32;
             let mut found = None;
-            for (index, state) in self.contexts[min].states.iter().enumerate() {
+            let base = self.states_base(min);
+            let n = self.num_stats(min);
+            for index in 0..n {
+                let state = self.read_state(base + index * STATE_BYTES);
                 if state.symbol == symbol {
                     found = Some((index, start, state.freq as u32));
                     break;
@@ -848,11 +939,11 @@ impl PpmdDecoder {
             self.prev_success = 0;
             output.encode(start, summ_freq - start, summ_freq);
             self.hi_bits_flag = hi_bits_flag(self.state(self.found_state)?.symbol, 3);
-            for state in self.contexts[min].states.iter() {
-                mask[state.symbol as usize] = false;
+            for index in 0..n {
+                mask[self.heap[base + index * STATE_BYTES] as usize] = false;
             }
         } else {
-            let state = self.contexts[min].states[0];
+            let state = self.state_at(min, 0);
             let idx = self.bin_summ_index(state)?;
             let prob = self.bin_summ[idx.0][idx.1] as u32;
             let size0 = (output.range >> 14).wrapping_mul(prob);
@@ -878,22 +969,23 @@ impl PpmdDecoder {
         loop {
             output.normalize();
             let mut mc = self.min_context;
-            let num_masked = self.contexts[mc].states.len();
+            let num_masked = self.num_stats(mc);
             loop {
                 self.order_fall += 1;
-                let Some(suffix) = self.contexts[mc].suffix() else {
+                let Some(suffix) = self.suffix(mc) else {
                     return Err(Error::InvalidData("RAR PPMd symbol is not encodable"));
                 };
                 mc = suffix;
-                if self.contexts[mc].states.len() != num_masked {
+                if self.num_stats(mc) != num_masked {
                     break;
                 }
             }
             self.min_context = mc;
 
-            let hi_cnt = self.contexts[mc]
-                .states
-                .iter()
+            let base = self.states_base(mc);
+            let n = self.num_stats(mc);
+            let hi_cnt = (0..n)
+                .map(|i| self.read_state(base + i * STATE_BYTES))
                 .filter(|state| mask[state.symbol as usize])
                 .map(|state| state.freq as u32)
                 .sum::<u32>();
@@ -901,7 +993,8 @@ impl PpmdDecoder {
             let freq_sum = hi_cnt + esc_freq;
             let mut start = 0u32;
             let mut found = None;
-            for (index, state) in self.contexts[mc].states.iter().enumerate() {
+            for index in 0..n {
+                let state = self.read_state(base + index * STATE_BYTES);
                 if !mask[state.symbol as usize] {
                     continue;
                 }
@@ -922,60 +1015,55 @@ impl PpmdDecoder {
             }
             output.encode(hi_cnt, freq_sum - hi_cnt, freq_sum);
             self.add_see_summ(see_ref, freq_sum);
-            for state in self.contexts[mc].states.iter() {
-                mask[state.symbol as usize] = false;
+            for index in 0..n {
+                mask[self.heap[base + index * STATE_BYTES] as usize] = false;
             }
         }
     }
 
+    // Expects the pool sized by `reset_pool`.
     fn init_model(&mut self, max_order: usize) {
-        self.contexts.clear();
-        self.text.clear();
+        self.text_len = 0;
         // Spec §5.2 RestartModel: clear free lists, reserve root context
         // (1 unit from Hi) + its 256-state array (128 units from Lo).
         // Reuse the exact original byte size (C's p->Size) so the text/units
         // split and the pool-top remainder survive the restart unchanged.
-        let unbounded_before = self.suballoc.unbounded;
-        let reset_arg = if unbounded_before {
-            0
-        } else {
-            self.suballoc.size_bytes
-        };
-        self.suballoc.reset(reset_arg);
-        // At init time text is empty.
-        let header_offset = self
+        self.suballoc.reset(self.suballoc.size_bytes);
+        // A fresh pool of at least 1 MiB always holds these.
+        let root = self
             .suballoc
             .alloc(1, AllocSide::Hi, 0)
-            .unwrap_or(NULL_OFFSET);
-        let array_offset = self
+            .expect("a fresh PPMd pool holds the root context") as usize;
+        let array = self
             .suballoc
             .alloc(128, AllocSide::Lo, 0)
-            .unwrap_or(NULL_OFFSET);
+            .expect("a fresh PPMd pool holds the root state array");
         self.max_order = max_order;
         self.order_fall = max_order;
         self.init_rl = -(max_order.min(12) as i32) - 1;
         self.run_length = self.init_rl;
         self.prev_success = 0;
 
-        let states = (0..=255)
-            .map(|symbol| State {
-                symbol,
-                freq: 1,
-                successor: Successor::none(),
-            })
-            .collect::<Vec<_>>()
-            .into();
-        self.contexts.push(Context {
-            states,
-            summ_freq: 257,
-            suffix: NO_SUFFIX,
-            header_offset,
-            array_offset,
-        });
-        self.min_context = 0;
-        self.max_context = 0;
+        self.set_num_stats(root, 256);
+        self.set_summ_freq(root, 257);
+        self.set_stats(root, array);
+        let p = self.pos(root) + CTX_SUFFIX;
+        self.set_u32(p, NO_SUFFIX);
+        let base = self.pos(array as usize);
+        for symbol in 0..=255u8 {
+            self.write_state(
+                base + symbol as usize * STATE_BYTES,
+                State {
+                    symbol,
+                    freq: 1,
+                    successor: Successor::none(),
+                },
+            );
+        }
+        self.min_context = root;
+        self.max_context = root;
         self.found_state = StateRef {
-            context: 0,
+            context: root,
             index: 0,
         };
 
@@ -1005,10 +1093,10 @@ impl PpmdDecoder {
     }
 
     fn bin_summ_index(&mut self, state: State) -> Result<(usize, usize)> {
-        let suffix = self.contexts[self.min_context]
-            .suffix()
+        let suffix = self
+            .suffix(self.min_context)
             .ok_or(Error::InvalidData("RAR PPMd binary context has no suffix"))?;
-        let suffix_stats = self.contexts[suffix].states.len();
+        let suffix_stats = self.num_stats(suffix);
         self.hi_bits_flag = hi_bits_flag(self.state(self.found_state)?.symbol, 3);
         let row = state.freq as usize - 1;
         let col = self.prev_success as usize
@@ -1021,7 +1109,7 @@ impl PpmdDecoder {
 
     fn make_esc_freq(&mut self, num_masked: usize) -> Result<(SeeRef, u32)> {
         let mc = self.min_context;
-        let num_stats = self.contexts[mc].states.len();
+        let num_stats = self.num_stats(mc);
         if num_stats == 256 {
             return Ok((SeeRef::Dummy, 1));
         }
@@ -1031,15 +1119,15 @@ impl PpmdDecoder {
         let non_masked = num_stats
             .checked_sub(num_masked)
             .ok_or(Error::InvalidData("RAR PPMd masked-state count is invalid"))?;
-        let suffix = self.contexts[mc].suffix().unwrap_or(mc);
-        let suffix_stats = self.contexts[suffix].states.len();
+        let suffix = self.suffix(mc).unwrap_or(mc);
+        let suffix_stats = self.num_stats(suffix);
         // Spec §9.1: the subtraction is unsigned C wraparound — when
         // `suffix.num_stats < min_context.num_stats`, the underflow yields a
         // very large value and the `non_masked < suffix_delta` comparison
         // evaluates to TRUE. Replicate the wraparound here.
         let suffix_delta = suffix_stats.wrapping_sub(num_stats);
         let col = (non_masked < suffix_delta) as usize
-            + 2 * ((self.contexts[mc].summ_freq as usize) < 11 * num_stats) as usize
+            + 2 * ((self.summ_freq(mc) as usize) < 11 * num_stats) as usize
             + 4 * (num_masked > non_masked) as usize
             + self.hi_bits_flag as usize;
         let row = self.ns2indx[non_masked - 1] as usize;
@@ -1076,11 +1164,11 @@ impl PpmdDecoder {
     fn update1_0(&mut self) -> Result<()> {
         let fs = self.found_state;
         let freq = self.state(fs)?.freq as u32;
-        let summ_freq = self.contexts[fs.context].summ_freq as u32;
+        let summ_freq = self.summ_freq(fs.context) as u32;
         self.prev_success = u32::from(2 * freq > summ_freq);
         self.run_length += self.prev_success as i32;
-        self.contexts[fs.context].summ_freq = self.contexts[fs.context].summ_freq.wrapping_add(4);
-        self.state_mut(fs)?.freq = (freq + 4) as u8;
+        self.set_summ_freq(fs.context, (summ_freq as u16).wrapping_add(4));
+        self.set_freq(fs, (freq + 4) as u8)?;
         if freq + 4 > MAX_FREQ {
             self.rescale();
         }
@@ -1090,15 +1178,14 @@ impl PpmdDecoder {
     fn update1(&mut self) -> Result<()> {
         let fs = self.found_state;
         let freq = self.state(fs)?.freq as u32 + 4;
-        self.contexts[fs.context].summ_freq = self.contexts[fs.context].summ_freq.wrapping_add(4);
-        self.state_mut(fs)?.freq = freq as u8;
+        let summ_freq = self.summ_freq(fs.context);
+        self.set_summ_freq(fs.context, summ_freq.wrapping_add(4));
+        self.set_freq(fs, freq as u8)?;
         if fs.index > 0
-            && self.contexts[fs.context].states[fs.index].freq
-                > self.contexts[fs.context].states[fs.index - 1].freq
+            && self.state_at(fs.context, fs.index).freq
+                > self.state_at(fs.context, fs.index - 1).freq
         {
-            self.contexts[fs.context]
-                .states
-                .swap(fs.index, fs.index - 1);
+            self.swap_states(fs.context, fs.index, fs.index - 1);
             self.found_state.index -= 1;
             if freq > MAX_FREQ {
                 self.rescale();
@@ -1111,8 +1198,9 @@ impl PpmdDecoder {
         let fs = self.found_state;
         let freq = self.state(fs)?.freq as u32 + 4;
         self.run_length = self.init_rl;
-        self.contexts[fs.context].summ_freq = self.contexts[fs.context].summ_freq.wrapping_add(4);
-        self.state_mut(fs)?.freq = freq as u8;
+        let summ_freq = self.summ_freq(fs.context);
+        self.set_summ_freq(fs.context, summ_freq.wrapping_add(4));
+        self.set_freq(fs, freq as u8)?;
         if freq > MAX_FREQ {
             self.rescale();
         }
@@ -1122,7 +1210,7 @@ impl PpmdDecoder {
     fn update_bin(&mut self) -> Result<()> {
         let fs = self.found_state;
         let freq = self.state(fs)?.freq;
-        self.state_mut(fs)?.freq = freq.wrapping_add(u8::from(freq < 128));
+        self.set_freq(fs, freq.wrapping_add(u8::from(freq < 128)))?;
         self.prev_success = 1;
         self.run_length += 1;
         self.next_context()
@@ -1143,29 +1231,24 @@ impl PpmdDecoder {
     fn update_model(&mut self) -> Result<()> {
         let fs = self.state(self.found_state)?;
         let found_symbol = fs.symbol;
-        if fs.freq < (MAX_FREQ / 4) as u8 && self.contexts[self.min_context].suffix().is_some() {
-            let suffix = self.contexts[self.min_context].suffix().unwrap();
-            if self.contexts[suffix].states.len() == 1 {
-                let freq = self.contexts[suffix].states[0].freq;
-                if freq < 32 {
-                    self.contexts[suffix].states[0].freq += 1;
-                }
-            } else if let Some(mut index) = self.contexts[suffix]
-                .states
-                .iter()
-                .position(|state| state.symbol == found_symbol)
-            {
-                if index > 0
-                    && self.contexts[suffix].states[index].freq
-                        >= self.contexts[suffix].states[index - 1].freq
-                {
-                    self.contexts[suffix].states.swap(index, index - 1);
-                    index -= 1;
-                }
-                if self.contexts[suffix].states[index].freq < (MAX_FREQ - 9) as u8 {
-                    self.contexts[suffix].states[index].freq += 2;
-                    self.contexts[suffix].summ_freq =
-                        self.contexts[suffix].summ_freq.wrapping_add(2);
+        if fs.freq < (MAX_FREQ / 4) as u8 {
+            if let Some(suffix) = self.suffix(self.min_context) {
+                let base = self.states_base(suffix);
+                if self.num_stats(suffix) == 1 {
+                    if self.heap[base + 1] < 32 {
+                        self.heap[base + 1] += 1;
+                    }
+                } else if let Some(mut index) = self.find_symbol(suffix, found_symbol) {
+                    let freq_at = |s: &Self, i: usize| s.heap[base + i * STATE_BYTES + 1];
+                    if index > 0 && freq_at(self, index) >= freq_at(self, index - 1) {
+                        self.swap_states(suffix, index, index - 1);
+                        index -= 1;
+                    }
+                    if freq_at(self, index) < (MAX_FREQ - 9) as u8 {
+                        self.heap[base + index * STATE_BYTES + 1] += 2;
+                        let summ_freq = self.summ_freq(suffix);
+                        self.set_summ_freq(suffix, summ_freq.wrapping_add(2));
+                    }
                 }
             }
         }
@@ -1177,7 +1260,7 @@ impl PpmdDecoder {
             };
             self.max_context = context;
             self.min_context = context;
-            self.state_mut(self.found_state)?.successor = Successor::context(context);
+            self.set_successor(self.found_state, Successor::context(context))?;
             return Ok(());
         }
 
@@ -1185,10 +1268,12 @@ impl PpmdDecoder {
         // `text >= UnitsStart`. The previous "check then push" version
         // restarted one symbol later than the reference, advancing the range
         // coder by one extra symbol before resetting — which left the
-        // post-restart state out of sync.
-        self.text.push(found_symbol);
-        let max_successor = Successor::raw(self.text.len());
-        if !self.suballoc.text_has_room(self.text.len()) {
+        // post-restart state out of sync. The text never reaches the units:
+        // it stops one byte short of UnitsStart, and the model restarts.
+        self.heap[self.text_len] = found_symbol;
+        self.text_len += 1;
+        let max_successor = Successor::raw(self.text_len);
+        if !self.suballoc.text_has_room(self.text_len) {
             self.init_model(self.max_order);
             return Ok(());
         }
@@ -1203,10 +1288,10 @@ impl PpmdDecoder {
             }
             self.order_fall -= 1;
             if self.order_fall == 0 && self.max_context != self.min_context {
-                self.text.pop();
+                self.text_len -= 1;
             }
         } else {
-            self.state_mut(self.found_state)?.successor = max_successor;
+            self.set_successor(self.found_state, max_successor)?;
             min_successor = Successor::context(self.min_context);
         }
 
@@ -1218,27 +1303,28 @@ impl PpmdDecoder {
             return Ok(());
         }
 
-        let ns = self.contexts[mc].states.len() as u32;
-        let s0 = self.contexts[mc]
-            .summ_freq
+        let ns = self.num_stats(mc) as u32;
+        let s0 = self
+            .summ_freq(mc)
             .checked_sub(ns as u16)
             .map(u32::from)
             .and_then(|value| value.checked_sub(fs.freq as u32 - 1))
             .ok_or(Error::InvalidData("RAR PPMd model frequency is invalid"))?;
         while c != mc {
-            let ns1 = self.contexts[c].states.len() as u32;
+            let ns1 = self.num_stats(c) as u32;
             let mut sum;
             if ns1 != 1 {
-                sum = self.contexts[c].summ_freq as u32;
+                sum = self.summ_freq(c) as u32;
                 sum += u32::from(2 * ns1 < ns) + 2 * u32::from(4 * ns1 <= ns && sum <= 8 * ns1);
             } else {
-                let old = self.contexts[c].states[0];
-                let freq = if old.freq < (MAX_FREQ / 4 - 1) as u8 {
-                    old.freq * 2
+                let p = self.states_base(c) + 1;
+                let old = self.heap[p];
+                let freq = if old < (MAX_FREQ / 4 - 1) as u8 {
+                    old * 2
                 } else {
                     (MAX_FREQ - 4) as u8
                 };
-                self.contexts[c].states[0].freq = freq;
+                self.heap[p] = freq;
                 sum = freq as u32 + self.init_esc + u32::from(ns > 3);
             }
 
@@ -1262,12 +1348,7 @@ impl PpmdDecoder {
                     + u32::from(cf >= 15 * sf);
                 sum += cf;
             }
-            let old_n = self.contexts[c].states.len();
-            if !self.grow_state_array(c, old_n + 1) {
-                self.init_model(self.max_order);
-                return Ok(());
-            }
-            self.contexts[c].states.push(State {
+            let state = State {
                 symbol: found_symbol,
                 freq: cf as u8,
                 successor: if self.order_fall == 0 {
@@ -1275,10 +1356,15 @@ impl PpmdDecoder {
                 } else {
                     max_successor
                 },
-            });
-            self.contexts[c].summ_freq = u16::try_from(sum)
+            };
+            if !self.add_state(c, state) {
+                self.init_model(self.max_order);
+                return Ok(());
+            }
+            let sum = u16::try_from(sum)
                 .map_err(|_| Error::InvalidData("RAR PPMd model frequency overflows"))?;
-            c = self.contexts[c].suffix().unwrap_or(mc);
+            self.set_summ_freq(c, sum);
+            c = self.suffix(c).unwrap_or(mc);
         }
         Ok(())
     }
@@ -1293,14 +1379,11 @@ impl PpmdDecoder {
         if self.order_fall != 0 {
             ps.push(self.found_state);
         }
-        while let Some(suffix) = self.contexts[c].suffix() {
+        while let Some(suffix) = self.suffix(c) {
             c = suffix;
             let found_symbol = self.state(self.found_state).ok()?.symbol;
-            let index = self.contexts[c]
-                .states
-                .iter()
-                .position(|state| state.symbol == found_symbol)?;
-            let successor = self.contexts[c].states[index].successor;
+            let index = self.find_symbol(c, found_symbol)?;
+            let successor = self.state_at(c, index).successor;
             if successor.as_raw() != Some(up_branch) {
                 if let Some(context) = successor.as_context() {
                     c = context;
@@ -1317,17 +1400,17 @@ impl PpmdDecoder {
             return Some(c);
         }
 
-        let new_sym = *self.text.get(up_branch)?;
+        if up_branch >= self.text_len {
+            return None;
+        }
+        let new_sym = self.heap[up_branch];
         let up_successor = Successor::raw(up_branch + 1);
-        let new_freq = if self.contexts[c].states.len() == 1 {
-            self.contexts[c].states[0].freq
+        let new_freq = if self.num_stats(c) == 1 {
+            self.state_at(c, 0).freq
         } else {
-            let state = self.contexts[c]
-                .states
-                .iter()
-                .find(|state| state.symbol == new_sym)?;
+            let state = self.state_at(c, self.find_symbol(c, new_sym)?);
             let cf = state.freq as u32 - 1;
-            let s0 = self.contexts[c].summ_freq as u32 - self.contexts[c].states.len() as u32 - cf;
+            let s0 = self.summ_freq(c) as u32 - self.num_stats(c) as u32 - cf;
             (1 + if 2 * cf <= s0 {
                 u32::from(5 * cf > s0)
             } else {
@@ -1336,80 +1419,57 @@ impl PpmdDecoder {
         };
 
         while let Some(state_ref) = ps.pop() {
-            let context = self.push_context(Context {
-                states: States::One(State {
+            let context = self.new_binary_context(
+                State {
                     symbol: new_sym,
                     freq: new_freq,
                     successor: up_successor,
-                }),
-                summ_freq: 0,
-                suffix: c as u32,
-                header_offset: NULL_OFFSET,
-                array_offset: NULL_OFFSET,
-            })?;
-            self.state_mut(state_ref).ok()?.successor = Successor::context(context);
+                },
+                c,
+            )?;
+            self.set_successor(state_ref, Successor::context(context))
+                .ok()?;
             c = context;
         }
         Some(c)
     }
 
-    fn push_context(&mut self, mut context: Context) -> Option<usize> {
-        if self.contexts.len() >= self.max_contexts {
-            return None;
-        }
-        // 1 unit for the context header (Hi side); binary contexts (1 state)
-        // carry their state inline, multi-state contexts also need a state
-        // array (Lo side).
-        let text_len = self.text.len();
-        let header_offset = self.suballoc.alloc(1, AllocSide::Hi, text_len)?;
-        let array_units = Self::state_array_units(context.states.len());
-        let array_offset = if array_units > 0 {
-            match self.suballoc.alloc(array_units, AllocSide::Lo, text_len) {
-                Some(off) => off,
-                None => {
-                    self.suballoc.free(header_offset, 1);
-                    return None;
-                }
-            }
-        } else {
-            NULL_OFFSET
-        };
-        context.header_offset = header_offset;
-        context.array_offset = array_offset;
-        let index = self.contexts.len();
-        self.contexts.push(context);
-        Some(index)
+    // A one-state context: one unit from the Hi side, its state inline.
+    fn new_binary_context(&mut self, state: State, suffix: usize) -> Option<usize> {
+        let context = self.suballoc.alloc(1, AllocSide::Hi, self.text_len)? as usize;
+        let p = self.pos(context);
+        self.set_u16(p, 1);
+        self.write_state(p + CTX_SUMM, state);
+        self.set_u32(p + CTX_SUFFIX, suffix as u32);
+        Some(context)
     }
 
-    // Grow a context's state array from its current size → `new_n` states.
-    // Models ExpandUnits: if the same bucket still fits, no realloc happens;
-    // otherwise allocate the new size first, then release the old slot. The
-    // context's array_offset is updated to point at the new block when
-    // moved.
-    fn grow_state_array(&mut self, ctx_idx: usize, new_n: usize) -> bool {
-        let old_n = self.contexts[ctx_idx].states.len();
-        let old_units = Self::state_array_units(old_n);
-        let new_units = Self::state_array_units(new_n);
-        if new_units == 0 || new_units <= old_units {
-            return true;
-        }
-        if old_units > 0 {
-            let old_b = Suballocator::bucket_for(old_units);
-            let new_b = Suballocator::bucket_for(new_units);
-            if old_b == new_b {
-                return true;
+    // Append a state, growing the array as ExpandUnits does: if the same
+    // bucket still fits, it stays put; otherwise allocate the new size first,
+    // copy, then release the old block. A binary context moves its inline
+    // state into a fresh one-unit array. False when the pool is exhausted.
+    fn add_state(&mut self, c: usize, state: State) -> bool {
+        let n = self.num_stats(c);
+        let old_units = Self::state_array_units(n);
+        let new_units = Self::state_array_units(n + 1);
+        if old_units == 0
+            || Suballocator::bucket_for(old_units) != Suballocator::bucket_for(new_units)
+        {
+            let Some(new) = self.suballoc.alloc(new_units, AllocSide::Lo, self.text_len) else {
+                return false;
+            };
+            let from = self.states_base(c);
+            let to = self.pos(new as usize);
+            self.heap.copy_within(from..from + n * STATE_BYTES, to);
+            if old_units > 0 {
+                let old = self.stats(c);
+                self.suballoc.free(old, old_units);
             }
+            self.set_stats(c, new);
         }
-        let text_len = self.text.len();
-        let new_offset = match self.suballoc.alloc(new_units, AllocSide::Lo, text_len) {
-            Some(off) => off,
-            None => return false,
-        };
-        if old_units > 0 {
-            let old_offset = self.contexts[ctx_idx].array_offset;
-            self.suballoc.free(old_offset, old_units);
-        }
-        self.contexts[ctx_idx].array_offset = new_offset;
+        let p = self.pos(self.stats(c) as usize) + n * STATE_BYTES;
+        self.write_state(p, state);
+        self.set_num_stats(c, n + 1);
         true
     }
 
@@ -1424,17 +1484,17 @@ impl PpmdDecoder {
     // Collapse-to-unary (new_n == 1, new_units == 0) is handled by Rescale's
     // earlier branch (Ppmd7.c:881-898), which frees `stats` at bucket
     // U2I(n0) and copies the surviving state into the inline OneState slot.
-    fn shrink_state_array(&mut self, ctx_idx: usize, old_n: usize, new_n: usize) {
+    //
+    // Only the block moves; the caller writes the states into it.
+    fn shrink_state_array(&mut self, ctx: usize, old_n: usize, new_n: usize) {
         let old_units = Self::state_array_units(old_n);
         let new_units = Self::state_array_units(new_n);
         if old_units == 0 || new_units >= old_units {
             return;
         }
+        let old_offset = self.stats(ctx);
         if new_units == 0 {
-            // Collapse to unary: free the whole array, clear the pointer.
-            let old_offset = self.contexts[ctx_idx].array_offset;
             self.suballoc.free(old_offset, old_units);
-            self.contexts[ctx_idx].array_offset = NULL_OFFSET;
             return;
         }
         let Some(i0) = Suballocator::bucket_for(old_units) else {
@@ -1446,27 +1506,27 @@ impl PpmdDecoder {
         if i0 == i1 {
             return;
         }
-        let old_offset = self.contexts[ctx_idx].array_offset;
         if let Some(swap_offset) = self.suballoc.free_lists[i1].pop() {
             // Swap path: take a same-sized block from the target bucket,
-            // return the oversized block to its bucket. Data lives in
-            // self.contexts[ctx_idx].states (Vec), so no MEM_12_CPY needed.
+            // return the oversized block to its bucket.
             self.suballoc.free(old_offset, old_units);
-            self.contexts[ctx_idx].array_offset = swap_offset;
+            self.set_stats(ctx, swap_offset);
         } else {
             // SplitBlock in place: keep the first I2U(i1) units at the same
             // address, bucket the residue. Matches Ppmd7_SplitBlock.
             let i0_units = Suballocator::bucket_units(i0) as u32;
             let i1_units = Suballocator::bucket_units(i1) as u32;
             self.suballoc.split_in_place(old_offset, i0_units, i1_units);
-            // array_offset is unchanged.
         }
     }
 
     fn rescale(&mut self) {
         let ctx = self.min_context;
-        let original_state_count = self.contexts[ctx].states.len();
-        let mut states = self.contexts[ctx].states.to_vec();
+        let original_state_count = self.num_stats(ctx);
+        let base = self.states_base(ctx);
+        let mut states = (0..original_state_count)
+            .map(|i| self.read_state(base + i * STATE_BYTES))
+            .collect::<Vec<_>>();
         let found = self.found_state.index;
         if found != 0 {
             let state = states.remove(found);
@@ -1474,7 +1534,7 @@ impl PpmdDecoder {
             self.found_state.index = 0;
         }
         let mut sum_freq = states[0].freq as u32;
-        let mut esc_freq = self.contexts[ctx].summ_freq as u32 - sum_freq;
+        let mut esc_freq = self.summ_freq(ctx) as u32 - sum_freq;
         let adder = u32::from(self.order_fall != 0);
         sum_freq = (sum_freq + 4 + adder) >> 1;
         states[0].freq = sum_freq as u8;
@@ -1494,6 +1554,7 @@ impl PpmdDecoder {
             states.pop();
             esc_freq += 1;
         }
+        self.found_state.index = 0;
         if states.len() == 1 {
             let mut freq = states[0].freq as u32;
             while esc_freq > 1 {
@@ -1502,29 +1563,18 @@ impl PpmdDecoder {
             }
             states[0].freq = freq as u8;
             self.shrink_state_array(ctx, original_state_count, 1);
-            self.contexts[ctx].states = states.into();
-            self.found_state.index = 0;
+            self.set_num_stats(ctx, 1);
+            let p = self.pos(ctx) + CTX_SUMM;
+            self.write_state(p, states[0]);
             return;
         }
-        self.contexts[ctx].summ_freq = (sum_freq + esc_freq - (esc_freq >> 1)) as u16;
+        self.set_summ_freq(ctx, (sum_freq + esc_freq - (esc_freq >> 1)) as u16);
         self.shrink_state_array(ctx, original_state_count, states.len());
-        self.contexts[ctx].states = states.into();
-        self.found_state.index = 0;
-    }
-
-    fn state(&self, state: StateRef) -> Result<State> {
-        self.contexts
-            .get(state.context)
-            .and_then(|context| context.states.get(state.index))
-            .copied()
-            .ok_or(Error::InvalidData("RAR PPMd state reference is invalid"))
-    }
-
-    fn state_mut(&mut self, state: StateRef) -> Result<&mut State> {
-        self.contexts
-            .get_mut(state.context)
-            .and_then(|context| context.states.get_mut(state.index))
-            .ok_or(Error::InvalidData("RAR PPMd state reference is invalid"))
+        self.set_num_stats(ctx, states.len());
+        let base = self.pos(self.stats(ctx) as usize);
+        for (i, state) in states.iter().enumerate() {
+            self.write_state(base + i * STATE_BYTES, *state);
+        }
     }
 }
 
@@ -1539,10 +1589,7 @@ impl PpmdEncoder {
             return Err(Error::InvalidData("RAR PPMd dictionary size is invalid"));
         }
         let mut model = PpmdDecoder::new();
-        model.max_contexts = model_context_limit(dictionary_mb);
-        model
-            .suballoc
-            .reset(dictionary_mb.saturating_mul(1024 * 1024));
+        model.reset_pool(dictionary_mb * 1024 * 1024);
         model.init_model(max_order);
         model.allocated = true;
         Ok(Self {
@@ -1757,23 +1804,6 @@ fn update_prob_1(prob: u32) -> u32 {
 
 fn hi_bits_flag(symbol: u8, bits: u32) -> u32 {
     ((symbol as u32 + 0xc0) >> (8 - bits)) & (1 << bits)
-}
-
-// Upper bound on the number of live context records. The C reference
-// (Ppmd7.c) has NO independent context cap — model restart is driven solely
-// by suballocator exhaustion (`Ppmd7_AllocUnits`/`AllocUnitsRare` returning
-// NULL). A context header is one 12-byte unit, and headers + state arrays
-// share the pool, so the live context count can never exceed `pool_units`
-// (= Size / UNIT_SIZE). Sizing the cap to that makes the suballocator the
-// binding constraint, exactly as in the reference, while still bounding Vec
-// growth defensively. A smaller cap (the old Size/16) forced a premature
-// RestartModel that desynchronised the decoder from the reference.
-fn model_context_limit(dictionary_mb: usize) -> usize {
-    dictionary_mb
-        .saturating_mul(1024 * 1024)
-        .checked_div(ALLOC_UNIT_BYTES)
-        .unwrap_or(usize::MAX)
-        .max(MIN_MODEL_CONTEXTS)
 }
 
 #[cfg(test)]
@@ -2037,9 +2067,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(decoder.max_order, 64);
-        assert_eq!(decoder.contexts.len(), 1);
-        assert_eq!(decoder.contexts[0].states.len(), 256);
-        assert_eq!(decoder.max_contexts, model_context_limit(1));
+        assert_eq!(decoder.num_stats(decoder.min_context), 256);
+        // The whole model is the declared 1 MiB, allocated once.
+        assert_eq!(decoder.heap.len(), 1024 * 1024);
+        assert_eq!(decoder.heap.capacity(), 1024 * 1024);
     }
 
     #[test]
@@ -2066,7 +2097,7 @@ mod tests {
     }
 
     #[test]
-    fn successor_and_states_round_trip() {
+    fn successor_round_trips() {
         assert_eq!(Successor::none().as_raw(), None);
         assert_eq!(Successor::none().as_context(), None);
         let last_pos = 256 * 1024 * 1024;
@@ -2076,17 +2107,6 @@ mod tests {
         assert_eq!(Successor::context(0).as_context(), Some(0));
         assert_eq!(Successor::context(last_pos).as_context(), Some(last_pos));
         assert_eq!(Successor::context(0).as_raw(), None);
-
-        let state = |symbol| State {
-            symbol,
-            freq: 1,
-            successor: Successor::none(),
-        };
-        let mut states = States::One(state(b'a'));
-        states.push(state(b'b'));
-        assert!(matches!(states, States::Many(_)));
-        assert_eq!(states.iter().map(|s| s.symbol).collect::<Vec<_>>(), b"ab");
-        assert!(matches!(States::from(vec![state(b'c')]), States::One(_)));
     }
 
     #[test]
@@ -2103,47 +2123,67 @@ mod tests {
         );
     }
 
-    #[test]
-    fn context_allocation_respects_dictionary_limit() {
-        let mut decoder = PpmdDecoder::new();
-        decoder.max_contexts = 1;
-        decoder.init_model(4);
+    fn state(symbol: u8, freq: u8) -> State {
+        State {
+            symbol,
+            freq,
+            successor: Successor::none(),
+        }
+    }
 
-        assert_eq!(
-            decoder.push_context(Context {
-                states: Vec::new().into(),
-                summ_freq: 0,
-                suffix: NO_SUFFIX,
-                header_offset: NULL_OFFSET,
-                array_offset: NULL_OFFSET,
-            }),
-            None
-        );
+    // A model with a 1 MiB pool and its root context.
+    fn small_model() -> PpmdDecoder {
+        let mut decoder = PpmdDecoder::new();
+        decoder.reset_pool(1024 * 1024);
+        decoder.init_model(4);
+        decoder
+    }
+
+    #[test]
+    fn contexts_and_state_arrays_live_in_the_pool() {
+        let mut decoder = small_model();
+        let root = decoder.min_context;
+        let c = decoder.new_binary_context(state(b'a', 3), root).unwrap();
+        assert_eq!(decoder.num_stats(c), 1);
+        assert_eq!(decoder.suffix(c), Some(root));
+        for (i, symbol) in (b'b'..=b'z').enumerate() {
+            assert!(decoder.add_state(c, state(symbol, i as u8)));
+        }
+        assert_eq!(decoder.num_stats(c), 26);
+        assert_eq!(decoder.state_at(c, 0).symbol, b'a');
+        assert_eq!(decoder.state_at(c, 0).freq, 3);
+        for (i, symbol) in (b'b'..=b'z').enumerate() {
+            assert_eq!(decoder.state_at(c, i + 1).symbol, symbol);
+            assert_eq!(decoder.state_at(c, i + 1).freq, i as u8);
+        }
+        assert_eq!(decoder.find_symbol(c, b'q'), Some(16));
+        // The root is untouched by the growth around it.
+        assert_eq!(decoder.num_stats(root), 256);
+        assert_eq!(decoder.suffix(root), None);
+        assert_eq!(decoder.heap.len(), 1024 * 1024);
+    }
+
+    #[test]
+    fn context_allocation_fails_when_the_pool_is_full() {
+        let mut decoder = small_model();
+        let root = decoder.min_context;
+        let mut made = 0;
+        while decoder.new_binary_context(state(b'a', 1), root).is_some() {
+            made += 1;
+        }
+        // Everything but the text reservation and the root holds contexts.
+        assert!(made > 1024 * 1024 * 7 / 8 / 12 - 200, "{made}");
+        assert_eq!(decoder.heap.len(), 1024 * 1024);
     }
 
     #[test]
     fn make_esc_freq_rejects_invalid_masked_state_count() {
-        let mut decoder = PpmdDecoder::new();
-        decoder.init_model(4);
-        decoder.contexts.push(Context {
-            states: States::from(vec![
-                State {
-                    symbol: b'a',
-                    freq: 1,
-                    successor: Successor::none(),
-                },
-                State {
-                    symbol: b'b',
-                    freq: 1,
-                    successor: Successor::none(),
-                },
-            ]),
-            summ_freq: 2,
-            suffix: 0,
-            header_offset: NULL_OFFSET,
-            array_offset: NULL_OFFSET,
-        });
-        decoder.min_context = 1;
+        let mut decoder = small_model();
+        let root = decoder.min_context;
+        let c = decoder.new_binary_context(state(b'a', 1), root).unwrap();
+        assert!(decoder.add_state(c, state(b'b', 1)));
+        decoder.set_summ_freq(c, 2);
+        decoder.min_context = c;
 
         assert!(matches!(
             decoder.make_esc_freq(2),
@@ -2153,23 +2193,15 @@ mod tests {
 
     #[test]
     fn update_model_rejects_invalid_frequency_arithmetic() {
-        let mut decoder = PpmdDecoder::new();
-        decoder.init_model(4);
-        decoder.contexts.push(Context {
-            states: States::from(vec![State {
-                symbol: b'a',
-                freq: 10,
-                successor: Successor::none(),
-            }]),
-            summ_freq: 1,
-            suffix: 0,
-            header_offset: NULL_OFFSET,
-            array_offset: NULL_OFFSET,
-        });
-        decoder.min_context = 1;
-        decoder.max_context = 0;
+        let mut decoder = small_model();
+        let root = decoder.min_context;
+        let c = decoder.new_binary_context(state(b'a', 10), root).unwrap();
+        assert!(decoder.add_state(c, state(b'b', 1)));
+        decoder.set_summ_freq(c, 1);
+        decoder.min_context = c;
+        decoder.max_context = root;
         decoder.found_state = StateRef {
-            context: 1,
+            context: c,
             index: 0,
         };
         decoder.order_fall = 1;
@@ -2182,10 +2214,9 @@ mod tests {
 
     #[test]
     fn update_paths_reject_invalid_state_reference_without_panic() {
-        let mut decoder = PpmdDecoder::new();
-        decoder.init_model(4);
+        let mut decoder = small_model();
         decoder.found_state = StateRef {
-            context: 99,
+            context: 10_000_000,
             index: 0,
         };
 
@@ -2195,7 +2226,7 @@ mod tests {
         );
 
         decoder.found_state = StateRef {
-            context: 0,
+            context: decoder.max_context,
             index: 999,
         };
         assert_eq!(
@@ -2237,10 +2268,10 @@ mod tests {
         for &byte in &data {
             encoder.encode_literal(byte).unwrap();
             // The text area only shrinks when the model restarts.
-            if encoder.model.text.len() < text_len {
+            if encoder.model.text_len < text_len {
                 restarts += 1;
             }
-            text_len = encoder.model.text.len();
+            text_len = encoder.model.text_len;
         }
         let (packed, _) = encoder.finish_keeping_model().unwrap();
         assert!(restarts >= 1, "the model never restarted");
