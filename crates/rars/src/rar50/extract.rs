@@ -259,6 +259,7 @@ impl FileHeader {
         keys: Option<&Rar50Keys>,
         decoder: &mut Unpack50Decoder,
         max_dictionary_size: u64,
+        verify: bool,
         writer: &mut dyn Write,
     ) -> Result<()> {
         if self.is_stored() {
@@ -279,7 +280,7 @@ impl FileHeader {
             })
             .transpose()?;
         let mut crc = Crc32::new();
-        let mut hash = streaming_hash_verifier(self)?;
+        let mut hash = streaming_hash_verifier(self)?.filter(|_| verify);
         let mut written = 0u64;
         let decoded = decoder.decode_member_from_reader_with_dictionary_to_sink(
             packed,
@@ -290,7 +291,9 @@ impl FileHeader {
             |chunk| match chunk {
                 DecodedChunk::Bytes(chunk) => {
                     written += chunk.len() as u64;
-                    crc.update(chunk);
+                    if verify {
+                        crc.update(chunk);
+                    }
                     if let Some((_, hasher)) = &mut hash {
                         hasher.update(chunk);
                     }
@@ -316,6 +319,9 @@ impl FileHeader {
             Err(StreamDecodeError::Decode(error)) => return Err(Error::from(error)),
             Err(StreamDecodeError::Sink(error)) => return Err(Error::from(error)),
         }
+        if !verify {
+            return Ok(());
+        }
         self.verify_streaming_integrity(crc, hash, keys)
     }
 
@@ -323,6 +329,7 @@ impl FileHeader {
         &self,
         archive: &Archive,
         password: Option<&[u8]>,
+        verify: bool,
         writer: &mut dyn Write,
     ) -> Result<()> {
         self.check_stored_size_verifiable()
@@ -331,8 +338,9 @@ impl FileHeader {
             .packed_reader_with_password(archive, password)
             .map_err(|error| self.entry_error("decoding", error))?;
         let mut crc = Crc32::new();
-        let mut hash =
-            streaming_hash_verifier(self).map_err(|error| self.entry_error("decoding", error))?;
+        let mut hash = streaming_hash_verifier(self)
+            .map_err(|error| self.entry_error("decoding", error))?
+            .filter(|_| verify);
         let mut written = 0u64;
         let mut buf = [0u8; 64 * 1024];
 
@@ -359,7 +367,9 @@ impl FileHeader {
                 .checked_add(chunk.len() as u64)
                 .ok_or(Error::InvalidHeader("RAR 5 stored size overflows"))
                 .map_err(|error| self.entry_error("decoding", error))?;
-            crc.update(chunk);
+            if verify {
+                crc.update(chunk);
+            }
             if let Some((_, hasher)) = &mut hash {
                 hasher.update(chunk);
             }
@@ -374,6 +384,9 @@ impl FileHeader {
                 "decoding",
                 Error::InvalidHeader("RAR 5 stored file has mismatched packed and unpacked sizes"),
             ));
+        }
+        if !verify {
+            return Ok(());
         }
         self.verify_streaming_integrity(crc, hash, keys.as_ref())
             .map_err(|error| self.entry_error("verifying", error))
@@ -572,6 +585,7 @@ struct DecoderSession<'a> {
     decoder: Unpack50Decoder,
     password: Option<&'a [u8]>,
     max_dictionary_size: u64,
+    verify: bool,
 }
 
 impl<'a> DecoderSession<'a> {
@@ -582,6 +596,7 @@ impl<'a> DecoderSession<'a> {
             max_dictionary_size: options
                 .max_dictionary_size
                 .unwrap_or(crate::DEFAULT_MAX_DICTIONARY_SIZE),
+            verify: !options.skip_checksums,
         }
     }
 
@@ -598,7 +613,7 @@ impl<'a> DecoderSession<'a> {
         writer: &mut dyn Write,
     ) -> Result<()> {
         if file.is_stored() {
-            return file.write_stored_to(archive, self.password, writer);
+            return file.write_stored_to(archive, self.password, self.verify, writer);
         }
         self.stream_file_to(archive, file, writer)
     }
@@ -619,6 +634,7 @@ impl<'a> DecoderSession<'a> {
             keys.as_ref(),
             &mut self.decoder,
             self.max_dictionary_size,
+            self.verify,
             writer,
         )
         .map_err(|error| file.entry_error("decoding", error))
@@ -901,7 +917,13 @@ impl PendingSplitRefs {
         // caller an error that names no part of the set.
         if final_file.is_stored() {
             return self
-                .write_stored_to(volumes, final_file, decryptor.as_ref(), &mut writer)
+                .write_stored_to(
+                    volumes,
+                    final_file,
+                    decryptor.as_ref(),
+                    session.verify,
+                    &mut writer,
+                )
                 .map_err(|error| self.checksum_error(volumes).unwrap_or(error))
                 .map_err(|error| final_file.entry_error("extracting", error));
         }
@@ -919,6 +941,7 @@ impl PendingSplitRefs {
                 decryptor.as_ref().map(|decryptor| &decryptor.keys),
                 &mut session.decoder,
                 session.max_dictionary_size,
+                session.verify,
                 &mut writer,
             )
             .map_err(|error| self.checksum_error(volumes).unwrap_or(error))
@@ -930,12 +953,13 @@ impl PendingSplitRefs {
         volumes: &[Archive],
         final_file: &FileHeader,
         decryptor: Option<&SplitDecryptor>,
+        verify: bool,
         writer: &mut dyn Write,
     ) -> Result<()> {
         final_file.check_stored_size_verifiable()?;
         let mut reader = self.fragment_reader(volumes, decryptor)?;
         let mut crc = Crc32::new();
-        let mut hash = streaming_hash_verifier(final_file)?;
+        let mut hash = streaming_hash_verifier(final_file)?.filter(|_| verify);
         let mut written = 0u64;
         let mut buf = [0u8; 64 * 1024];
 
@@ -959,7 +983,9 @@ impl PendingSplitRefs {
             written = written
                 .checked_add(chunk.len() as u64)
                 .ok_or(Error::InvalidHeader("RAR 5 stored split size overflows"))?;
-            crc.update(chunk);
+            if verify {
+                crc.update(chunk);
+            }
             if let Some((_, hasher)) = &mut hash {
                 hasher.update(chunk);
             }
@@ -970,6 +996,9 @@ impl PendingSplitRefs {
             return Err(Error::InvalidHeader(
                 "RAR 5 stored split file has mismatched packed and unpacked sizes",
             ));
+        }
+        if !verify {
+            return Ok(());
         }
         if let Some(expected) = final_file
             .data_crc32
@@ -1325,6 +1354,66 @@ mod tests {
     }
 
     #[test]
+    fn skip_checksums_leaves_crc32_and_blake2sp_to_the_caller() {
+        struct Sink(Rc<RefCell<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let data = b"checked by the caller, not by rars\n".repeat(400);
+        for store in [true, false] {
+            let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50).store(store);
+            builder
+                .add_bytes(b"a.txt".to_vec(), data.clone(), None, None)
+                .unwrap();
+            let mut archive = Archive::parse(&builder.to_bytes().unwrap()).unwrap();
+            for block in &mut archive.blocks {
+                if let Block::File(file) = block {
+                    assert_eq!(file.is_stored(), store);
+                    // A wrong CRC32 with no BLAKE2sp to supersede it.
+                    file.hash = None;
+                    file.data_crc32 = Some(crc32(&data) ^ 1);
+                }
+            }
+            let extract = |archive: &Archive, options| {
+                let out = Rc::new(RefCell::new(Vec::new()));
+                let sink = out.clone();
+                archive
+                    .extract_to(options, move |_| Ok(Box::new(Sink(sink.clone()))))
+                    .map(|()| out.take())
+            };
+            let checked = crate::ArchiveReadOptions::default();
+            let skipped = checked.with_skip_checksums(true);
+            assert!(matches!(
+                extract(&archive, checked),
+                Err(Error::AtEntry { source, .. }) if matches!(*source, Error::Crc32Mismatch { .. })
+            ));
+            assert_eq!(extract(&archive, skipped).unwrap(), data);
+
+            let mut wrong_hash = blake2sp::hash(&data);
+            wrong_hash[0] ^= 1;
+            for block in &mut archive.blocks {
+                if let Block::File(file) = block {
+                    file.hash = Some(FileHash {
+                        hash_type: 0,
+                        data: wrong_hash.to_vec(),
+                    });
+                }
+            }
+            assert!(matches!(
+                extract(&archive, checked),
+                Err(Error::AtEntry { source, .. }) if matches!(*source, Error::HashMismatch { .. })
+            ));
+            assert_eq!(extract(&archive, skipped).unwrap(), data);
+        }
+    }
+
+    #[test]
     fn small_filtered_members_extract() {
         let mut data = Vec::new();
         while data.len() + 29 <= BUFFERED_DECODE_LIMIT as usize {
@@ -1419,6 +1508,7 @@ mod tests {
                 None,
                 &mut Unpack50Decoder::new(),
                 crate::DEFAULT_MAX_DICTIONARY_SIZE,
+                true,
                 &mut out,
             )
             .unwrap_err();
@@ -1463,6 +1553,7 @@ mod tests {
                 None,
                 &mut Unpack50Decoder::new(),
                 crate::DEFAULT_MAX_DICTIONARY_SIZE,
+                true,
                 &mut out,
             )
             .unwrap_err();
@@ -2098,6 +2189,7 @@ mod tests {
                 None,
                 &mut decoder,
                 crate::DEFAULT_MAX_DICTIONARY_SIZE,
+                true,
                 &mut out,
             )
             .unwrap_err();
@@ -2123,7 +2215,7 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         let err = pending
-            .write_stored_to(&volumes, &final_file, None, &mut out)
+            .write_stored_to(&volumes, &final_file, None, true, &mut out)
             .unwrap_err();
         assert!(
             matches!(err, Error::InvalidHeader(msg) if msg.contains("mismatched packed and unpacked")),
@@ -2148,7 +2240,7 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         let err = pending
-            .write_stored_to(&volumes, &final_file, None, &mut out)
+            .write_stored_to(&volumes, &final_file, None, true, &mut out)
             .unwrap_err();
         assert!(
             matches!(err, Error::Crc32Mismatch { .. }),
@@ -2180,7 +2272,7 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         let err = pending
-            .write_stored_to(&volumes, &final_file, None, &mut out)
+            .write_stored_to(&volumes, &final_file, None, true, &mut out)
             .unwrap_err();
         assert!(
             matches!(err, Error::HashMismatch { hash_type: 0 }),

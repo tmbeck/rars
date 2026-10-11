@@ -80,6 +80,17 @@ pub struct ArchiveReadOptions<'a> {
     /// [`Error::DictionaryLimitExceeded`] before any of it is decoded. RAR
     /// 1.5-4 windows are fixed by the format (at most 4 MiB) and ignore it.
     pub max_dictionary_size: Option<u64>,
+    /// Skip rars' own check of RAR 5/7 members' CRC32 and BLAKE2sp (default
+    /// false: checked).
+    ///
+    /// For callers that verify the bytes themselves against the
+    /// `crc32` / `blake2sp` the member's `ExtractedEntryMeta` carries: the
+    /// checksums are then neither computed nor compared, and a corrupt member
+    /// comes out without an error, as does an encrypted member opened with a
+    /// wrong password when the archive records no password check value. RAR
+    /// 1.5-4 members are always checked: their CRC32 is cheap, and it is how
+    /// a wrong password shows.
+    pub skip_checksums: bool,
 }
 
 /// The largest RAR 5/7 dictionary decoded unless
@@ -120,6 +131,13 @@ impl<'a> ArchiveReadOptions<'a> {
     /// [`Self::max_dictionary_size`].
     pub fn with_max_dictionary_size(mut self, bytes: u64) -> Self {
         self.max_dictionary_size = Some(bytes);
+        self
+    }
+
+    /// Sets whether RAR 5/7 checksums are left to the caller; see
+    /// [`Self::skip_checksums`].
+    pub fn with_skip_checksums(mut self, skip: bool) -> Self {
+        self.skip_checksums = skip;
         self
     }
 }
