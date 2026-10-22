@@ -392,6 +392,11 @@ pub struct ArchiveMemberMeta {
     pub packed_size: u64,
     /// Unpacked file size in bytes.
     pub unpacked_size: u64,
+    /// Expected logical output size, when the archive records one.
+    ///
+    /// This is `None` for RAR5 members whose header marks the size unknown;
+    /// `unpacked_size` retains the format-level value for compatibility.
+    pub expected_unpacked_size: Option<u64>,
     /// DOS local wall-clock fields for RAR 1.3-4.x, or Unix seconds for RAR5.
     /// RAR5 includes the extended modification-time fallback; `None` is distinct
     /// from an explicitly stored Unix epoch (`Some(0)`).
@@ -492,12 +497,20 @@ pub enum ArchiveMemberDetail {
         unpack_version: u8,
         /// Stored CRC-32 of the unpacked data.
         crc32: u32,
+        /// Expected CRC-32 of the complete logical member.
+        expected_crc32: u32,
         /// Whether this member participates in a solid stream.
         solid: bool,
         /// Original Unicode wire name, including the legacy fallback.
         unicode_name: Option<Vec<u8>>,
         /// Raw legacy extended timestamp record.
         extended_times: Vec<u8>,
+        /// Legacy extended creation time, when present.
+        ctime: Option<rar15_40::DosTime>,
+        /// Legacy extended access time, when present.
+        atime: Option<rar15_40::DosTime>,
+        /// RAR4 UOWNER metadata, when linked to this file.
+        owner: Option<rar50::UnixOwner>,
         /// Per-file salt when file encryption is used.
         salt: Option<[u8; 8]>,
         /// Whether the member carries a file-comment extension.
@@ -510,12 +523,27 @@ pub enum ArchiveMemberDetail {
         compression_info: u64,
         /// Stored CRC-32 when present.
         crc32: Option<u32>,
+        /// Expected CRC-32 of the unpacked data, when present.
+        expected_crc32: Option<u32>,
+        /// Expected logical output size, when known.
+        expected_unpacked_size: Option<u64>,
+        /// RAR5 file version from FHEXTRA_VERSION.
+        version: Option<u64>,
+        /// RAR5 UOWNER metadata, when present.
+        owner: Option<rar50::UnixOwner>,
         /// Complete supported RAR5 high-precision file times.
         file_times: Option<FileTimes>,
+        /// RAR5 creation time, when present.
+        ctime: Option<UnixTimestamp>,
+        /// RAR5 access time, when present.
+        atime: Option<UnixTimestamp>,
         /// Redirection metadata, including the raw target name.
         redirection: Option<rar50::FileRedirection>,
         /// Strong file hash when present.
         hash: Option<ArchiveMemberHash>,
+        /// Expected BLAKE2sp hash, when the hash record is the standard RAR5
+        /// BLAKE2sp record.
+        expected_blake2sp: Option<[u8; 32]>,
     },
 }
 
@@ -1054,6 +1082,7 @@ fn rar13_member(entry: &rar13::Entry) -> ArchiveMember {
             name: entry.name.clone(),
             packed_size: u64::from(entry.header.pack_size),
             unpacked_size: u64::from(entry.header.unp_size),
+            expected_unpacked_size: Some(u64::from(entry.header.unp_size)),
             file_time: Some(entry.header.file_time),
             mtime_refinement: None,
             file_attr: u64::from(entry.header.file_attr),
@@ -1081,6 +1110,7 @@ fn rar15_40_member(file: &rar15_40::FileHeader) -> ArchiveMember {
             name: file.name.clone(),
             packed_size: file.pack_size,
             unpacked_size: file.unp_size,
+            expected_unpacked_size: Some(file.unp_size),
             file_time: Some(file.file_time),
             mtime_refinement: file.mtime_refinement(),
             file_attr: u64::from(file.attr),
@@ -1096,10 +1126,14 @@ fn rar15_40_member(file: &rar15_40::FileHeader) -> ArchiveMember {
             method: file.method,
             unpack_version: file.unp_ver,
             crc32: file.file_crc,
+            expected_crc32: file.file_crc,
             solid: file.is_solid(),
             salt: file.salt,
             unicode_name: file.unicode_name.clone(),
             extended_times: file.ext_time.clone(),
+            ctime: rar15_40::ext_times(&file.ext_time, file.file_time)[1],
+            atime: rar15_40::ext_times(&file.ext_time, file.file_time)[2],
+            owner: file.owner.clone(),
             has_file_comment: file.has_file_comment(),
         },
     }
@@ -1112,6 +1146,7 @@ fn rar50_member(file: &rar50::FileHeader) -> ArchiveMember {
             name: file.name.clone(),
             packed_size: file.packed_size(),
             unpacked_size: file.unpacked_size,
+            expected_unpacked_size: file.known_unpacked_size(),
             file_time: file.modification_time(),
             mtime_refinement: file.modification_time_refinement(),
             file_attr: file.attributes,
@@ -1126,9 +1161,20 @@ fn rar50_member(file: &rar50::FileHeader) -> ArchiveMember {
         detail: ArchiveMemberDetail::Rar50Plus {
             compression_info: file.compression_info,
             crc32: file.data_crc32,
+            expected_crc32: file.data_crc32,
+            expected_unpacked_size: file.known_unpacked_size(),
+            version: file.version,
+            owner: file.owner.clone(),
             hash: file.hash.as_ref().map(rar50_member_hash),
+            expected_blake2sp: file
+                .hash
+                .as_ref()
+                .filter(|hash| hash.hash_type == 0)
+                .and_then(|hash| <[u8; 32]>::try_from(hash.data.as_slice()).ok()),
             redirection: file.redirection.clone(),
             file_times: file.file_times,
+            ctime: file.times.ctime,
+            atime: file.times.atime,
         },
     }
 }
