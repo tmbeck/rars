@@ -9,8 +9,14 @@ set -euo pipefail
 export RARS_REQUIRE_EXTERNAL_DECODERS=1
 
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
+
+# The fuzz workspace is intentionally separate from the main workspace, so the
+# test command above cannot catch a stale or uncompilable target. Compile every
+# deterministic harness here, but do not run a time- or toolchain-dependent
+# fuzzing campaign as part of a release gate.
+cargo check --manifest-path fuzz/Cargo.toml --bins --locked
 
 # The Python package ships from the same tag as the crates, so the gate covers
 # it too. This builds the extension into a throwaway virtualenv and runs

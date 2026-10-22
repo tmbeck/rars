@@ -1,8 +1,9 @@
 # Local fuzzing
 
 This is a separate Cargo workspace; normal workspace checks do not build these
-targets. Run fuzzing locally or in explicitly scheduled jobs. PR checks run the
-ordinary deterministic tests, not random fuzz campaigns.
+targets. CI and the release gate compile every harness with
+`cargo check --manifest-path fuzz/Cargo.toml --bins --locked`, but neither runs
+a random campaign. Run fuzzing locally or in explicitly scheduled jobs.
 
 From the repository root, install the tooling once:
 

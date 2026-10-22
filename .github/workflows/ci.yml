@@ -45,3 +45,8 @@ jobs:
       # External-decoder tests skip unavailable tools; the release gate requires them.
       - name: Tests
         run: cargo test --workspace --locked
+
+      # Fuzzing is not a PR-time random campaign, but all deterministic harnesses
+      # must continue to compile as codec APIs evolve.
+      - name: Fuzz harnesses compile
+        run: cargo check --manifest-path fuzz/Cargo.toml --bins --locked
