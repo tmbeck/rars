@@ -21,6 +21,9 @@ has since matured as it gained some users. It's still a bit slower than WinRAR,
 uses more memory and has slightly worse compression. It could use more testing
 at volume, too. Other than that it's in pretty good shape.
 
+Volume coverage, ordering rules, feature combinations, and deliberate writer
+refusals are summarized in the [volume capability matrix](VOLUME_CAPABILITY_MATRIX.md).
+
 ## Usage
 
 The API is in the `rars` crate, which is used by the Python and TypeScript
