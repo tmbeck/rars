@@ -1867,10 +1867,8 @@ fn link_owners(blocks: &mut [Block]) {
                     uid: None,
                     gid: None,
                 };
-                if let Some(file) = last_file.and_then(|i| blocks.get_mut(i)) {
-                    if let Block::File(file) = file {
-                        file.owner = Some(owner);
-                    }
+                if let Some(Block::File(file)) = last_file.and_then(|i| blocks.get_mut(i)) {
+                    file.owner = Some(owner);
                 }
             }
             _ => {}
