@@ -36,6 +36,8 @@ mod parallel;
 mod parse_budget;
 mod read_control;
 pub use read_control::ReadCancellation;
+mod read_at;
+pub use read_at::{ReadAt, SeekReader};
 mod extraction_control;
 mod file_times;
 pub mod rar13;
@@ -1325,6 +1327,19 @@ impl ArchiveReader {
                 options,
             )?)),
         }
+    }
+
+    /// Parses an archive from a positioned source without copying it.
+    pub fn read_source(source: std::sync::Arc<dyn ReadAt>) -> Result<Archive> {
+        Self::read_source_with_options(source, ArchiveReadOptions::default())
+    }
+
+    /// Parses an archive from a positioned source with explicit options.
+    pub fn read_source_with_options(
+        source: std::sync::Arc<dyn ReadAt>,
+        options: ArchiveReadOptions<'_>,
+    ) -> Result<Archive> {
+        Self::read_reader_with_options(crate::read_at::as_reader(source), options)
     }
 
     /// Parses an archive from a path using explicit read options.

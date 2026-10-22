@@ -162,6 +162,8 @@ pub struct FileHeader {
     pub file_comment: Vec<u8>,
     pub ext_time: Vec<u8>,
     pub packed_range: Range<usize>,
+    pub sub_data: Vec<u8>,
+    pub owner: Option<crate::rar50::UnixOwner>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -411,6 +413,7 @@ pub struct ExtractedEntryMeta {
     pub is_directory: bool,
     pub ctime: Option<DosTime>,
     pub atime: Option<DosTime>,
+    pub owner: Option<crate::rar50::UnixOwner>,
     /// CRC32 of the unpacked data (of the whole member for a split one).
     pub crc32: u32,
     pub unpacked_size: u64,
@@ -591,6 +594,7 @@ impl FileHeader {
             is_directory: self.is_directory(),
             ctime,
             atime,
+            owner: self.owner.clone(),
             crc32: self.file_crc,
             unpacked_size: self.unp_size,
         }
@@ -1062,6 +1066,7 @@ impl Archive {
         }
 
         options.check_cancelled()?;
+        link_owners(&mut blocks);
         Ok(Self {
             sfx_offset: sig.offset,
             main,
@@ -1187,6 +1192,7 @@ impl Archive {
         }
 
         options.check_cancelled()?;
+        link_owners(&mut blocks);
         Ok(Self {
             sfx_offset,
             main,
@@ -1841,6 +1847,34 @@ fn classify_new_sub(name: &[u8]) -> NewSubKind {
         b"CMT" => NewSubKind::ArchiveComment,
         b"RR" => NewSubKind::RecoveryRecord,
         _ => NewSubKind::Unknown(name.to_vec()),
+    }
+}
+
+fn link_owners(blocks: &mut [Block]) {
+    let mut last_file = None;
+    for index in 0..blocks.len() {
+        match &blocks[index] {
+            Block::File(_) => last_file = Some(index),
+            Block::NewSub(sub) if matches!(sub.kind, NewSubKind::Unknown(_)) && sub.file.name == b"UOW" => {
+                let Some(nul) = sub.file.sub_data.iter().position(|&b| b == 0) else {
+                    continue;
+                };
+                let group = &sub.file.sub_data[nul + 1..];
+                let group = &group[..group.iter().position(|&b| b == 0).unwrap_or(group.len())];
+                let owner = crate::rar50::UnixOwner {
+                    user: Some(sub.file.sub_data[..nul].to_vec()),
+                    group: Some(group.to_vec()),
+                    uid: None,
+                    gid: None,
+                };
+                if let Some(file) = last_file.and_then(|i| blocks.get_mut(i)) {
+                    if let Block::File(file) = file {
+                        file.owner = Some(owner);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -2512,6 +2546,16 @@ fn parse_file_like_header(
     let name = decode_file_name(&input[pos..name_end], block.flags);
     pos = name_end;
 
+    let sub_data = if block.head_type == NEWSUB_HEAD {
+        let salt_len = if block.flags & FHD_SALT != 0 { 8 } else { 0 };
+        let sub_end = head_end.saturating_sub(salt_len).max(pos);
+        let data = input[pos..sub_end].to_vec();
+        pos = sub_end;
+        data
+    } else {
+        Vec::new()
+    };
+
     let salt = if block.flags & FHD_SALT != 0 {
         let salt_end = pos
             .checked_add(8)
@@ -2574,6 +2618,8 @@ fn parse_file_like_header(
         file_comment,
         ext_time,
         packed_range: archive_offset + data_start..archive_offset + data_end,
+        sub_data,
+        owner: None,
     })
 }
 
@@ -3248,6 +3294,8 @@ mod tests {
             file_comment: Vec::new(),
             ext_time: Vec::new(),
             packed_range: 0..0,
+            sub_data: Vec::new(),
+            owner: None,
         }
     }
 

@@ -430,6 +430,7 @@ struct PendingSplitRefs<B: Budget = Allowance> {
     mtime_refinement: Option<crate::TimeRefinement>,
     ctime: Option<super::DosTime>,
     atime: Option<super::DosTime>,
+    owner: Option<crate::rar50::UnixOwner>,
     attr: u32,
     host_os: u8,
     method: u8,
@@ -452,6 +453,7 @@ impl<B: Budget> PendingSplitRefs<B> {
             mtime_refinement: file.mtime_refinement(),
             ctime: super::ext_times(&file.ext_time, file.file_time)[1],
             atime: super::ext_times(&file.ext_time, file.file_time)[2],
+            owner: file.owner.clone(),
             attr: file.attr,
             host_os: file.host_os,
             method: file.method,
@@ -489,6 +491,7 @@ impl<B: Budget> PendingSplitRefs<B> {
             is_directory: false,
             ctime: self.ctime,
             atime: self.atime,
+            owner: self.owner.clone(),
             crc32: final_file.file_crc,
             unpacked_size: final_file.unp_size,
         };
@@ -1001,6 +1004,8 @@ mod tests {
             file_comment: Vec::new(),
             ext_time: Vec::new(),
             packed_range: 0..0,
+            sub_data: Vec::new(),
+            owner: None,
         }
     }
 
