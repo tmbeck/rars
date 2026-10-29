@@ -11,9 +11,7 @@ use crate::streaming::EntrySource;
 use std::borrow::Cow;
 use std::io::{Read, Write};
 
-pub(crate) fn entropy_error(error: getrandom::Error, context: &'static str) -> Error {
-    std::io::Error::other(format!("{context}: {error}")).into()
-}
+pub(crate) use crate::entropy::fill_entropy;
 
 /// Attribute a writer failure without blaming a member for cancellation.
 pub(crate) fn member_error(error: Error, name: &[u8], operation: &'static str) -> Error {
@@ -35,13 +33,24 @@ const WALK_CHUNK: usize = 256 * 1024;
 pub(crate) enum MemberBytes<'a> {
     Borrowed(&'a [u8]),
     Source(&'a EntrySource),
+    /// Builder inputs retain their source-read context even when loading is
+    /// deferred into a writer's preparation phase.
+    NamedSource(&'a EntrySource, &'a [u8]),
 }
 
 impl<'a> MemberBytes<'a> {
     pub(crate) fn len(&self) -> Result<u64> {
-        match self {
+        let result = match self {
             Self::Borrowed(data) => Ok(data.len() as u64),
-            Self::Source(source) => source.len(),
+            Self::Source(source) | Self::NamedSource(source, _) => source.len(),
+        };
+        result.map_err(|error| self.source_error(error))
+    }
+
+    fn source_error(&self, error: Error) -> Error {
+        match self {
+            Self::NamedSource(_, name) => member_error(error, name, "reading source"),
+            _ => error,
         }
     }
 
@@ -56,10 +65,30 @@ impl<'a> MemberBytes<'a> {
         progress: Option<crate::write_progress::ProgressReporter<'_>>,
     ) -> Result<Cow<'_, [u8]>> {
         crate::write_progress::check_cancelled(progress)?;
+        self.load_exact_with_progress(self.len()?, progress)
+    }
+
+    /// Use the source size already captured for the header and workspace.
+    /// Requerying a changing path here could disagree with that header. Inline
+    /// bytes remain borrowed and immutable throughout the write.
+    pub(crate) fn load_exact_with_progress(
+        &self,
+        expected: u64,
+        progress: Option<crate::write_progress::ProgressReporter<'_>>,
+    ) -> Result<Cow<'_, [u8]>> {
+        self.load_exact(expected, progress)
+            .map_err(|error| self.source_error(error))
+    }
+
+    fn load_exact(
+        &self,
+        expected: u64,
+        progress: Option<crate::write_progress::ProgressReporter<'_>>,
+    ) -> Result<Cow<'_, [u8]>> {
+        crate::write_progress::check_cancelled(progress)?;
         match self {
             Self::Borrowed(data) => Ok(Cow::Borrowed(data)),
-            Self::Source(source) => {
-                let expected = source.len()?;
+            Self::Source(source) | Self::NamedSource(source, _) => {
                 let capacity = usize::try_from(expected).map_err(|_| {
                     Error::InvalidArgument("member is larger than this host can hold")
                 })?;
@@ -90,8 +119,30 @@ impl<'a> MemberBytes<'a> {
         self.walk_with_progress(None, visit)
     }
 
-    pub(crate) fn walk_with_progress(
+    #[cfg(test)]
+    fn walk_with_progress(
         &self,
+        progress: Option<crate::write_progress::ProgressReporter<'_>>,
+        visit: impl FnMut(&[u8]),
+    ) -> Result<()> {
+        crate::write_progress::check_cancelled(progress)?;
+        self.walk_exact_with_progress(self.len()?, progress, visit)
+    }
+
+    /// Walk against the same captured source size that the member header uses.
+    pub(crate) fn walk_exact_with_progress(
+        &self,
+        expected: u64,
+        progress: Option<crate::write_progress::ProgressReporter<'_>>,
+        visit: impl FnMut(&[u8]),
+    ) -> Result<()> {
+        self.walk_exact(expected, progress, visit)
+            .map_err(|error| self.source_error(error))
+    }
+
+    fn walk_exact(
+        &self,
+        expected: u64,
         progress: Option<crate::write_progress::ProgressReporter<'_>>,
         mut visit: impl FnMut(&[u8]),
     ) -> Result<()> {
@@ -103,8 +154,7 @@ impl<'a> MemberBytes<'a> {
                     visit(chunk);
                 }
             }
-            Self::Source(source) => {
-                let expected = source.len()?;
+            Self::Source(source) | Self::NamedSource(source, _) => {
                 crate::write_progress::check_cancelled(progress)?;
                 let mut reader = crate::write_progress::CancellableIo {
                     inner: source.open()?,
@@ -138,7 +188,16 @@ impl<'a> MemberBytes<'a> {
     pub(crate) fn source(&self) -> Option<&'a EntrySource> {
         match self {
             Self::Borrowed(_) => None,
-            Self::Source(source) => Some(source),
+            Self::Source(source) | Self::NamedSource(source, _) => Some(source),
+        }
+    }
+
+    /// The member has been written and verified, so this write will not
+    /// reopen its session-owned staged payload. Public source factories keep
+    /// their usual reopenable behavior.
+    pub(crate) fn release(&self) {
+        if let Some(source) = self.source() {
+            source.release();
         }
     }
 }
@@ -205,6 +264,36 @@ pub(crate) fn check_source_length(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn captured_source_size_controls_loading_and_checksum_walks() {
+        struct Source;
+        impl crate::streaming::SourceFactory for Source {
+            fn len(&self) -> Result<u64> {
+                panic!("must use the size already captured for the member header")
+            }
+            fn open(&self) -> Result<Box<dyn crate::streaming::EntryReader>> {
+                Ok(Box::new(std::io::Cursor::new(b"abc".as_slice())))
+            }
+        }
+        for expected in [0, 1, 3, 4] {
+            let source = EntrySource::from_factory(Source);
+            let member = MemberBytes::Source(&source);
+            let loaded = member.load_exact_with_progress(expected, None);
+            let mut observed = Vec::new();
+            let walked = member.walk_exact_with_progress(expected, None, |chunk| {
+                observed.extend_from_slice(chunk)
+            });
+            if expected == 3 {
+                assert_eq!(loaded.unwrap().as_ref(), b"abc");
+                walked.unwrap();
+                assert_eq!(observed, b"abc");
+            } else {
+                assert_eq!(loaded.unwrap_err().kind(), crate::ErrorKind::SourceChanged);
+                assert_eq!(walked.unwrap_err().kind(), crate::ErrorKind::SourceChanged);
+            }
+        }
+    }
+
+    #[test]
     fn source_end_probe_retries_interruptions_and_reports_other_io_errors() {
         struct Probe {
             calls: usize,
@@ -246,23 +335,28 @@ mod tests {
             super::member_error(crate::Error::Cancelled, b"file", "writing"),
             crate::Error::Cancelled
         );
-        let existing = crate::Error::InvalidArgument("source failed")
-            .at_entry(b"file".to_vec(), "reading");
+        let existing =
+            crate::Error::InvalidArgument("source failed").at_entry(b"file".to_vec(), "reading");
         let error = super::member_error(existing, b"file", "writing");
         assert_eq!(error.entry_context(), Some((b"file".as_slice(), "reading")));
     }
 
-    #[test]
-    fn entropy_failure_is_io_and_keeps_the_backend_diagnostic() {
-        let error = super::entropy_error(getrandom::Error::UNSUPPORTED, "encryption salt");
-        assert_eq!(error.kind(), crate::ErrorKind::Io);
-        assert!(error.to_string().contains("encryption salt"));
-        assert!(error
-            .to_string()
-            .contains(&getrandom::Error::UNSUPPORTED.to_string()));
-    }
-
     use super::*;
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn oversized_member_is_refused_before_opening_its_source() {
+        let length = u64::from(u32::MAX) + 1;
+        let source = EntrySource::from_opener(length, || {
+            panic!("an unrepresentable member must not open its source")
+        });
+        let member = MemberBytes::Source(&source);
+        assert_eq!(member.len().unwrap(), length);
+        assert_eq!(
+            member.load().unwrap_err(),
+            Error::InvalidArgument("member is larger than this host can hold")
+        );
+    }
 
     #[test]
     fn changed_sources_are_bounded_and_rejected() {
@@ -350,7 +444,9 @@ mod tests {
         assert!(matches!(bytes.load().unwrap(), Cow::Borrowed(_)));
         assert!(bytes.source().is_none());
         let mut visited = Vec::new();
-        bytes.walk(|chunk| visited.extend_from_slice(chunk)).unwrap();
+        bytes
+            .walk(|chunk| visited.extend_from_slice(chunk))
+            .unwrap();
         assert_eq!(visited, data);
     }
 }

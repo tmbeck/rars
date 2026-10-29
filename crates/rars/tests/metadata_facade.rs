@@ -84,11 +84,11 @@ fn split_members_keep_logical_expected_size_and_crc() {
     assert!(members.iter().any(|member| member.meta.is_split_before));
     assert!(members.iter().any(|member| member.meta.is_split_after));
     for member in members {
-        assert_eq!(member.meta.expected_unpacked_size, Some(payload.len() as u64));
-        let ArchiveMemberDetail::Rar15To40 {
-            expected_crc32, ..
-        } = member.detail
-        else {
+        assert_eq!(
+            member.meta.expected_unpacked_size,
+            Some(payload.len() as u64)
+        );
+        let ArchiveMemberDetail::Rar15To40 { expected_crc32, .. } = member.detail else {
             panic!("expected RAR4 detail");
         };
         assert!(expected_crc32 != 0);

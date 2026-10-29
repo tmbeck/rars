@@ -27,10 +27,12 @@ pub struct FileTimes {
     pub accessed: Option<FileTimestamp>,
 }
 
+#[cfg(any(test, feature = "write"))]
 pub(crate) struct EncodedTimes {
     bytes: [u8; 25],
     len: usize,
 }
+#[cfg(any(test, feature = "write"))]
 impl std::ops::Deref for EncodedTimes {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
@@ -80,6 +82,7 @@ impl FileTimes {
         })
     }
 
+    #[cfg(any(test, feature = "write"))]
     pub(crate) fn encode(self) -> Result<EncodedTimes> {
         let times = [self.modified, self.created, self.accessed];
         let first = times
@@ -177,6 +180,7 @@ impl FileTimes {
         })
     }
 
+    #[cfg(any(test, feature = "write"))]
     pub(crate) fn legacy(raw: &[u8], mtime: Option<u32>) -> Result<Option<Self>> {
         if raw.is_empty() {
             return Ok(None);
@@ -225,7 +229,8 @@ impl FileTimes {
             .ok_or_else(invalid)?;
             let duration = time
                 .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|_| invalid())?;
+                // extracted_system_time adds nonnegative durations to UNIX_EPOCH.
+                .expect("extracted timestamps cannot precede the Unix epoch");
             *slot = Some(FileTimestamp::Unix {
                 seconds: u32::try_from(duration.as_secs()).map_err(|_| invalid())?,
                 nanoseconds: duration.subsec_nanos(),
@@ -245,6 +250,7 @@ impl FileTimes {
 
 /// Validate a native legacy record without interpreting DOS wall-clock times.
 /// Includes the fourth (archival) timestamp, which RAR5 cannot represent.
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn validate_legacy_extended_times(raw: &[u8]) -> Result<()> {
     let invalid = || Error::InvalidArgument("legacy extended timestamps are incomplete or invalid");
     let flags = u16::from_le_bytes(raw.get(..2).ok_or_else(invalid)?.try_into().unwrap());
@@ -318,8 +324,11 @@ mod tests {
 
     #[test]
     fn malformed_or_mixed_time_records_are_rejected() {
+        assert!(FileTimes::parse(1, &[]).is_none());
         assert!(FileTimes::parse(0x23, &[0; 4]).is_none());
         assert!(FileTimes::parse(0x13, &[0; 4]).is_none());
+        // Fractional seconds are available only with Unix encoding.
+        assert!(FileTimes::parse(0x12, &[0; 8]).is_none());
         let mut data = vec![0; 4];
         data.extend(1_000_000_000u32.to_le_bytes());
         assert!(FileTimes::parse(0x13, &data).is_none());
@@ -332,6 +341,151 @@ mod tests {
             accessed: None,
         };
         assert!(mixed.encode().is_err());
+        assert!(FileTimes::default().encode().is_err());
+        assert!(FileTimes {
+            modified: Some(FileTimestamp::Unix {
+                seconds: 0,
+                nanoseconds: 1_000_000_000,
+            }),
+            ..FileTimes::default()
+        }
+        .encode()
+        .is_err());
+        let mut reverse_mixed = mixed;
+        std::mem::swap(&mut reverse_mixed.modified, &mut reverse_mixed.created);
+        assert!(reverse_mixed.encode().is_err());
+        assert_eq!(
+            FileTimes::parse(3, &123u32.to_le_bytes()).unwrap().modified,
+            Some(FileTimestamp::Unix {
+                seconds: 123,
+                nanoseconds: 0
+            })
+        );
+    }
+
+    #[test]
+    fn exact_nanoseconds_choose_one_lossless_encoding_at_range_boundaries() {
+        let unix_end = i128::from(u32::MAX) * 1_000_000_000 + 999_999_999;
+        for value in [0, 1, unix_end] {
+            let times = FileTimes::from_unix_nanoseconds(Some(value), None, None).unwrap();
+            assert!(matches!(times.modified, Some(FileTimestamp::Unix { .. })));
+            assert_eq!(times.modified.unwrap().unix_nanoseconds(), value);
+            let encoded = times.encode().unwrap();
+            assert_eq!(
+                FileTimes::parse(u64::from(encoded[0]), &encoded[1..]),
+                Some(times)
+            );
+        }
+        let filetime_min = -11_644_473_600_000_000_000i128;
+        let filetime_max = (i128::from(u64::MAX) - 116_444_736_000_000_000) * 100;
+        for value in [filetime_min, -100, unix_end + 1, filetime_max] {
+            let times = FileTimes::from_unix_nanoseconds(Some(value), Some(0), None).unwrap();
+            assert!(matches!(
+                times.modified,
+                Some(FileTimestamp::WindowsFiletime(_))
+            ));
+            assert!(matches!(
+                times.created,
+                Some(FileTimestamp::WindowsFiletime(_))
+            ));
+            assert_eq!(times.modified.unwrap().unix_nanoseconds(), value);
+            assert_eq!(times.created.unwrap().unix_nanoseconds(), 0);
+            let encoded = times.encode().unwrap();
+            assert_eq!(
+                FileTimes::parse(u64::from(encoded[0]), &encoded[1..]),
+                Some(times)
+            );
+        }
+        for value in [
+            -1,
+            unix_end + 2,
+            filetime_min - 100,
+            filetime_max + 100,
+            i128::MIN,
+            i128::MAX,
+        ] {
+            assert!(
+                FileTimes::from_unix_nanoseconds(Some(value), None, None).is_err(),
+                "{value}"
+            );
+        }
+        assert_eq!(
+            FileTimes::from_unix_nanoseconds(None, None, None).unwrap(),
+            FileTimes::default()
+        );
+    }
+
+    #[test]
+    fn legacy_conversion_refuses_missing_invalid_and_unix_out_of_range_dates() {
+        for (raw, modified) in [
+            (vec![0], None),
+            (0x8000u16.to_le_bytes().to_vec(), None),
+            (0x8000u16.to_le_bytes().to_vec(), Some(0)),
+            (0x0800u16.to_le_bytes().to_vec(), None),
+            (0x9000u16.to_le_bytes().to_vec(), Some(0x5022_1882)),
+        ] {
+            assert!(FileTimes::legacy(&raw, modified).is_err());
+        }
+        let future_dos = (127 << 25) | (1 << 21) | (1 << 16); // 2107-01-01
+        let instant = crate::timestamp::extracted_system_time(
+            crate::ArchiveFamily::Rar15To40,
+            Some(future_dos),
+            None,
+        )
+        .unwrap();
+        assert!(
+            instant
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                > u64::from(u32::MAX)
+        );
+        assert!(FileTimes::legacy(&0x8000u16.to_le_bytes(), Some(future_dos)).is_err());
+        assert_eq!(FileTimes::legacy(&[], None).unwrap(), None);
+        assert!(validate_legacy_extended_times(&[0]).is_err());
+        assert!(validate_legacy_extended_times(&0x0800u16.to_le_bytes()).is_err());
+        assert!(validate_legacy_extended_times(&0x9000u16.to_le_bytes()).is_err());
+    }
+
+    #[test]
+    fn archival_time_is_preserved_natively_but_cannot_be_converted_to_rar5() {
+        // Legacy extended-time flags place archival time in the low nibble.
+        let mut raw = 0x0008u16.to_le_bytes().to_vec();
+        raw.extend(0x5022_1882u32.to_le_bytes());
+        validate_legacy_extended_times(&raw).unwrap();
+        assert_eq!(
+            FileTimes::legacy(&raw, None),
+            Err(Error::InvalidArgument(
+                "legacy archival time has no supported RAR5 representation"
+            ))
+        );
+    }
+
+    #[test]
+    fn legacy_fractions_end_before_one_second_and_records_have_no_trailing_bytes() {
+        let dos = 0x5022_1882;
+        for (ticks, valid) in [
+            (9_999_999u32, true),
+            (10_000_000, false),
+            (0xff_ffff, false),
+        ] {
+            let mut raw = 0xb000u16.to_le_bytes().to_vec();
+            raw.extend_from_slice(&ticks.to_le_bytes()[..3]);
+            assert_eq!(validate_legacy_extended_times(&raw).is_ok(), valid);
+            let converted = FileTimes::legacy(&raw, Some(dos));
+            assert_eq!(converted.is_ok(), valid);
+            if valid {
+                let FileTimestamp::Unix { nanoseconds, .. } =
+                    converted.unwrap().unwrap().modified.unwrap()
+                else {
+                    panic!("legacy conversion must use Unix seconds");
+                };
+                assert_eq!(nanoseconds, ticks * 100);
+            }
+        }
+        assert_eq!(FileTimes::legacy(&[0, 0], None).unwrap(), None);
+        assert!(FileTimes::legacy(&[0, 0, 1], None).is_err());
+        assert!(validate_legacy_extended_times(&[0, 0, 1]).is_err());
     }
 
     #[test]

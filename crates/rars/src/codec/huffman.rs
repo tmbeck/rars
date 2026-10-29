@@ -1,4 +1,6 @@
-use super::workspace::{Allowance, Budget, Buffer};
+#[cfg(any(test, feature = "write"))]
+use super::workspace::Allowance;
+use super::workspace::{Budget, Buffer};
 use super::Result;
 
 /// Like [`lengths_for_frequencies`], but guarantees the returned code lengths
@@ -42,22 +44,21 @@ fn is_complete_code(lengths: &[u8]) -> bool {
 /// Overwrites `lengths` with a complete near-uniform canonical code over the
 /// currently-used symbols (those with a non-zero length), preserving symbol
 /// order. A single used symbol is padded with one phantom length-1 code so the
-/// result satisfies Kraft equality; an empty table is left untouched. Callers
-/// that need a guaranteed-complete code (e.g. tables a strict decoder builds
+/// result satisfies Kraft equality. The alphabet must have at least two slots
+/// and at least one used symbol. Callers that need a guaranteed-complete code
+/// (e.g. tables a strict decoder builds
 /// with `Full`/`Full_or_Empty`) can mark used symbols with any non-zero length
 /// and call this to normalise them.
 pub(crate) fn assign_flat_complete_code(lengths: &mut [u8]) {
     let n = lengths.iter().filter(|&&length| length != 0).count();
-    if n == 0 {
-        return;
-    }
+    // Level tables always encode a nonempty main-table description. Empty
+    // frequency tables in complete_lengths_with_allowance skip this helper.
+    debug_assert!(n != 0 && lengths.len() >= 2);
     if n == 1 {
         let symbol = lengths.iter().position(|&length| length != 0).unwrap();
         lengths[symbol] = 1;
         let phantom = usize::from(symbol == 0);
-        if phantom < lengths.len() {
-            lengths[phantom] = 1;
-        }
+        lengths[phantom] = 1;
         return;
     }
     let k = (usize::BITS - (n - 1).leading_zeros()) as u8;
@@ -71,6 +72,7 @@ pub(crate) fn assign_flat_complete_code(lengths: &mut [u8]) {
     }
 }
 
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn lengths_for_frequencies(frequencies: &[usize], max_bits: u8) -> Vec<u8> {
     lengths_with_allowance(frequencies, max_bits, &Allowance::default())
         .expect("unlimited Huffman allocation")
@@ -211,10 +213,13 @@ fn uniform_lengths_into(lengths: &mut [u8], frequencies: &[usize]) {
 /// complete. Package-merge would be optimal; this is within a fraction of a
 /// percent of it and much shorter.
 fn limit_code_lengths(lengths: &mut [u8], frequencies: &[usize], max_bits: u8) {
+    // Writers use the format's 15-bit limit. The generic limiter requires a
+    // positive limit representable as a prefix-space size on this host.
+    debug_assert!((1..usize::BITS as u8).contains(&max_bits));
     // No prefix code over this many symbols fits in this many bits however it
     // is arranged, so there is nothing to repair towards.
     let used = lengths.iter().filter(|&&length| length != 0).count();
-    if max_bits == 0 || max_bits >= usize::BITS as u8 || used > (1usize << max_bits) {
+    if used > (1usize << max_bits) {
         uniform_lengths_into(lengths, frequencies);
         return;
     }
@@ -234,12 +239,13 @@ fn limit_code_lengths(lengths: &mut [u8], frequencies: &[usize], max_bits: u8) {
         .sum();
 
     while sum > target {
-        let Some(symbol) = (0..lengths.len())
+        // If every used length were max_bits, sum would equal used, which
+        // the capacity check above bounds by target. An overfull code must
+        // therefore have a symbol whose length can still be increased.
+        let symbol = (0..lengths.len())
             .filter(|&symbol| lengths[symbol] != 0 && lengths[symbol] < max_bits)
             .min_by_key(|&symbol| (frequencies[symbol], std::cmp::Reverse(lengths[symbol])))
-        else {
-            break;
-        };
+            .expect("overfull prefix code has a short symbol");
         sum -= 1u64 << (max_bits - lengths[symbol] - 1);
         lengths[symbol] += 1;
     }
@@ -254,6 +260,7 @@ fn limit_code_lengths(lengths: &mut [u8], frequencies: &[usize], max_bits: u8) {
     }
 }
 
+#[cfg(feature = "write")]
 pub(crate) fn lengths_for_frequency_array<const N: usize>(
     frequencies: &[usize; N],
     max_bits: u8,
@@ -381,19 +388,28 @@ mod tests {
             let next = frequencies[frequencies.len() - 1] + frequencies[frequencies.len() - 2];
             frequencies.push(next);
         }
-        let lengths = lengths_for_frequencies(&frequencies, 15);
+        let mut sparse = vec![0; 306];
+        for (symbol, &frequency) in frequencies.iter().enumerate() {
+            sparse[symbol * 7 + 3] = frequency;
+        }
+        for frequencies in [frequencies, sparse] {
+            let lengths = lengths_for_frequencies(&frequencies, 15);
 
-        assert!(lengths.iter().all(|&length| length <= 15), "{lengths:?}");
-        assert!(is_complete_code(&lengths), "{lengths:?}");
-        // A flat code over forty symbols is six bits each, and on frequencies
-        // this skewed the limited code has to beat that.
-        let flat: usize = frequencies.iter().sum::<usize>() * 6;
-        let limited: usize = frequencies
-            .iter()
-            .zip(&lengths)
-            .map(|(&frequency, &length)| frequency * usize::from(length))
-            .sum();
-        assert!(limited < flat, "limited {limited} flat {flat}");
+            assert!(lengths.iter().all(|&length| length <= 15), "{lengths:?}");
+            assert!(is_complete_code(&lengths), "{lengths:?}");
+            for (&frequency, &length) in frequencies.iter().zip(&lengths) {
+                assert_eq!(frequency == 0, length == 0);
+            }
+            // A flat code over forty symbols is six bits each, and on frequencies
+            // this skewed the limited code has to beat that.
+            let flat: usize = frequencies.iter().sum::<usize>() * 6;
+            let limited: usize = frequencies
+                .iter()
+                .zip(&lengths)
+                .map(|(&frequency, &length)| frequency * usize::from(length))
+                .sum();
+            assert!(limited < flat, "limited {limited} flat {flat}");
+        }
     }
 
     #[test]
@@ -452,6 +468,96 @@ mod tests {
             .map(|&len| 1u64 << (max_len - len))
             .sum();
         sum == (1u64 << max_len)
+    }
+
+    #[test]
+    fn flat_codes_complete_every_small_nonempty_symbol_subset() {
+        for slots in 2..=8 {
+            for mask in 1usize..1 << slots {
+                let mut lengths: Vec<_> = (0..slots)
+                    .map(|symbol| if mask & (1 << symbol) != 0 { 7 } else { 0 })
+                    .collect();
+                assign_flat_complete_code(&mut lengths);
+                let used = mask.count_ones() as usize;
+                assert_eq!(lengths.iter().filter(|&&n| n != 0).count(), used.max(2));
+                for (symbol, &length) in lengths.iter().enumerate() {
+                    if mask & (1 << symbol) != 0 {
+                        assert_ne!(length, 0);
+                    } else if used > 1 {
+                        assert_eq!(length, 0);
+                    }
+                }
+                // Count concrete fixed-width bit strings owned by each code
+                // length. A complete prefix code fills the entire space.
+                let deepest = lengths.iter().copied().max().unwrap();
+                let mut ordered: Vec<_> = lengths.iter().copied().filter(|&n| n != 0).collect();
+                ordered.sort_unstable();
+                let mut next = 0usize;
+                for length in ordered {
+                    let width = 1usize << (deepest - length);
+                    assert_eq!(next % width, 0);
+                    next += width;
+                }
+                assert_eq!(next, 1 << deepest);
+                let shallowest = lengths.iter().copied().filter(|&n| n != 0).min().unwrap();
+                assert!(deepest - shallowest <= 1);
+            }
+        }
+    }
+
+    #[test]
+    fn small_alphabets_have_non_overlapping_canonical_codes() {
+        for symbols in 2u32..=7 {
+            for mut pattern in 0..3usize.pow(symbols) {
+                let frequencies: Vec<_> = (0..symbols)
+                    .map(|_| {
+                        let frequency = pattern % 3;
+                        pattern /= 3;
+                        frequency
+                    })
+                    .collect();
+                let used = frequencies
+                    .iter()
+                    .filter(|&&frequency| frequency != 0)
+                    .count();
+                for max_bits in 1..=4 {
+                    let lengths = lengths_for_frequencies(&frequencies, max_bits);
+                    for (&frequency, &length) in frequencies.iter().zip(&lengths) {
+                        assert_eq!(frequency == 0, length == 0);
+                    }
+                    if used > 1usize << max_bits {
+                        // An impossible limit retains the documented uniform fallback.
+                        let uniform = (usize::BITS - (used - 1).leading_zeros()) as u8;
+                        assert!(lengths
+                            .iter()
+                            .all(|&length| length == 0 || length == uniform));
+                    } else {
+                        assert!(lengths.iter().all(|&length| length <= max_bits));
+                    }
+
+                    // Assign canonical integers independently, then occupy every
+                    // suffix below each prefix. No two symbols may share a slot.
+                    let depth = lengths.iter().copied().max().unwrap_or(0);
+                    let mut occupied = vec![false; 1usize << depth];
+                    let mut ordered: Vec<_> = lengths.iter().copied().filter(|&n| n != 0).collect();
+                    ordered.sort_unstable();
+                    let mut code = 0usize;
+                    let mut previous = 0;
+                    for length in ordered {
+                        code <<= length - previous;
+                        let start = code << (depth - length);
+                        let end = start + (1usize << (depth - length));
+                        assert!(end <= occupied.len(), "{frequencies:?}: {lengths:?}");
+                        for slot in &mut occupied[start..end] {
+                            assert!(!*slot, "{frequencies:?}: {lengths:?}");
+                            *slot = true;
+                        }
+                        code += 1;
+                        previous = length;
+                    }
+                }
+            }
+        }
     }
 
     #[test]

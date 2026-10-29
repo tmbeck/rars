@@ -21,6 +21,18 @@ def headers(data):
         offset += size + packed
 
 
+def service_headers(data, name):
+    """Select a service by its wire name, independently of producer records."""
+    for header in headers(data):
+        offset, kind, flags, _ = header
+        if kind != 0x7a:
+            continue
+        length = struct.unpack_from("<H", data, offset + 26)[0]
+        name_at = offset + 32 + (8 if flags & 0x100 else 0)
+        if data[name_at:name_at + length] == name:
+            yield header
+
+
 def file_metadata(data):
     result = []
     for offset, kind, _, _ in headers(data):

@@ -6,7 +6,7 @@ import zlib
 import pytest
 import rars
 
-from test_rewrite_legacy import ROOT, headers
+from test_rewrite_legacy import ROOT, headers, service_headers
 
 
 @pytest.mark.parametrize("format", ["rar20", "rar29", "rar30", "rar40"])
@@ -121,8 +121,8 @@ def test_reference_rar300_comment_survives_native_rewrite(tmp_path):
     assert output.comment == source.comment
     original = (ROOT / "crates/rars/tests/fixtures/rar15_40/rar300/with_comment_rar300.rar").read_bytes()
     rewritten = destination.read_bytes()
-    before = next(offset for offset, kind, _, _ in headers(original) if kind == 0x7a)
-    after = next(offset for offset, kind, _, _ in headers(rewritten) if kind == 0x7a)
+    before = next(offset for offset, _, _, _ in service_headers(original, b"CMT"))
+    after = next(offset for offset, _, _, _ in service_headers(rewritten, b"CMT"))
     assert rewritten[after + 20:after + 24] == original[before + 20:before + 24]
     assert rewritten[after + 15] == original[before + 15]
     for name in source.namelist():
@@ -137,7 +137,7 @@ def test_unsupported_cmt_service_layout_is_rejected(damage):
     builder = rars.RarBuilder(format="rar30", comment=b"comment")
     builder.add_bytes(b"payload", "file")
     data = bytearray(builder.to_bytes())
-    offset, _, flags, size = next(h for h in headers(data) if h[1] == 0x7a)
+    offset, _, flags, size = next(service_headers(data, b"CMT"))
     packed = struct.unpack_from("<I", data, offset + 7)[0]
     block = data[offset:offset + size + packed]
     if damage == "duplicate":

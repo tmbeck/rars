@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 #[path = "support/scratch.rs"]
 mod scratch;
 
@@ -426,8 +428,8 @@ fn forced_rar29_lz_round_trips_with_each_filter_policy() {
         FilterPolicy::Auto,
         FilterPolicy::explicit(FilterKind::E8),
     ] {
-        let bytes = write_rar29_compressed_archive_with_filter_policy(&entries, options, policy)
-            .unwrap();
+        let bytes =
+            write_rar29_compressed_archive_with_filter_policy(&entries, options, policy).unwrap();
         let archive = Archive::parse(&bytes).unwrap();
         assert_eq!(collect_extract(&archive).unwrap()[0].data, payload);
     }
@@ -449,12 +451,9 @@ fn forced_rar29_lz_stores_unprofitable_and_empty_members() {
         let options = WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only())
             .with_method(Rar29Method::Lz);
         for policy in [FilterPolicy::None, FilterPolicy::Auto] {
-            let bytes = write_rar29_compressed_archive_with_filter_policy(
-                &entries,
-                options,
-                policy,
-            )
-            .unwrap();
+            let bytes =
+                write_rar29_compressed_archive_with_filter_policy(&entries, options, policy)
+                    .unwrap();
             let archive = Archive::parse(&bytes).unwrap();
             let file = archive.files().next().unwrap();
             assert_eq!(file.method, 0x30);
@@ -1764,7 +1763,12 @@ fn extracts_stored_newsub_comments_with_and_without_encryption() {
         bytes[start..start + 2].copy_from_slice(&crc.to_le_bytes());
         let archive = Archive::parse(&bytes).unwrap();
         assert!(archive.files().next().is_none());
-        assert!(archive.new_subs().next().unwrap().file.is_stored());
+        assert!(archive
+            .new_subs()
+            .find(|sub| sub.file.name != b"RARS")
+            .unwrap()
+            .file
+            .is_stored());
         let options = ArchiveReadOptions::with_optional_password(password);
         assert_eq!(
             archive
@@ -1824,7 +1828,10 @@ fn extracts_compressed_legacy_comment_blocks_with_rar15_and_rar20_coding() {
         .unwrap();
         let archive = Archive::parse(&original).unwrap();
         let file = archive.files().next().unwrap();
-        assert!(!file.is_stored(), "{version:?} must exercise comment decoding");
+        assert!(
+            !file.is_stored(),
+            "{version:?} must exercise comment decoding"
+        );
         let packed = file.packed_data(&archive).unwrap();
         let mut comment = vec![0, 0, 0x75, 0, 0];
         comment.extend_from_slice(&((13 + packed.len()) as u16).to_le_bytes());
@@ -2319,7 +2326,10 @@ fn writes_rar3_newsub_archive_comment_that_reader_decodes() {
 
         let archive = Archive::parse(&bytes).unwrap();
         assert!(!archive.main.has_archive_comment());
-        let subblocks: Vec<_> = archive.new_subs().collect();
+        let subblocks: Vec<_> = archive
+            .new_subs()
+            .filter(|sub| sub.file.name != b"RARS")
+            .collect();
         assert_eq!(subblocks.len(), 1);
         assert_eq!(subblocks[0].kind, NewSubKind::ArchiveComment);
         assert_eq!(subblocks[0].file.name, b"CMT");
@@ -2509,10 +2519,13 @@ fn stored_writer_refuses_solid_option_before_emitting_members() {
         ArchiveVersion::Rar29,
         ArchiveVersion::Rar40,
     ] {
-        assert!(matches!(
-            write_stored_archive(&entries, WriterOptions::new(target, features)),
-            Err(Error::UnsupportedWriterOption { .. })
-        ), "{target:?}");
+        assert!(
+            matches!(
+                write_stored_archive(&entries, WriterOptions::new(target, features)),
+                Err(Error::UnsupportedWriterOption { .. })
+            ),
+            "{target:?}"
+        );
     }
 }
 
@@ -2552,7 +2565,10 @@ fn later_legacy_solid_level_zero_stores_each_member() {
         )
         .unwrap();
         let archive = Archive::parse(&bytes).unwrap();
-        assert!(archive.files().all(|file| file.method == 0x30), "{target:?}");
+        assert!(
+            archive.files().all(|file| file.method == 0x30),
+            "{target:?}"
+        );
         let extracted = collect_extract(&archive).unwrap();
         assert_eq!(extracted[0].data, entries[0].data, "{target:?}");
         assert_eq!(extracted[1].data, entries[1].data, "{target:?}");
@@ -4910,14 +4926,17 @@ fn solid_compressed_volume_sets_keep_the_solid_main_flag() {
             password: encrypted_headers.then_some(b"password".as_slice()),
             file_comment: None,
         };
-        let parts = write_compressed_volumes(entry, WriterOptions::new(target, features), 24)
-            .unwrap();
+        let parts =
+            write_compressed_volumes(entry, WriterOptions::new(target, features), 24).unwrap();
         assert!(parts.len() > 1, "{target:?}");
         let archives: Vec<_> = parts
             .iter()
             .map(|part| Archive::parse_with_password(part, entry.password).unwrap())
             .collect();
-        assert!(archives.iter().all(|archive| archive.main.is_solid()), "{target:?}");
+        assert!(
+            archives.iter().all(|archive| archive.main.is_solid()),
+            "{target:?}"
+        );
         let extracted = collect_extract_volumes_with_password(&archives, entry.password).unwrap();
         assert_eq!(extracted[0].data, data, "{target:?}");
     }
@@ -4939,7 +4958,10 @@ fn compressed_rar29_volumes_keep_requested_dictionary_size() {
         .with_dictionary_size(2 * 1024 * 1024);
     let parts = write_compressed_volumes(entry, options, 24).unwrap();
     assert!(parts.len() > 1);
-    let archives: Vec<_> = parts.iter().map(|part| Archive::parse(part).unwrap()).collect();
+    let archives: Vec<_> = parts
+        .iter()
+        .map(|part| Archive::parse(part).unwrap())
+        .collect();
     assert!(archives
         .iter()
         .all(|archive| archive.files().next().unwrap().block.flags & 0x00e0 == 0x00a0));
@@ -5418,7 +5440,15 @@ fn extracts_rars_generated_rar15_comments_and_encryption_oracles() {
         collect_extract(&comment_archive).unwrap()[0].data,
         RARS_GENERATED_PAYLOAD
     );
-    assert_eq!(comment_bytes, rars_generated_comments_archive());
+    let mut generated = rars_generated_comments_archive();
+    let generated_archive = Archive::parse(&generated).unwrap();
+    let producer = generated_archive.new_subs().next().unwrap();
+    assert_eq!(producer.file.name, b"RARS");
+    assert_eq!(producer.file.unp_ver, 15);
+    // Keep the old unmarked fixture as a reader oracle. Apart from the new
+    // producer record, the archive and file comment bytes must stay identical.
+    generated.drain(producer.file.block.offset..producer.file.packed_range.end);
+    assert_eq!(comment_bytes, generated);
 
     let encrypted_bytes = std::fs::read(fixture("rars_generated/encrypted.rar")).unwrap();
     let encrypted_archive = Archive::parse(&encrypted_bytes).unwrap();
@@ -5508,7 +5538,10 @@ fn parses_rar300_comment_subblock_and_stored_file() {
     assert_eq!(archive.sfx_offset, 0);
     assert_eq!(archive.main.flags, 0);
 
-    let subblocks: Vec<_> = archive.new_subs().collect();
+    let subblocks: Vec<_> = archive
+        .new_subs()
+        .filter(|sub| sub.file.name != b"RARS")
+        .collect();
     assert_eq!(subblocks.len(), 1);
     assert_eq!(subblocks[0].kind, NewSubKind::ArchiveComment);
     assert_eq!(subblocks[0].file.name, b"CMT");
@@ -6374,7 +6407,9 @@ fn rar250_repair_rejects_inconsistent_public_protection_metadata() {
 
     assert!(matches!(
         archive.repair_protect_head(),
-        Err(Error::InvalidHeader("RAR 2.x recovery data size is invalid"))
+        Err(Error::InvalidHeader(
+            "RAR 2.x recovery data size is invalid"
+        ))
     ));
 }
 
@@ -6436,7 +6471,10 @@ fn intact_rar300_recovery_record_leaves_archive_unchanged() {
 fn preserves_unknown_rar300_service_records_without_hiding_files() {
     let mut bytes = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
     let original = Archive::parse(&bytes).unwrap();
-    let recovery = original.new_subs().next().unwrap();
+    let recovery = original
+        .new_subs()
+        .find(|sub| sub.file.name != b"RARS")
+        .unwrap();
     let start = recovery.file.block.offset;
     let name_start = start + 32;
     assert_eq!(&bytes[name_start..name_start + 2], b"RR");
@@ -6445,7 +6483,7 @@ fn preserves_unknown_rar300_service_records_without_hiding_files() {
 
     let parsed = Archive::parse(&bytes).unwrap();
     assert!(matches!(
-        parsed.new_subs().next().unwrap().kind,
+        parsed.new_subs().find(|sub| sub.file.name != b"RARS").unwrap().kind,
         NewSubKind::Unknown(ref name) if name == b"XY"
     ));
     assert_eq!(parsed.files().count(), original.files().count());
@@ -6486,9 +6524,7 @@ fn rar300_repair_rejects_inconsistent_public_recovery_metadata() {
             .blocks
             .iter_mut()
             .find_map(|block| match block {
-                Block::NewSub(sub) if sub.kind == NewSubKind::RecoveryRecord => {
-                    Some(&mut sub.file)
-                }
+                Block::NewSub(sub) if sub.kind == NewSubKind::RecoveryRecord => Some(&mut sub.file),
                 _ => None,
             })
             .unwrap()
@@ -7304,7 +7340,10 @@ fn rejects_split_rar15_40_entries_until_volume_reassembly_exists() {
     ] {
         let bytes = std::fs::read(fixture(path)).unwrap();
         let archive = Archive::parse(&bytes).unwrap();
-        assert_eq!(archive.files().next().unwrap().is_split_before(), split_before);
+        assert_eq!(
+            archive.files().next().unwrap().is_split_before(),
+            split_before
+        );
         assert!(matches!(
             collect_extract(&archive),
             Err(Error::InvalidHeader(

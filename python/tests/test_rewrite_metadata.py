@@ -151,7 +151,9 @@ def test_rewrite_rejects_unix_special_file_modes(kind):
 def test_legacy_rewrite_uses_extractions_local_zone_and_odd_second(tmp_path, zone):
     source = ROOT / "crates/rars/tests/fixtures/rar15_40/rar420/ext_time_rar420.rar"
     rewritten = tmp_path / "rewritten.rar"
-    env = dict(os.environ, TZDIR=str(ROOT / "crates/rars/tests/fixtures/tz"), TZ=zone)
+    # Native timezone handling on macOS does not honor TZDIR.
+    zone_file = ROOT / "crates/rars/tests/fixtures/tz" / zone
+    env = dict(os.environ, TZ=f":{zone_file.resolve()}")
     # Zone state is cached once per process, just as in CLI extraction.
     subprocess.run(
         [sys.executable, "-c", "import rars,sys; rars.RarBuilder.from_archive(sys.argv[1], preserve=False).write(sys.argv[2])",

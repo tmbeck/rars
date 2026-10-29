@@ -1,6 +1,7 @@
+#[cfg(feature = "encryption")]
 use zeroize::ZeroizeOnDrop;
 
-#[derive(ZeroizeOnDrop)]
+#[cfg_attr(feature = "encryption", derive(ZeroizeOnDrop))]
 pub struct Rar13Cipher {
     key: [u8; 3],
 }
@@ -11,6 +12,7 @@ pub struct Rar13DecryptReader<R> {
 }
 
 impl Rar13Cipher {
+    #[cfg(feature = "encryption")]
     pub fn new(password: &[u8]) -> Self {
         let password = crate::crypto::clamp_password(password);
         let mut key = [0u8; 3];
@@ -22,10 +24,25 @@ impl Rar13Cipher {
         Self { key }
     }
 
+    pub(crate) fn for_password(password: &[u8]) -> crate::Result<Self> {
+        #[cfg(feature = "encryption")]
+        {
+            Ok(Self::new(password))
+        }
+        #[cfg(not(feature = "encryption"))]
+        {
+            let _ = password;
+            Err(crate::Error::FeatureDisabled {
+                feature: "encryption",
+            })
+        }
+    }
+
     pub fn new_comment() -> Self {
         Self { key: [0, 7, 77] }
     }
 
+    #[cfg(any(test, feature = "write"))]
     pub fn encrypt_in_place(mut self, data: &mut [u8]) {
         for byte in data {
             *byte = self.encrypt_byte(*byte);
@@ -38,6 +55,7 @@ impl Rar13Cipher {
         }
     }
 
+    #[cfg(any(test, feature = "write"))]
     pub fn encrypt_byte(&mut self, byte: u8) -> u8 {
         self.advance();
         byte.wrapping_add(self.key[0])
@@ -70,7 +88,7 @@ impl<R: std::io::Read> std::io::Read for Rar13DecryptReader<R> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "encryption"))]
 mod tests {
     use super::Rar13Cipher;
 

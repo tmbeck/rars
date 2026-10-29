@@ -109,11 +109,12 @@ impl Archive {
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod native {
     use super::*;
+    use crate::atomic64::AtomicU64;
     use crate::{
         streaming::Spool, Error, ExtractionDecision, WriteOperation, WriteProgress,
         WriteProgressEvent, WriterResources,
     };
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
     use std::{
         cell::{Cell, RefCell},
         collections::BTreeMap,
@@ -130,17 +131,27 @@ mod native {
     impl Write for Sink {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             let count = bytes.len() as u64;
-            self.used
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                    used.checked_add(count)
-                        .filter(|required| *required <= self.limit)
-                })
-                .map_err(|used| {
-                    std::io::Error::other(Error::RewriteStagingLimitExceeded {
+            let mut used = self.used.load(Ordering::Acquire);
+            loop {
+                let Some(required) = used
+                    .checked_add(count)
+                    .filter(|required| *required <= self.limit)
+                else {
+                    return Err(std::io::Error::other(Error::RewriteStagingLimitExceeded {
                         limit: self.limit,
                         required: used.saturating_add(count),
-                    })
-                })?;
+                    }));
+                };
+                match self.used.compare_exchange_weak(
+                    used,
+                    required,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => used = actual,
+                }
+            }
             let written = match self.spool.borrow_mut().write(bytes) {
                 Ok(written) => written,
                 Err(error) => {

@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::{Archive, ArchiveReader, ArchiveVersion, Builder};
 
 fn archive(size: usize) -> rars::rar50::Archive {
@@ -472,17 +474,14 @@ fn filtered_output_is_counted_once_and_limits_remain_distinct() {
             err.root_cause(),
             Error::MemberOutputLimitExceeded { .. } | Error::TotalOutputLimitExceeded { .. }
         ));
-        let err = a
-            .extract_to_with_options(
-                output_options(ArchiveReadOptions::new(), size, total)
-                    .with_rar50_buffered_decode_limit(0),
-                |_| Ok(Box::new(std::io::sink())),
-            )
-            .unwrap_err();
-        assert!(matches!(
-            err.root_cause(),
-            Error::Rar50BufferedDecodeLimitExceeded { .. }
-        ));
+        let streamed = Rc::new(RefCell::new(Vec::new()));
+        a.extract_to_with_options(
+            output_options(ArchiveReadOptions::new(), size, total)
+                .with_rar50_buffered_decode_limit(0),
+            |_| Ok(Box::new(Capture(streamed.clone()))),
+        )
+        .unwrap();
+        assert_eq!(*streamed.borrow(), *expected.borrow());
     }
 }
 

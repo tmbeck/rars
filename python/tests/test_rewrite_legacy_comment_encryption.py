@@ -6,7 +6,7 @@ import zlib
 import pytest
 import rars
 
-from test_rewrite_legacy import headers
+from test_rewrite_legacy import headers, service_headers
 from test_rewrite_older import check_unrar
 
 
@@ -74,7 +74,7 @@ def test_encrypted_archive_comment_retains_password_with_plain_members(tmp_path)
     assert output.comment == source.comment
     assert not output.getinfo("plain").is_encrypted
     assert output.read("plain") == b"public"
-    assert next(flags for _, kind, flags, _ in headers(data) if kind == 0x7a) & 0x404 == 0x404
+    assert next(flags for _, _, flags, _ in service_headers(data, b"CMT")) & 0x404 == 0x404
     with pytest.raises(rars.PasswordRequired):
         rars.RarFile.from_bytes(data).comment
     check_unrar(tmp_path, data)

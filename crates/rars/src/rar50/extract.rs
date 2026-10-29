@@ -1,21 +1,30 @@
 #[path = "scratch.rs"]
 mod scratch;
 use super::{blake2sp, Archive, ExtractedEntryMeta, FileHeader, FileRedirection};
-use crate::codec::rar50::{DecodeMode, DecodedChunk, ReaderState, StreamDecodeError};
+use crate::codec::rar50::{
+    DecodeMode, DecodedChunk, HistoryRetention, ReaderState, StreamDecodeError,
+};
 use crate::codec::workspace::{Allowance, Boxed, Budget, Buffer};
 use crate::crc32::{crc32, Crc32};
-use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
+#[cfg(feature = "encryption")]
+use crate::crypto::rar50::Rar50Cipher;
+use crate::crypto::rar50::Rar50Keys;
 use crate::error::{Error, Result};
 use crate::volume_extract::{ChainedReader, SplitVolumeState, SplitVolumeStep};
 use std::io::{Read, Write};
 
-// Filtered RAR5 members still need whole-member byte transforms. Members at or
-// below this boundary use the buffered path, while larger members stream once
-// and reject filtered streams through the codec's typed sentinel.
+// Members at or below this boundary use the buffered path, while larger members
+// stream once. The streaming decoder applies filters in place and rejects only a
+// filter it cannot hold (longer than unrar's 4 MiB block, out of order, or past
+// unrar's 8192 pending filters) through the codec's typed sentinel.
 #[cfg(not(test))]
 const BUFFERED_DECODE_LIMIT: u64 = 512 * 1024 * 1024;
 #[cfg(test)]
 const BUFFERED_DECODE_LIMIT: u64 = 1024;
+
+#[cfg(all(test, feature = "write"))]
+#[path = "streaming_checks_tests.rs"]
+mod streaming_checks_tests;
 
 impl FileHeader {
     fn check_output_limit(&self, budget: &crate::output_limit::OutputBudget) -> Result<()> {
@@ -55,27 +64,39 @@ impl FileHeader {
     }
 
     fn encryption_keys(&self, password: Option<&[u8]>) -> Result<Rar50Keys> {
-        // Both callers have already selected an encrypted member.
-        if let Some(crypto) = &self.crypto {
-            return Ok(crypto.keys.clone());
+        #[cfg(not(feature = "encryption"))]
+        {
+            let _ = (self, password);
+            Err(Error::FeatureDisabled {
+                feature: "encryption",
+            })
         }
-        let password = password.ok_or(Error::NeedPassword)?;
-        let encryption = self.encryption.as_ref().ok_or(Error::InvalidHeader(
-            "RAR 5 encrypted file is missing encryption record",
-        ))?;
-        if encryption.version != 0 {
-            return Err(Error::UnsupportedFeature {
-                version: crate::version::ArchiveVersion::Rar50,
-                feature: "RAR 5 unknown file encryption version",
-            });
-        }
-        let keys = Rar50Keys::derive(password, encryption.salt, encryption.kdf_count)
-            .map_err(super::map_rar50_crypto_error)?;
-        if let Some(check_value) = encryption.check_value {
-            keys.check_password(&check_value)
+        #[cfg(feature = "encryption")]
+        {
+            crate::crypto::require_encryption()?;
+
+            // Both callers have already selected an encrypted member.
+            if let Some(crypto) = &self.crypto {
+                return Ok(crypto.keys.clone());
+            }
+            let password = password.ok_or(Error::NeedPassword)?;
+            let encryption = self.encryption.as_ref().ok_or(Error::InvalidHeader(
+                "RAR 5 encrypted file is missing encryption record",
+            ))?;
+            if encryption.version != 0 {
+                return Err(Error::UnsupportedFeature {
+                    version: crate::version::ArchiveVersion::Rar50,
+                    feature: "RAR 5 unknown file encryption version",
+                });
+            }
+            let keys = Rar50Keys::derive(password, encryption.salt, encryption.kdf_count)
                 .map_err(super::map_rar50_crypto_error)?;
+            if let Some(check_value) = encryption.check_value {
+                keys.check_password(&check_value)
+                    .map_err(super::map_rar50_crypto_error)?;
+            }
+            Ok(keys)
         }
-        Ok(keys)
     }
 
     fn encryption_iv(&self) -> Result<[u8; 16]> {
@@ -126,13 +147,13 @@ impl FileHeader {
         let keys = self.encryption_keys(password)?;
         let iv = self.encryption_iv()?;
         let reader = Boxed::try_new(
-            || Ok::<_, crate::codec::Error>(Rar50DecryptingReader::new(reader, keys.key, iv)),
+            || Rar50DecryptingReader::with_keys(reader, keys.key, iv),
             allowance,
         )?;
         Ok((PackedReader::Encrypted(reader), Some(keys)))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write", feature = "encryption"))]
     fn packed_reader_with_password<'a>(
         &self,
         archive: &'a Archive,
@@ -161,6 +182,10 @@ impl FileHeader {
             .is_some_and(|hash| hash.hash_type == 0 && hash.data.len() == 32)
     }
 
+    fn needs_crc32(&self) -> bool {
+        self.data_crc32.is_some() && !self.blake2sp_supersedes_crc32()
+    }
+
     pub(super) fn verify_integrity_with_keys(
         &self,
         data: &[u8],
@@ -175,7 +200,7 @@ impl FileHeader {
                 let keys = keys.ok_or(Error::InvalidHeader(
                     "RAR 5 encrypted hash MAC needs encryption keys",
                 ))?;
-                keys.mac_crc32(actual)
+                keys.checked_crc_mac(actual)?
             } else {
                 actual
             };
@@ -194,7 +219,7 @@ impl FileHeader {
                     let keys = keys.ok_or(Error::InvalidHeader(
                         "RAR 5 encrypted hash MAC needs encryption keys",
                     ))?;
-                    keys.mac_hash32(actual)
+                    keys.checked_hash_mac(actual)?
                 } else {
                     actual
                 };
@@ -225,7 +250,7 @@ impl FileHeader {
                 let keys = keys.ok_or(Error::InvalidHeader(
                     "RAR 5 encrypted hash MAC needs encryption keys",
                 ))?;
-                keys.mac_crc32(crc.finish())
+                keys.checked_crc_mac(crc.finish())?
             } else {
                 crc.finish()
             };
@@ -239,7 +264,7 @@ impl FileHeader {
                 let keys = keys.ok_or(Error::InvalidHeader(
                     "RAR 5 encrypted hash MAC needs encryption keys",
                 ))?;
-                keys.mac_hash32(hasher.finalize())
+                keys.checked_hash_mac(hasher.finalize())?
             } else {
                 hasher.finalize()
             };
@@ -305,7 +330,7 @@ impl FileHeader {
         session.write_file_to(archive, self, out)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     pub(crate) fn decoded_data_unverified(
         &self,
         archive: &Archive,
@@ -318,6 +343,7 @@ impl FileHeader {
             .into_vec())
     }
 
+    #[cfg(feature = "recovery")]
     pub(super) fn decoded_recovery_data(
         &self,
         archive: &Archive,
@@ -430,13 +456,28 @@ impl FileHeader {
         decoder: &mut ReaderState<B>,
         password: Option<&[u8]>,
     ) -> Result<DecodedData<B>> {
+        self.decoded_data_with_decoder_and_history(
+            archive,
+            decoder,
+            password,
+            HistoryRetention::Retain,
+        )
+    }
+
+    fn decoded_data_with_decoder_and_history<B: Budget>(
+        &self,
+        archive: &Archive,
+        decoder: &mut ReaderState<B>,
+        password: Option<&[u8]>,
+        history: HistoryRetention,
+    ) -> Result<DecodedData<B>> {
         let (packed, keys) = self.packed_data_with_allowance(
             archive,
             password,
             &decoder.read_control,
             &decoder.allowance(),
         )?;
-        let data = self.decode_packed_owned(&packed, decoder)?;
+        let data = self.decode_packed_owned(&packed, decoder, history)?;
         Ok(DecodedData { data, keys })
     }
 
@@ -444,6 +485,7 @@ impl FileHeader {
         &self,
         packed: &[u8],
         decoder: &mut ReaderState<B>,
+        history: HistoryRetention,
     ) -> Result<Buffer<u8, B>> {
         if self.is_stored() {
             if self.encrypted {
@@ -455,11 +497,9 @@ impl FileHeader {
                         "RAR 5 encrypted stored file is shorter than unpacked size",
                     ));
                 }
-                if packed[unpacked_size..].iter().any(|&byte| byte != 0) {
-                    return Err(Error::InvalidHeader(
-                        "RAR 5 encrypted stored file has non-zero padding",
-                    ));
-                }
+                // The cipher block's padding holds whatever the packer left
+                // there; WinRAR leaves random bytes, and unrar writes the
+                // unpacked size without reading them.
                 return Buffer::copied(&packed[..unpacked_size], &decoder.allowance())
                     .map_err(Error::from);
             }
@@ -482,18 +522,40 @@ impl FileHeader {
         })?;
         let output_size = checked_unpacked_size(self.unpacked_size)?;
         decoder
-            .decode_member_with_dictionary(
+            .decode_member_with_dictionary_and_history(
                 packed,
                 info.algorithm_version,
                 output_size,
                 dictionary_size,
                 info.solid,
                 DecodeMode::Lz,
+                history,
             )
             .map_err(Error::from)
     }
 
     fn stream_packed_with_decoder<R: Read, B: Budget>(
+        &self,
+        packed: &mut R,
+        keys: Option<&Rar50Keys>,
+        decoder: &mut ReaderState<B>,
+        buffered_decode_limit: u64,
+        scratch_policy: Option<&crate::Rar50Scratch>,
+        writer: &mut dyn Write,
+    ) -> Result<()> {
+        // Split members retain their existing checksum work. Only ordinary
+        // members select the optional policy, independently of scratch decoding.
+        self.stream_packed_with_crc_policy::<false, _, _>(
+            packed,
+            keys,
+            decoder,
+            buffered_decode_limit,
+            scratch_policy,
+            writer,
+        )
+    }
+
+    fn stream_packed_with_crc_policy<const OPTIONAL_CRC: bool, R: Read, B: Budget>(
         &self,
         packed: &mut R,
         keys: Option<&Rar50Keys>,
@@ -513,6 +575,7 @@ impl FileHeader {
         let output_size = usize::try_from(self.unpacked_size)
             .map_err(|_| Error::InvalidHeader("RAR 5 unpacked size overflows host address size"))?;
         let mut crc = Crc32::new();
+        let check_crc = !OPTIONAL_CRC || self.needs_crc32();
         let mut hash = streaming_hash_verifier(self)?;
         decoder
             .decode_member_from_reader_with_dictionary_to_sink(
@@ -523,14 +586,24 @@ impl FileHeader {
                 info.solid,
                 |chunk| match chunk {
                     DecodedChunk::Bytes(chunk) => {
-                        crc.update(chunk);
+                        if check_crc {
+                            #[cfg(all(test, feature = "write"))]
+                            streaming_checks_tests::record_crc_work(chunk.len(), false);
+                            crc.update(chunk);
+                        }
                         if let Some((_, hasher)) = &mut hash {
                             hasher.update(chunk);
                         }
                         writer.write_all(chunk)
                     }
                     DecodedChunk::Repeated { byte, len } => {
-                        write_repeated_chunk(writer, &mut crc, &mut hash, byte, len)
+                        if check_crc {
+                            write_repeated_chunk(writer, &mut crc, &mut hash, byte, len)
+                        } else {
+                            write_repeated_chunk_with_optional_crc(
+                                writer, None, &mut hash, byte, len,
+                            )
+                        }
                     }
                 },
             )
@@ -562,6 +635,7 @@ impl FileHeader {
             .packed_reader_with_allowance(archive, password, allowance)
             .map_err(|error| self.entry_error("decoding", error))?;
         let mut crc = Crc32::new();
+        let check_crc = self.needs_crc32();
         let mut hash =
             streaming_hash_verifier(self).map_err(|error| self.entry_error("decoding", error))?;
         let mut written = 0u64;
@@ -578,17 +652,17 @@ impl FileHeader {
             let remaining =
                 usize::try_from(self.unpacked_size.saturating_sub(written)).unwrap_or(usize::MAX);
             let chunk_len = count.min(remaining);
+            // Past the unpacked size is the cipher block's padding, which
+            // may hold any bytes; only the unpacked bytes are written.
             let chunk = &buf[..chunk_len];
-            if self.encrypted && buf[chunk_len..count].iter().any(|&byte| byte != 0) {
-                return Err(self.entry_error(
-                    "decoding",
-                    Error::InvalidHeader("RAR 5 encrypted stored file has non-zero padding"),
-                ));
-            }
             // chunk_len is bounded by unpacked_size - written, so this sum
             // cannot exceed the declared u64 size, including u64::MAX.
             written += chunk.len() as u64;
-            crc.update(chunk);
+            if check_crc {
+                #[cfg(all(test, feature = "write"))]
+                streaming_checks_tests::record_crc_work(chunk.len(), false);
+                crc.update(chunk);
+            }
             if let Some((_, hasher)) = &mut hash {
                 hasher.update(chunk);
             }
@@ -608,13 +682,13 @@ impl FileHeader {
             .map_err(|error| self.entry_error("verifying", error))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     fn decode_packed_with_decoder(
         &self,
         packed: &[u8],
         decoder: &mut ReaderState<Allowance>,
     ) -> Result<Vec<u8>> {
-        self.decode_packed_owned(packed, decoder)
+        self.decode_packed_owned(packed, decoder, HistoryRetention::Retain)
             .map(Buffer::into_vec)
     }
 
@@ -628,6 +702,16 @@ fn write_repeated_chunk(
     crc: &mut Crc32,
     hash: &mut Option<([u8; 32], blake2sp::Hasher)>,
     byte: u8,
+    len: usize,
+) -> std::io::Result<()> {
+    write_repeated_chunk_with_optional_crc(writer, Some(crc), hash, byte, len)
+}
+
+fn write_repeated_chunk_with_optional_crc(
+    writer: &mut dyn Write,
+    mut crc: Option<&mut Crc32>,
+    hash: &mut Option<([u8; 32], blake2sp::Hasher)>,
+    byte: u8,
     mut len: usize,
 ) -> std::io::Result<()> {
     let buffer = [byte; 64 * 1024];
@@ -635,10 +719,16 @@ fn write_repeated_chunk(
         let take = len.min(buffer.len());
         let chunk = &buffer[..take];
         writer.write_all(chunk)?;
-        if byte == 0 {
-            crc.update_zeroes(take as u64);
-        } else {
-            crc.update(chunk);
+        #[cfg(all(test, feature = "write"))]
+        streaming_checks_tests::record_repeated_output(take, byte == 0);
+        if let Some(crc) = crc.as_mut() {
+            #[cfg(all(test, feature = "write"))]
+            streaming_checks_tests::record_crc_work(take, byte == 0);
+            if byte == 0 {
+                crc.update_zeroes(take as u64);
+            } else {
+                crc.update(chunk);
+            }
         }
         if let Some((_, hasher)) = hash.as_mut() {
             hasher.update(chunk);
@@ -758,7 +848,7 @@ impl Archive {
             let selected_writer = match selected {
                 Some(crate::ExtractionDecision::Skip) => continue,
                 Some(crate::ExtractionDecision::Stop) => {
-                    return Ok(crate::ExtractionOutcome::Stopped)
+                    return Ok(crate::ExtractionOutcome::Stopped);
                 }
                 Some(crate::ExtractionDecision::Extract(writer)) => Some(writer),
                 None => None,
@@ -835,6 +925,36 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        self.parallel_to_impl(options, &mut open, false)
+    }
+
+    pub(crate) fn test_to<F>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        mut tested: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<()>,
+    {
+        self.parallel_to_impl(
+            options,
+            &mut |meta| {
+                tested(meta)?;
+                Ok(Box::new(std::io::sink()) as Box<dyn Write>)
+            },
+            true,
+        )
+    }
+
+    fn parallel_to_impl<F>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        open: &mut F,
+        verification: bool,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    {
         options.check_cancelled()?;
         // Admit and charge total-limited work in archive order before dispatch.
         if options.rar50_scratch.is_some()
@@ -860,7 +980,11 @@ impl Archive {
                     if file.is_directory() || file.redirection.is_some() {
                         0
                     } else if file.is_stored() {
-                        file.unpacked_size
+                        if verification {
+                            0
+                        } else {
+                            file.unpacked_size
+                        }
                     } else {
                         file.unpacked_size
                             .saturating_add(file.packed_size())
@@ -875,10 +999,11 @@ impl Archive {
                         options.password,
                         rar50_buffered_decode_limit(options),
                         options,
+                        verification,
                         local,
                     )
                 },
-                |entry| write_parallel_entry(entry, &mut open, &mut |_, _| Ok(()), &publication),
+                |entry| write_parallel_entry(entry, open, &mut |_, _| Ok(()), &publication),
             );
         }
 
@@ -899,11 +1024,22 @@ impl Archive {
                 remaining -= file.unpacked_size;
                 batch.push(files.next().expect("peeked file"));
             }
-            let entries = crate::parallel::map_collect(batch, |file| {
-                decode_parallel_entry(self, file, password, buffered_decode_limit, options)
-            })?;
+            // Write the verified members ahead of a failure before reporting it.
+            let (entries, failure) = crate::parallel::map_prefix(batch, |file| {
+                decode_parallel_entry(
+                    self,
+                    file,
+                    password,
+                    buffered_decode_limit,
+                    options,
+                    verification,
+                )
+            });
             for entry in entries {
-                write_parallel_entry(entry, &mut open, &mut |_, _| Ok(()), &publication)?;
+                write_parallel_entry(entry, open, &mut |_, _| Ok(()), &publication)?;
+            }
+            if let Some(error) = failure {
+                return Err(error);
             }
         }
         options.check_cancelled()?;
@@ -917,6 +1053,7 @@ fn decode_parallel_entry(
     password: Option<&[u8]>,
     buffered_decode_limit: u64,
     options: crate::ArchiveReadOptions<'_>,
+    verification: bool,
 ) -> Result<ParallelExtractedEntry> {
     decode_parallel_entry_with_allowance(
         archive,
@@ -924,12 +1061,14 @@ fn decode_parallel_entry(
         password,
         buffered_decode_limit,
         options,
+        verification,
         &Allowance::default(),
     )
 }
 
 enum ParallelExtractedEntry<B: Budget = Allowance> {
     Directory(ExtractedEntryMeta),
+    Verified(ExtractedEntryMeta),
     File {
         meta: ExtractedEntryMeta,
         data: Buffer<u8, B>,
@@ -946,6 +1085,7 @@ fn decode_parallel_entry_with_allowance<B: Budget>(
     password: Option<&[u8]>,
     buffered_decode_limit: u64,
     options: crate::ArchiveReadOptions<'_>,
+    verification: bool,
     allowance: &B,
 ) -> Result<ParallelExtractedEntry<B>> {
     options.check_cancelled()?;
@@ -963,12 +1103,33 @@ fn decode_parallel_entry_with_allowance<B: Budget>(
     if meta.is_directory {
         return Ok(ParallelExtractedEntry::Directory(meta));
     }
-    let mut data = Buffer::new(allowance);
     let mut session = DecoderSession::with_allowance(password, buffered_decode_limit, allowance);
     session.decoder.read_control = budget.control.clone();
     session.scratch = options.rar50_scratch;
+    // Only a disposable buffered worker can omit the final dictionary copy.
+    // Compression metadata is still validated at its original decode boundary;
+    // ReaderState also forces retention for solid and limited decoding.
+    let history = if !B::LIMITED
+        && !archive.main.is_solid()
+        && !file.is_split_before()
+        && !file.is_split_after()
+        && !file.is_stored()
+        && session.scratch.is_none()
+        && !file.should_stream_decode(buffered_decode_limit)
+    {
+        HistoryRetention::DiscardIndependent
+    } else {
+        HistoryRetention::Retain
+    };
+    if verification {
+        budget.run(&file.name, std::io::sink(), |writer| {
+            session.write_file_to_with_history(archive, file, writer, history)
+        })?;
+        return Ok(ParallelExtractedEntry::Verified(meta));
+    }
+    let mut data = Buffer::new(allowance);
     budget.run(&file.name, &mut data, |writer| {
-        session.write_file_to(archive, file, writer)
+        session.write_file_to_with_history(archive, file, writer, history)
     })?;
     Ok(ParallelExtractedEntry::File { meta, data })
 }
@@ -985,7 +1146,7 @@ where
 {
     control.check()?;
     match entry {
-        ParallelExtractedEntry::Directory(meta) => {
+        ParallelExtractedEntry::Directory(meta) | ParallelExtractedEntry::Verified(meta) => {
             let _ = open(&meta)?;
         }
         ParallelExtractedEntry::File { meta, data } => {
@@ -1037,6 +1198,16 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         file: &FileHeader,
         writer: &mut dyn Write,
     ) -> Result<()> {
+        self.write_file_to_with_history(archive, file, writer, HistoryRetention::Retain)
+    }
+
+    fn write_file_to_with_history(
+        &mut self,
+        archive: &Archive,
+        file: &FileHeader,
+        writer: &mut dyn Write,
+        history: HistoryRetention,
+    ) -> Result<()> {
         if file.is_stored() {
             return file.write_stored_with_allowance(
                 archive,
@@ -1049,7 +1220,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
             return self.stream_file_to(archive, file, writer);
         }
         let decoded = self
-            .decoded_file_data(archive, file)
+            .decoded_file_data(archive, file, history)
             .map_err(|error| file.entry_error("decoding", error))?;
         file.verify_integrity_with_keys(&decoded.data, decoded.keys.as_ref())
             .map_err(|error| file.entry_error("verifying", error))?;
@@ -1065,11 +1236,14 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         file: &FileHeader,
         writer: &mut dyn Write,
     ) -> Result<()> {
-        let mut streaming_decoder = self.decoder.try_clone()?;
+        // Read just the solid flag here; full header validation stays in decode.
+        let mut streaming_decoder = self
+            .decoder
+            .try_prepare_for_stream(file.compression_info & 0x40 != 0, file.unpacked_size)?;
         let (mut packed, keys) = file
             .packed_reader_with_allowance(archive, self.password, &self.allowance)
             .map_err(|error| file.entry_error("reading", error))?;
-        file.stream_packed_with_decoder(
+        file.stream_packed_with_crc_policy::<true, _, _>(
             &mut packed,
             keys.as_ref(),
             &mut streaming_decoder,
@@ -1086,8 +1260,14 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         &mut self,
         archive: &Archive,
         file: &FileHeader,
+        history: HistoryRetention,
     ) -> Result<DecodedData<B>> {
-        file.decoded_data_with_decoder(archive, &mut self.decoder, self.password)
+        file.decoded_data_with_decoder_and_history(
+            archive,
+            &mut self.decoder,
+            self.password,
+            history,
+        )
     }
 
     fn split_decryptor(
@@ -1119,7 +1299,10 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         // Keep solid state only after successful emission and integrity checks,
         // just as for a non-split streaming member.
         self.decoder.read_control.check()?;
-        let mut decoder = self.decoder.try_clone()?;
+        let mut decoder = self.decoder.try_prepare_for_stream(
+            final_file.compression_info & 0x40 != 0,
+            final_file.unpacked_size,
+        )?;
         let control = decoder.read_control.clone();
         let mut packed =
             split.fragment_reader_with_allowance(volumes, decryptor, &self.allowance)?;
@@ -1173,7 +1356,8 @@ fn rar50_buffered_decode_limit(options: crate::ArchiveReadOptions<'_>) -> u64 {
 
 /// Streams a RAR 5 multivolume archive set to caller-provided writers.
 /// Compressed logical members obey the same buffered-decode threshold as ordinary
-/// members. Above it, filtered members return a typed limit error. Direct sinks
+/// members. Above it, a filter the streaming decoder cannot hold returns a typed
+/// limit error. Direct sinks
 /// can receive data before an integrity or decoding failure; callers requiring
 /// verified publication must stage output until extraction succeeds.
 pub fn extract_volumes_to<F>(
@@ -1186,6 +1370,20 @@ where
 {
     options.check_cancelled()?;
     extract_volumes_to_impl(volumes, options, &mut open, &mut |_, _| Ok(()), false)
+}
+
+pub(crate) fn test_volumes_to<F>(
+    volumes: &[Archive],
+    options: crate::ArchiveReadOptions<'_>,
+    mut tested: F,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<()>,
+{
+    extract_volumes_to(volumes, options, |meta| {
+        tested(meta)?;
+        Ok(Box::new(std::io::sink()) as Box<dyn Write>)
+    })
 }
 
 pub fn extract_volumes_to_with_redirections<F, R>(
@@ -1332,6 +1530,9 @@ fn validate_split_fragment(file: &FileHeader, password: Option<&[u8]>) -> Result
             "RAR 5 split directory entry is invalid",
         ));
     }
+    if file.encrypted {
+        crate::crypto::require_encryption()?;
+    }
     if file.encrypted && password.is_none() && file.crypto.is_none() {
         return Err(Error::NeedPassword);
     }
@@ -1363,10 +1564,7 @@ fn validate_split_continuation_refs<B: Budget>(
 struct PendingSplitRefs<B: Budget = Allowance> {
     name: Vec<u8>,
     fragments: Buffer<(usize, usize), B>,
-    file_time: Option<u32>,
-    mtime_refinement: Option<crate::TimeRefinement>,
-    attr: u64,
-    host_os: u64,
+    meta: ExtractedEntryMeta,
     compression_info: u64,
     encrypted: bool,
 }
@@ -1381,10 +1579,7 @@ impl<B: Budget> PendingSplitRefs<B> {
         Ok(Self {
             name: file.name.clone(),
             fragments: Buffer::copied(&[(volume_index, file_index)], allowance)?,
-            file_time: file.modification_time(),
-            mtime_refinement: file.modification_time_refinement(),
-            attr: file.attributes,
-            host_os: file.host_os,
+            meta: file.metadata(),
             compression_info: file.compression_info,
             encrypted: file.encrypted,
         })
@@ -1409,29 +1604,15 @@ impl<B: Budget> PendingSplitRefs<B> {
         budget.control.check()?;
         let decryptor = session.split_decryptor(&self, volumes)?;
         budget.control.check()?;
-        let meta = ExtractedEntryMeta {
-            name: self.name.clone(),
-            file_time: self.file_time,
-            mtime_refinement: self.mtime_refinement,
-            attr: self.attr,
-            host_os: self.host_os,
-            is_directory: false,
-            mtime: self.file_time.map(|seconds| crate::UnixTimestamp {
-                seconds: i64::from(seconds),
-                nanoseconds: 0,
-            }),
-            ctime: None,
-            atime: None,
-            owner: None,
-            version: None,
-            crc32: final_file.data_crc32,
-            blake2sp: final_file
-                .hash
-                .as_ref()
-                .filter(|h| h.hash_type == 0)
-                .and_then(|h| <[u8; 32]>::try_from(h.data.as_slice()).ok()),
-            unpacked_size: final_file.known_unpacked_size(),
-        };
+        let mut meta = self.meta.clone();
+        meta.is_directory = false;
+        meta.crc32 = final_file.data_crc32;
+        meta.blake2sp = final_file
+            .hash
+            .as_ref()
+            .filter(|h| h.hash_type == 0)
+            .and_then(|h| <[u8; 32]>::try_from(h.data.as_slice()).ok());
+        meta.unpacked_size = final_file.known_unpacked_size();
         let mut writer = open(&meta)?;
         budget.run(&final_file.name, &mut writer, |mut writer| {
             // Decode/integrity failures can gain fragment context. I/O failures
@@ -1495,12 +1676,9 @@ impl<B: Budget> PendingSplitRefs<B> {
             let chunk = if final_file.encrypted {
                 let remaining = usize::try_from(final_file.unpacked_size.saturating_sub(written))
                     .unwrap_or(usize::MAX);
+                // The padding after the unpacked size may hold any bytes, as
+                // unrar accepts.
                 let chunk_len = count.min(remaining);
-                if buf[chunk_len..count].iter().any(|&byte| byte != 0) {
-                    return Err(Error::InvalidHeader(
-                        "RAR 5 encrypted stored split file has non-zero padding",
-                    ));
-                }
                 &buf[..chunk_len]
             } else {
                 &buf[..count]
@@ -1531,7 +1709,7 @@ impl<B: Budget> PendingSplitRefs<B> {
                 let decryptor = decryptor.ok_or(Error::InvalidHeader(
                     "RAR 5 encrypted split CRC needs encryption keys",
                 ))?;
-                decryptor.keys.mac_crc32(crc.finish())
+                decryptor.keys.checked_crc_mac(crc.finish())?
             } else {
                 crc.finish()
             };
@@ -1544,7 +1722,7 @@ impl<B: Budget> PendingSplitRefs<B> {
                 let decryptor = decryptor.ok_or(Error::InvalidHeader(
                     "RAR 5 encrypted split hash needs encryption keys",
                 ))?;
-                decryptor.keys.mac_hash32(hasher.finalize())
+                decryptor.keys.checked_hash_mac(hasher.finalize())?
             } else {
                 hasher.finalize()
             };
@@ -1638,13 +1816,7 @@ impl<B: Budget> PendingSplitRefs<B> {
         let chained = ChainedReader::with_readers(readers);
         if let Some(decryptor) = decryptor {
             Ok(PackedReader::Encrypted(Boxed::try_new(
-                || {
-                    Ok::<_, crate::codec::Error>(Rar50DecryptingReader::new(
-                        chained,
-                        decryptor.keys.key,
-                        decryptor.iv,
-                    ))
-                },
+                || Rar50DecryptingReader::with_keys(chained, decryptor.keys.key, decryptor.iv),
                 allowance,
             )?))
         } else {
@@ -1653,7 +1825,7 @@ impl<B: Budget> PendingSplitRefs<B> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 impl PendingSplitRefs<Allowance> {
     fn new(file: &FileHeader, volume_index: usize, file_index: usize) -> Self {
         Self::with_allowance(file, volume_index, file_index, &Allowance::default())
@@ -1775,6 +1947,10 @@ impl<R: Read, B: Budget> Read for PackedReader<R, B> {
     }
 }
 
+#[cfg(not(feature = "encryption"))]
+type Rar50DecryptingReader<R> = crate::crypto::unavailable::Reader<R>;
+
+#[cfg(feature = "encryption")]
 struct Rar50DecryptingReader<R> {
     inner: R,
     cipher: Rar50Cipher,
@@ -1784,7 +1960,12 @@ struct Rar50DecryptingReader<R> {
     len: usize,
 }
 
+#[cfg(feature = "encryption")]
 impl<R: Read> Rar50DecryptingReader<R> {
+    fn with_keys(inner: R, key: [u8; 32], iv: [u8; 16]) -> Result<Self> {
+        Ok(Self::new(inner, key, iv))
+    }
+
     fn new(inner: R, key: [u8; 32], iv: [u8; 16]) -> Self {
         Self {
             inner,
@@ -1820,6 +2001,7 @@ impl<R: Read> Rar50DecryptingReader<R> {
     }
 }
 
+#[cfg(feature = "encryption")]
 impl<R: Read> Read for Rar50DecryptingReader<R> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         if out.is_empty() {
@@ -1835,8 +2017,24 @@ impl<R: Read> Read for Rar50DecryptingReader<R> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 mod tests {
+    #[test]
+    fn checksum_sink_flush_preserves_accumulated_checksum() {
+        let mut crc = Crc32::new();
+        {
+            let mut sink = CrcSink(&mut crc);
+            sink.flush().unwrap();
+            assert_eq!(sink.write(b"").unwrap(), 0);
+            assert_eq!(sink.write(b"a").unwrap(), 1);
+            sink.flush().unwrap();
+            sink.write_all(b"bc").unwrap();
+            sink.flush().unwrap();
+            sink.flush().unwrap();
+        }
+        assert_eq!(crc.finish(), 0x3524_41c2);
+    }
+
     #[test]
     fn reader_workspace_split_descriptor_growth_is_admitted_before_mutation() {
         let first = stored_split_archive(b"a", b"a", crc32(b"a"), HFL_SPLIT_AFTER)
@@ -1880,6 +2078,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encrypted_split_reader_releases_descriptor_and_cipher_allocations() {
         let volumes = [
             include_bytes!("../../tests/fixtures/rar50/encrypted_multivol.part1.rar").as_slice(),
@@ -1966,7 +2165,7 @@ mod tests {
     #[test]
     fn reader_session_workspace_refusals_release_rar5_packed_output_cipher_and_checkpoints() {
         let data = b"RAR5 charged member payload!\n".repeat(3);
-        for encrypted in [false, true] {
+        for encrypted in crate::test_features::encryption_cases() {
             for filtered in [false, true] {
                 let input = if encrypted {
                     entry(b"charged.bin", &data).with_password(b"password".to_vec())
@@ -2014,9 +2213,10 @@ mod tests {
         HFL_SPLIT_BEFORE,
     };
     use super::*;
-    use crate::{ArchiveVersion, FeatureSet};
     use crate::rar50::FileTimes;
+    use crate::{ArchiveVersion, FeatureSet};
     use std::cell::RefCell;
+    #[cfg(feature = "encryption")]
     use std::io::Cursor;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -2027,6 +2227,213 @@ mod tests {
             name.to_vec(),
             crate::EntrySource::from_bytes(Arc::<[u8]>::from(data.to_vec())),
         )
+    }
+
+    #[test]
+    fn independent_streaming_allocations_do_not_depend_on_previous_history() {
+        use crate::codec::workspace::RefusingBudget;
+
+        let data = b"independent streaming member".repeat(100);
+        let mut builder = crate::Builder::new(ArchiveVersion::Rar50)
+            .store(false)
+            .compression_level(Some(1));
+        builder
+            .add_bytes(b"member".to_vec(), data.clone(), None, None)
+            .unwrap();
+        let archive = Archive::parse_owned(builder.to_bytes().unwrap()).unwrap();
+        let file = archive.files().next().unwrap();
+        assert!(!file.is_stored());
+        assert!(!file.decoded_compression_info().unwrap().solid);
+        let volumes = [
+            include_bytes!("../../tests/fixtures/rar50/multivol.part1.rar").as_slice(),
+            include_bytes!("../../tests/fixtures/rar50/multivol.part2.rar").as_slice(),
+            include_bytes!("../../tests/fixtures/rar50/multivol.part3.rar").as_slice(),
+        ]
+        .map(|bytes| Archive::parse(bytes).unwrap());
+        let first = volumes[0].files().next().unwrap();
+        let last = volumes[2].files().next().unwrap();
+        assert!(!last.decoded_compression_info().unwrap().solid);
+        let seed = vec![b'X'; 1024 * 1024];
+        let packed_seed = crate::codec::rar50::encode_literal_only(&seed, 0).unwrap();
+
+        for split in [false, true] {
+            let mut counts = Vec::new();
+            for seeded in [false, true] {
+                let budget = RefusingBudget::new(usize::MAX);
+                let mut session = DecoderSession::with_allowance(None, 0, &budget);
+                if seeded {
+                    session
+                        .decoder
+                        .decode_member_with_dictionary(
+                            &packed_seed,
+                            0,
+                            seed.len(),
+                            seed.len(),
+                            false,
+                            DecodeMode::Lz,
+                        )
+                        .unwrap();
+                    assert!(budget.used() >= seed.len() as u64);
+                }
+                let mut pending = PendingSplitRefs::with_allowance(first, 0, 0, &budget).unwrap();
+                pending.append(1, 0).unwrap();
+                pending.append(2, 0).unwrap();
+                let before = budget.attempts();
+                let mut output = Vec::new();
+                if split {
+                    session
+                        .stream_split_to(&volumes, &pending, last, None, &mut output)
+                        .unwrap();
+                    assert_eq!(output.len(), 4096);
+                    assert_eq!(crc32(&output), 0xb9c5_4415);
+                } else {
+                    session.write_file_to(&archive, file, &mut output).unwrap();
+                    assert_eq!(output, data);
+                }
+                counts.push(budget.attempts() - before);
+                drop(pending);
+                drop(session);
+                assert_eq!(budget.used(), 0);
+            }
+            assert_eq!(
+                counts[0], counts[1],
+                "split={split}: fresh versus seeded allocations"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_checkpoint_rolls_back_sink_cancellation_and_integrity_failures() {
+        let mut word = 0x1234_5678u32;
+        // Avoid a period aligned with the 64 KiB flush: appending or resetting
+        // to the first failed flush must change the successor's match bytes.
+        let seed: Vec<_> = (0..32749)
+            .map(|_| {
+                word ^= word << 13;
+                word ^= word >> 17;
+                word ^= word << 5;
+                word as u8
+            })
+            .collect();
+        let first_data = seed.repeat(4);
+        let next_data = first_data[127..4224].to_vec();
+        let mut builder = crate::Builder::new(ArchiveVersion::Rar50)
+            .store(false)
+            .solid(true)
+            .compression_level(Some(1));
+        builder
+            .add_bytes(b"first".to_vec(), first_data.clone(), None, None)
+            .unwrap();
+        builder
+            .add_bytes(b"next".to_vec(), next_data.clone(), None, None)
+            .unwrap();
+        let archive = Archive::parse_owned(builder.to_bytes().unwrap()).unwrap();
+        let files: Vec<_> = archive.files().collect();
+        assert!(files.iter().all(|file| !file.is_stored()));
+        assert!(!files[0].decoded_compression_info().unwrap().solid);
+        assert!(files[1].decoded_compression_info().unwrap().solid);
+        assert!(
+            files[1].packed_size() < 128,
+            "next member must use old history"
+        );
+
+        struct CancelOnWrite<'a> {
+            token: &'a crate::ReadCancellation,
+            written: usize,
+        }
+        impl Write for CancelOnWrite<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.written += bytes.len();
+                self.token.cancel();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        struct RejectWrite;
+        impl Write for RejectWrite {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("checkpoint sink failed"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        for failure in ["sink", "cancellation", "integrity"] {
+            let mut session = DecoderSession::with_allowance(None, 0, &Allowance::default());
+            session
+                .write_file_to(&archive, files[0], &mut std::io::sink())
+                .unwrap();
+            match failure {
+                "sink" => {
+                    let error = session
+                        .write_file_to(&archive, files[0], &mut RejectWrite)
+                        .unwrap_err();
+                    assert_eq!(error.kind(), crate::ErrorKind::Io);
+                }
+                "cancellation" => {
+                    let token = crate::ReadCancellation::new();
+                    session.decoder.read_control =
+                        crate::read_control::ReadControl::new(Some(&token));
+                    let mut writer = CancelOnWrite {
+                        token: &token,
+                        written: 0,
+                    };
+                    let error = session
+                        .write_file_to(&archive, files[0], &mut writer)
+                        .unwrap_err();
+                    assert_eq!(error.kind(), crate::ErrorKind::Cancelled);
+                    assert!(writer.written >= 64 * 1024);
+                    session.decoder.read_control = Default::default();
+                }
+                "integrity" => {
+                    let mut corrupt = files[1].clone();
+                    corrupt.hash = None;
+                    corrupt.data_crc32 = Some(crc32(&next_data) ^ 1);
+                    let error = session
+                        .write_file_to(&archive, &corrupt, &mut std::io::sink())
+                        .unwrap_err();
+                    assert_eq!(error.kind(), crate::ErrorKind::ChecksumMismatch);
+                }
+                _ => unreachable!(),
+            }
+            // The successor references the old, nonperiodic raw dictionary.
+            // A failed checkpoint must not have reset or appended to it.
+            let mut decoded = Vec::new();
+            session
+                .write_file_to(&archive, files[1], &mut decoded)
+                .unwrap();
+            assert_eq!(decoded, next_data, "after {failure}");
+        }
+
+        // Prove the successor detects the two erroneous history states that
+        // the failed first flush could publish, rather than accepting a fixture
+        // whose repeating phase accidentally masks a broken checkpoint.
+        let prefix = &first_data[..64 * 1024];
+        let packed_prefix = crate::codec::rar50::encode_literal_only(prefix, 0).unwrap();
+        for appended in [false, true] {
+            let mut session = DecoderSession::with_allowance(None, 0, &Allowance::default());
+            session
+                .write_file_to(&archive, files[0], &mut std::io::sink())
+                .unwrap();
+            session
+                .decoder
+                .decode_member_from_reader_with_dictionary_to_sink(
+                    &mut packed_prefix.as_slice(),
+                    0,
+                    prefix.len(),
+                    4 * 1024 * 1024,
+                    appended,
+                    |_| Ok::<(), std::convert::Infallible>(()),
+                )
+                .unwrap();
+            let error = session
+                .write_file_to(&archive, files[1], &mut std::io::sink())
+                .unwrap_err();
+            assert_eq!(error.kind(), crate::ErrorKind::ChecksumMismatch);
+        }
     }
 
     #[test]
@@ -2192,6 +2599,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn decrypting_reader_streams_rar50_blocks() {
         let key = [3u8; 32];
         let iv = [4u8; 16];
@@ -2216,6 +2624,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn decrypting_reader_preserves_partial_blocks_across_source_errors() {
         let key = [3; 32];
         let iv = [4; 16];
@@ -2249,6 +2658,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn decrypting_reader_handles_short_reads_and_truncated_final_blocks() {
         let key = [3u8; 32];
         let iv = [4u8; 16];
@@ -2504,7 +2914,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_filtered_members_return_typed_error_without_preflight_decode() {
+    fn streaming_filtered_members_decode_in_full() {
         for prefix_len in [0, 64 * 1024] {
             let mut data = vec![b'P'; prefix_len];
             while (data.len() - prefix_len) as u64 <= BUFFERED_DECODE_LIMIT {
@@ -2555,17 +2965,9 @@ mod tests {
             assert_eq!(*captured.borrow(), data);
 
             let mut out = Vec::new();
-            let error = file.write_to(&archive, None, &mut out).unwrap_err();
+            file.write_to(&archive, None, &mut out).unwrap();
 
-            assert!(matches!(
-                error,
-                Error::AtEntry {
-                    operation: "decoding",
-                    source,
-                    ..
-                } if matches!(*source, Error::Rar50BufferedDecodeLimitExceeded { .. })
-            ));
-            assert_eq!(out, data[..prefix_len]);
+            assert_eq!(out, data);
         }
     }
 
@@ -2603,23 +3005,95 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_stored_decode_rejects_nonzero_discarded_padding() {
+    fn encrypted_stored_decode_discards_padding_whatever_it_holds() {
         let mut file = plain_file(b"secret.txt", b"secret", None);
         file.encrypted = true;
         file.unpacked_size = 6;
         let mut decoder = ReaderState::new(&Allowance::default());
 
+        for packed in [&b"secret\0\0"[..], b"secret\0\x01", b"secret\x6f\x46"] {
+            assert_eq!(
+                file.decode_packed_with_decoder(packed, &mut decoder)
+                    .unwrap(),
+                b"secret"
+            );
+        }
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn unrepresentable_dictionary_is_refused_by_buffered_streaming_and_split_decoders() {
+        struct NeverRead;
+        impl Read for NeverRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("an unrepresentable dictionary must be rejected before reading")
+            }
+        }
+        let mut file = plain_file(b"large-dictionary", &[0], None);
+        file.compression_info = (5 << 7) | (15 << 10);
         assert_eq!(
-            file.decode_packed_with_decoder(b"secret\0\0", &mut decoder)
-                .unwrap(),
-            b"secret"
+            file.decoded_compression_info().unwrap().dictionary_size,
+            1u64 << 32
         );
-        assert!(matches!(
-            file.decode_packed_with_decoder(b"secret\0\x01", &mut decoder),
-            Err(Error::InvalidHeader(
-                "RAR 5 encrypted stored file has non-zero padding"
-            ))
-        ));
+        let expected = Error::InvalidHeader("RAR 5 dictionary size overflows host address size");
+        let mut decoder = ReaderState::new(&Allowance::default());
+        assert_eq!(
+            file.decode_packed_owned(&[0], &mut decoder, HistoryRetention::Retain)
+                .unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            file.stream_packed_with_decoder(
+                &mut NeverRead,
+                None,
+                &mut decoder,
+                u64::MAX,
+                None,
+                &mut std::io::sink()
+            )
+            .unwrap_err(),
+            expected
+        );
+
+        let mut first = file.clone();
+        first.block.flags = HFL_SPLIT_AFTER;
+        first.block.data_range = 0..1;
+        first.block.data_size = Some(1);
+        let mut last = first.clone();
+        last.block.flags = HFL_SPLIT_BEFORE;
+        let volumes = [
+            archive_with_blocks(vec![Block::File(first.clone())], vec![0]),
+            archive_with_blocks(vec![Block::File(last.clone())], vec![0]),
+        ];
+        let mut split = PendingSplitRefs::new(&first, 0, 0);
+        split.append(1, 0).unwrap();
+        assert_eq!(
+            last.decode_split_with_decoder(&volumes, &split, &mut decoder, None)
+                .unwrap_err(),
+            expected
+        );
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn encrypted_stored_size_above_the_host_limit_is_refused() {
+        let mut file = plain_file(b"large-stored", &[], None);
+        file.encrypted = true;
+        file.encryption = Some(FileEncryption {
+            version: 0,
+            flags: 0,
+            kdf_count: 0,
+            salt: [0; 16],
+            iv: [0; 16],
+            check_value: None,
+        });
+        file.unpacked_size = 1u64 << 32;
+        let mut decoder = ReaderState::new(&Allowance::default());
+        assert_eq!(
+            file.decode_packed_owned(&[0; 16], &mut decoder, HistoryRetention::Retain)
+                .unwrap_err(),
+            Error::InvalidHeader("RAR 5 unpacked size overflows host address size")
+        );
     }
 
     #[test]
@@ -2724,6 +3198,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encryption_keys_reject_missing_password_record_and_unsupported_versions() {
         let mut missing = plain_file(b"a.txt", b"", None);
         missing.encrypted = true;
@@ -2753,6 +3228,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encryption_keys_handles_missing_check_value() {
         let mut file = plain_file(b"a.txt", b"", None);
         file.encrypted = true;
@@ -2932,6 +3408,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn map_rar50_crypto_error_translates_kdf_count() {
         assert!(matches!(
             super::super::map_rar50_crypto_error(crate::crypto::rar50::Error::KdfCountTooLarge),
@@ -2972,9 +3449,9 @@ mod tests {
                 htime_mtime: None,
                 htime_mtime_refinement: None,
                 file_times: None,
-            times: FileTimes::default(),
-            owner: None,
-            version: None,
+                times: FileTimes::default(),
+                owner: None,
+                version: None,
                 data_crc32: Some(crc),
                 compression_info: 0,
                 host_os: 2,
@@ -3121,11 +3598,23 @@ mod tests {
 
         let mut encrypted = split_fragment_file(b"a.txt", HFL_SPLIT_AFTER);
         encrypted.encrypted = true;
-        assert!(matches!(
-            validate_split_fragment(&encrypted, None),
-            Err(Error::NeedPassword)
-        ));
-        validate_split_fragment(&encrypted, Some(b"pw")).unwrap();
+        #[cfg(feature = "encryption")]
+        {
+            assert!(matches!(
+                validate_split_fragment(&encrypted, None),
+                Err(Error::NeedPassword)
+            ));
+            validate_split_fragment(&encrypted, Some(b"pw")).unwrap();
+        }
+        #[cfg(not(feature = "encryption"))]
+        for password in [None, Some(b"pw".as_slice())] {
+            assert!(matches!(
+                validate_split_fragment(&encrypted, password),
+                Err(Error::FeatureDisabled {
+                    feature: "encryption"
+                })
+            ));
+        }
 
         let plain = split_fragment_file(b"a.txt", HFL_SPLIT_AFTER);
         validate_split_fragment(&plain, None).unwrap();
@@ -3151,9 +3640,17 @@ mod tests {
 
         let mut new_encryption = split_fragment_file(b"a.txt", HFL_SPLIT_BEFORE);
         new_encryption.encrypted = true;
+        #[cfg(feature = "encryption")]
         assert!(matches!(
             validate_split_continuation_refs(&pending, &new_encryption, Some(b"pw")),
             Err(Error::InvalidHeader(_))
+        ));
+        #[cfg(not(feature = "encryption"))]
+        assert!(matches!(
+            validate_split_continuation_refs(&pending, &new_encryption, Some(b"pw")),
+            Err(Error::FeatureDisabled {
+                feature: "encryption"
+            })
         ));
 
         let same = split_fragment_file(b"a.txt", HFL_SPLIT_BEFORE);
@@ -3218,6 +3715,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encrypted_stored_split_checks_the_final_crc_mac() {
         let data = b"Hello, RAR 5.0 fixture world.\n";
         let bytes = Rar50Writer::new(
@@ -3318,6 +3816,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encrypted_buffered_crc_verification_requires_keys_and_checks_mac() {
         let data = b"MAC checked payload";
         let keys = Rar50Keys::derive(b"pw", [3; 16], 0).unwrap();
@@ -3710,3 +4209,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(all(test, feature = "write"))]
+#[path = "independent_history_tests.rs"]
+mod independent_history_tests;

@@ -452,13 +452,27 @@ pub(super) fn dictionary_size_fields(algorithm_version: u8, size: u64) -> Result
 mod dictionary_encoding_tests {
     use super::*;
 
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn encode_options_refuse_a_valid_dictionary_above_the_host_limit() {
+        let size = 1u64 << 32;
+        assert_eq!(dictionary_size_fields(0, size).unwrap(), (15, 0));
+        assert_eq!(
+            encode_options_for_level(Some(3), size).unwrap_err(),
+            Error::InvalidArgument("RAR 5 dictionary size exceeds this platform's address space")
+        );
+    }
+
     #[test]
     fn rar5_dictionary_boundaries_and_rejections() {
         let unit = DEFAULT_RAR50_DICTIONARY_SIZE;
         assert_eq!(dictionary_size_fields(0, unit).unwrap(), (0, 0));
         assert_eq!(dictionary_size_fields(0, 1u64 << 32).unwrap(), (15, 0));
         for (size, reason) in [
-            (unit - 1, "RAR 5 v0 dictionary size must be at least 128 KiB"),
+            (
+                unit - 1,
+                "RAR 5 v0 dictionary size must be at least 128 KiB",
+            ),
             (
                 unit + 4096,
                 "RAR 5 v0 dictionary size must be a power-of-two multiple of 128 KiB",
@@ -549,7 +563,10 @@ mod dictionary_encoding_tests {
         let filter = FilterSpec::whole(FilterKind::Delta { channels: 1 });
         let data = vec![42; 4096];
         assert_eq!(
-            search.filtered_bytes(&data, std::slice::from_ref(&filter)).unwrap_err().kind(),
+            search
+                .filtered_bytes(&data, std::slice::from_ref(&filter))
+                .unwrap_err()
+                .kind(),
             crate::ErrorKind::ResourceLimit
         );
         assert_eq!(

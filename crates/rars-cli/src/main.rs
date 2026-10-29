@@ -21,10 +21,9 @@ use cli::{AddArgs, Command, ExtractArgs, InfoArgs, PasswordArgs, TestArgs};
 use error::{CliError, CliResult};
 use input::{collect_inputs, rar15_file_attr, read_inputs_with_progress};
 use output::{
-    create_rar50_redirection as create_rar50_redirection_output, open_output_writer,
-    output_path_for_entry, output_path_for_rar50_entry, print_ok_entry, rar50_entry_name,
-    rar50_output_relative_path, restore_output_metadata, warn_rar50_redirections, Backslash,
-    ExtractedOutput, OverwritePolicy,
+    create_link_output, open_output_writer, print_ok_entry, rar50_output_relative_path,
+    restore_output_metadata, warn_rar50_redirections, ExtractedOutput, ExtractionStaging,
+    OverwritePolicy,
 };
 use password::{
     classify_rars_error, ensure_password_for_archives_extract, ensure_password_for_extract,
@@ -40,8 +39,8 @@ use rars::rar15_40::{
     WriterOptions as Rar15WriterOptions,
 };
 use rars::{
-    extract_volumes_to_with_options, Archive as DetectedArchive, ArchiveReadOptions, ArchiveReader,
-    ArchiveVersion, FeatureSet, MemberCoding,
+    extract_volumes_with_links, test_volumes_with_options_and_callback, Archive as DetectedArchive,
+    ArchiveReadOptions, ArchiveReader, ArchiveVersion, FeatureSet, MemberCoding,
 };
 use repair::cmd_repair;
 use std::cell::RefCell;
@@ -55,6 +54,10 @@ use volumes::{
 };
 
 const DOS_ARCHIVE_ATTR: u8 = 0x20;
+#[cfg(windows)]
+const RAR15_HOST_NATIVE: u8 = 2;
+#[cfg(not(windows))]
+const RAR15_HOST_NATIVE: u8 = 3;
 #[cfg(windows)]
 const RAR50_HOST_NATIVE: u64 = 0;
 #[cfg(not(windows))]
@@ -97,23 +100,16 @@ fn configure_threads(threads: Option<usize>) -> CliResult<()> {
         .ok()
         .map(std::num::NonZeroUsize::get);
     let mut builder = rayon::ThreadPoolBuilder::new();
-    if let Some(threads) = threads.or(default_threads) {
+    let selected_threads = threads.or(default_threads);
+    if let Some(threads) = selected_threads {
         builder = builder.num_threads(threads);
+    }
+    if selected_threads == Some(1) {
+        builder = builder.use_current_thread();
     }
     builder
         .build_global()
         .map_err(|err| CliError::general(format!("failed to configure parallel workers: {err}")))
-}
-
-fn extract_archive_to_with_options<F>(
-    archive: &DetectedArchive,
-    options: ArchiveReadOptions<'_>,
-    open: F,
-) -> rars::Result<()>
-where
-    F: FnMut(&rars::ExtractedEntryMeta) -> rars::Result<Box<dyn Write>>,
-{
-    archive.extract_to_parallel_buffered_with_options(options, open)
 }
 
 fn rar50_buffered_decode_limit_hint(error: &rars::Error) -> String {
@@ -123,6 +119,17 @@ fn rar50_buffered_decode_limit_hint(error: &rars::Error) -> String {
     format!(
         "\nhint: retry with --rar50-buffered-decode-limit {required} if you trust this archive and have enough memory"
     )
+}
+
+/// The archive name of the entry an extraction error is attributed to.
+fn failed_entry_name(error: &rars::Error) -> Option<&[u8]> {
+    match error {
+        rars::Error::AtEntry { name, .. } => Some(name),
+        rars::Error::AtArchiveOffset { source, .. } | rars::Error::InVolume { source, .. } => {
+            failed_entry_name(source)
+        }
+        _ => None,
+    }
 }
 
 fn find_rar50_buffered_decode_limit_error(error: &rars::Error) -> Option<(u64, u64)> {
@@ -266,13 +273,13 @@ where
         .iter()
         .map(|(unp, _, _)| unp.to_string().len())
         .max()
-        .unwrap_or(0)
+        .expect("entry table is nonempty")
         .max(4);
     let pack_w = rows
         .iter()
         .map(|(_, pack, _)| pack.to_string().len())
         .max()
-        .unwrap_or(0)
+        .expect("entry table is nonempty")
         .max(6);
     println!("  {:>size_w$}  {:>pack_w$}  Name", "Size", "Packed");
     for (unp, pack, name) in &rows {
@@ -336,12 +343,11 @@ fn info_rar13_verbose(
                 ""
             }
         );
-        if let Some(comment) = archive
+        let comment = archive
             .archive_comment_with_options(options)
             .map_err(|err| format!("failed to decode archive comment '{path}': {err}"))?
-        {
-            println!("  comment: {}", display_bytes_lossy(&comment));
-        }
+            .expect("archive comment flag checked above");
+        println!("  comment: {}", display_bytes_lossy(&comment));
     }
     if let Some(av) = archive
         .authenticity_verification()
@@ -616,19 +622,20 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
         let options = args
             .read_options
             .options(password_bytes(&password), scratch.as_ref());
-        extract_archive_to_with_options(&archive, options, |meta| {
-            entries.push(meta.clone());
-            Ok(Box::new(std::io::sink()))
-        })
-        .map_err(|err| {
-            classify_rars_error(err, |err| {
-                format!(
-                    "failed to test archive '{}': {err}{}",
-                    paths[0].display(),
-                    rar50_buffered_decode_limit_hint(err)
-                )
+        archive
+            .test_with_options_and_callback(options, |meta| {
+                entries.push(meta.clone());
+                Ok(())
             })
-        })?;
+            .map_err(|err| {
+                classify_rars_error(err, |err| {
+                    format!(
+                        "failed to test archive '{}': {err}{}",
+                        paths[0].display(),
+                        rar50_buffered_decode_limit_hint(err)
+                    )
+                })
+            })?;
         for entry in &entries {
             print_ok_entry(entry);
         }
@@ -642,9 +649,9 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
         let options = args
             .read_options
             .options(password_bytes(&password), scratch.as_ref());
-        extract_volumes_to_with_options(&archives, options, |meta| {
+        test_volumes_with_options_and_callback(&archives, options, |meta| {
             entries.push(meta.clone());
-            Ok(Box::new(std::io::sink()))
+            Ok(())
         })
         .map_err(|err| {
             classify_rars_error(err, |err| {
@@ -684,69 +691,66 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
         sort_volume_paths(&mut paths);
     }
 
-    if paths.len() == 1 {
-        let archive =
-            read_archive_path_prompting_with_options(&paths[0], &mut password, &args.read_options)?;
-        ensure_password_for_extract(&archive, &mut password)?;
-        let family = archive.family();
-        let state = RefCell::new(ExtractOutputState::new(&out_dir, overwrite, family));
-        let options = args
-            .read_options
-            .options(password_bytes(&password), scratch.as_ref());
-        extract_single_archive(&archive, options, &state).map_err(|err| {
-            classify_rars_error(err, |err| {
-                format!(
-                    "failed to write extracted entry to '{}': {err}{}",
-                    out_dir.display(),
-                    rar50_buffered_decode_limit_hint(err)
-                )
-            })
-        })?;
-        let outputs = state.into_inner().outputs;
-        restore_output_metadata(&outputs).map_err(|err| {
-            CliError::general(format!(
-                "failed to restore extracted metadata under '{}': {err}",
-                out_dir.display()
-            ))
-        })?;
-        for output in &outputs {
-            println!("x {}", display_bytes_lossy(&output.name));
-        }
+    let archives = if paths.len() == 1 {
+        vec![read_archive_path_prompting_with_options(
+            &paths[0],
+            &mut password,
+            &args.read_options,
+        )?]
     } else {
-        let archives = parse_archives_prompting(&paths, &mut password, &args.read_options)?;
-        ensure_password_for_archives_extract(&archives, &mut password)?;
-        let family = archives
-            .first()
-            .map(DetectedArchive::family)
-            .ok_or("no archive parts provided")?;
-        let state = RefCell::new(ExtractOutputState::new(&out_dir, overwrite, family));
-        let options = args
-            .read_options
-            .options(password_bytes(&password), scratch.as_ref());
-        extract_volume_archives(&archives, options, &state).map_err(|err| {
+        parse_archives_prompting(&paths, &mut password, &args.read_options)?
+    };
+    ensure_password_for_archives_extract(&archives, &mut password)?;
+    let family = archives
+        .first()
+        .map(DetectedArchive::family)
+        .ok_or("no archive parts provided")?;
+    let state = RefCell::new(ExtractOutputState::new(&out_dir, overwrite, family));
+    let options = args
+        .read_options
+        .options(password_bytes(&password), scratch.as_ref());
+    let result = if archives.len() == 1 {
+        extract_single_archive(&archives[0], options, &state)
+    } else {
+        extract_volume_archives(&archives, options, &state)
+    };
+    result
+        .inspect_err(|err| {
+            // Keep verified predecessors; retain the extraction error if publication fails.
+            let _ = state.borrow_mut().publish_before_failure(err);
+        })
+        .map_err(|err| {
             classify_rars_error(err, |err| {
-                format!(
-                    "failed to extract volume set '{}': {err}{}",
-                    paths
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    rar50_buffered_decode_limit_hint(err)
-                )
+                if archives.len() == 1 {
+                    format!(
+                        "failed to write extracted entry to '{}': {err}{}",
+                        out_dir.display(),
+                        rar50_buffered_decode_limit_hint(err)
+                    )
+                } else {
+                    format!(
+                        "failed to extract volume set '{}': {err}{}",
+                        paths
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        rar50_buffered_decode_limit_hint(err)
+                    )
+                }
             })
         })?;
-        let outputs = state.into_inner().outputs;
-        restore_output_metadata(&outputs).map_err(|err| {
-            CliError::general(format!(
-                "failed to restore extracted metadata under '{}': {err}",
-                out_dir.display()
-            ))
-        })?;
-        for output in &outputs {
-            println!("x {}", display_bytes_lossy(&output.name));
-        }
+    let outputs = state.into_inner().publish()?;
+    restore_output_metadata(&outputs).map_err(|err| {
+        CliError::general(format!(
+            "failed to restore extracted metadata under '{}': {err}",
+            out_dir.display()
+        ))
+    })?;
+    for output in &outputs {
+        println!("x {}", display_bytes_lossy(&output.name));
     }
+
     Ok(())
 }
 
@@ -754,9 +758,22 @@ struct ExtractOutputState<'a> {
     out_dir: &'a Path,
     overwrite: OverwritePolicy,
     family: rars::ArchiveFamily,
+    legacy_name_encoding: Option<rars::filename::LegacyNameEncoding>,
     outputs: Vec<ExtractedOutput>,
     planned_paths: HashSet<PathBuf>,
     created_paths: HashMap<PathBuf, PathBuf>,
+    staging: Option<ExtractionStaging>,
+    staged_paths: Vec<PathBuf>,
+    hardlink_targets: HashMap<PathBuf, PathBuf>,
+    staged_redirections: HashSet<PathBuf>,
+    staged_directories: HashSet<PathBuf>,
+    directory_times: Vec<(PathBuf, std::time::SystemTime)>,
+    /// Raw archive name of each output, as extraction errors report it.
+    archive_names: Vec<Vec<u8>>,
+    /// Outputs before this index have been moved to their destinations.
+    published: usize,
+    published_identities: HashSet<PathBuf>,
+    published_paths: HashMap<PathBuf, PathBuf>,
 }
 
 impl<'a> ExtractOutputState<'a> {
@@ -765,20 +782,65 @@ impl<'a> ExtractOutputState<'a> {
             out_dir,
             overwrite,
             family,
+            legacy_name_encoding: None,
             outputs: Vec::new(),
             planned_paths: HashSet::new(),
             created_paths: HashMap::new(),
+            staging: None,
+            staged_paths: Vec::new(),
+            hardlink_targets: HashMap::new(),
+            staged_redirections: HashSet::new(),
+            staged_directories: HashSet::new(),
+            directory_times: Vec::new(),
+            archive_names: Vec::new(),
+            published: 0,
+            published_identities: HashSet::new(),
+            published_paths: HashMap::new(),
+        }
+    }
+
+    // Decode names once at the filesystem boundary, retaining the archive's
+    // raw identity for errors and publication. RAR5 Unix hosts map to AttrSource::Unix.
+    fn entry_path(&self, meta: &rars::ExtractedEntryMeta) -> rars::Result<(Vec<u8>, PathBuf)> {
+        if self.family == rars::ArchiveFamily::Rar50Plus {
+            let path = rar50_output_relative_path(
+                &meta.name,
+                u64::from(meta.attr_source == rars::AttrSource::Unix),
+            )
+            .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?;
+            Ok((meta.name.clone(), path))
+        } else {
+            let name = rars::filename::decoded_name(
+                &meta.name,
+                meta.name_is_unicode,
+                self.legacy_name_encoding,
+            )?
+            .into_owned();
+            let path = output::output_relative_path(&name)
+                .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?;
+            Ok((name, path))
         }
     }
 
     fn open_entry(&mut self, meta: &rars::ExtractedEntryMeta) -> rars::Result<Box<dyn Write>> {
-        let planned = output_path_for_entry(self.out_dir, meta)?;
-        self.reserve_output_path(planned)?;
-        let (path, writer) =
-            open_output_writer(self.out_dir, meta, self.overwrite, Backslash::Separator)?;
+        self.publish_verified()?;
+        let (name, relative) = self.entry_path(meta)?;
+        let destination = output::checked_output_path(self.out_dir, &relative)?;
+        self.reserve_output_path(destination.clone())?;
+        self.remember_directory_time(&destination, meta)?;
+        let staging = self.prepare_staged_path(&destination, meta.is_directory)?;
+        let (path, writer) = open_output_writer(
+            &staging,
+            &relative,
+            meta.is_directory,
+            OverwritePolicy::Never,
+        )?;
+        self.record_staged_path(&path, meta.is_directory)?;
+        self.created_paths.insert(relative, path.clone());
+        self.archive_names.push(meta.name.clone());
         self.outputs.push(ExtractedOutput {
-            name: meta.name.clone(),
-            path,
+            name,
+            path: destination,
             meta: meta.clone(),
             family: self.family,
             restore_metadata: true,
@@ -786,45 +848,50 @@ impl<'a> ExtractOutputState<'a> {
         Ok(writer)
     }
 
-    fn open_rar50_entry(
+    fn create_link(
         &mut self,
-        meta: &rars::rar50::ExtractedEntryMeta,
-    ) -> rars::Result<Box<dyn Write>> {
-        let common = rar50_extracted_meta(meta);
-        let planned = output_path_for_rar50_entry(self.out_dir, meta)?;
-        self.reserve_output_path(planned)?;
-        let (path, writer) =
-            open_output_writer(self.out_dir, &common, self.overwrite, Backslash::Literal)?;
-        self.record_rar50_created_path(meta, path.clone())?;
-        self.outputs.push(ExtractedOutput {
-            name: meta.name.clone(),
-            path,
-            meta: common,
-            family: self.family,
-            restore_metadata: true,
-        });
-        Ok(writer)
-    }
-
-    fn create_rar50_redirection(
-        &mut self,
-        meta: &rars::rar50::ExtractedEntryMeta,
-        redirection: &rars::rar50::FileRedirection,
+        meta: &rars::ExtractedEntryMeta,
+        link: rars::ExtractedLink<'_>,
     ) -> rars::Result<()> {
-        let planned = output_path_for_rar50_entry(self.out_dir, meta)?;
-        self.reserve_output_path(planned)?;
-        let (path, restore_metadata) = create_rar50_redirection_output(
-            self.out_dir,
-            meta,
-            redirection,
-            self.overwrite,
+        self.publish_verified()?;
+        let (name, relative) = self.entry_path(meta)?;
+        let destination = output::checked_output_path(self.out_dir, &relative)?;
+        self.reserve_output_path(destination.clone())?;
+        // Keep the existing RAR5 policy for all links: reject absolute paths,
+        // parent components and drive prefixes. Native legacy targets are not
+        // member names: neither their codepage nor their backslashes are decoded.
+        let target = if self.family == rars::ArchiveFamily::Rar50Plus {
+            rar50_output_relative_path(
+                link.target(),
+                u64::from(meta.attr_source == rars::AttrSource::Unix),
+            )
+            .map_err(|_| rars::Error::InvalidHeader("unsafe archive redirection target"))?
+        } else {
+            rars::filename::relative_path(link.target(), false)
+                .map_err(|_| rars::Error::InvalidHeader("unsafe archive redirection target"))?
+        };
+        let staging = self.prepare_staged_path(&destination, false)?;
+        let (path, restore_metadata) = create_link_output(
+            &staging,
+            &relative,
+            &target,
+            link,
+            OverwritePolicy::Never,
             &self.created_paths,
         )?;
-        self.record_rar50_created_path(meta, path.clone())?;
+        self.record_staged_path(&path, false)?;
+        self.staged_redirections.insert(path.clone());
+        if matches!(link, rars::ExtractedLink::HardLink { .. }) {
+            let source = output::link_source_path(&target, &self.created_paths)?;
+            self.hardlink_targets
+                .insert(path.clone(), source.to_path_buf());
+        }
+        self.created_paths.insert(relative, path.clone());
+        self.archive_names.push(meta.name.clone());
         self.outputs.push(ExtractedOutput {
-            name: meta.name.clone(),
-            path,
-            meta: rar50_extracted_meta(meta),
+            name,
+            path: destination,
+            meta: meta.clone(),
             family: self.family,
             restore_metadata,
         });
@@ -840,24 +907,173 @@ impl<'a> ExtractOutputState<'a> {
         Ok(())
     }
 
-    fn record_rar50_created_path(
+    fn prepare_staged_path(
         &mut self,
-        meta: &rars::rar50::ExtractedEntryMeta,
-        path: PathBuf,
-    ) -> rars::Result<()> {
-        let key = rar50_output_relative_path(&meta.name, meta.host_os)
+        destination: &Path,
+        directory: bool,
+    ) -> rars::Result<PathBuf> {
+        if !directory
+            && self.overwrite == OverwritePolicy::Never
+            && fs::symlink_metadata(destination).is_ok()
+        {
+            return Err(
+                std::io::Error::new(std::io::ErrorKind::AlreadyExists, "File exists").into(),
+            );
+        }
+        if self.staging.is_none() {
+            self.staging = Some(ExtractionStaging::new(self.out_dir)?);
+        }
+        let root = &self.staging.as_ref().expect("staging exists").root;
+        self.staging
+            .as_ref()
+            .expect("staging exists")
+            .reject_alias(destination)?;
+        let relative = destination
+            .strip_prefix(self.out_dir)
             .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?;
-        self.created_paths.insert(key, path);
+        if destination.starts_with(root) {
+            return Err(rars::Error::InvalidHeader(
+                "archive path conflicts with extraction storage",
+            ));
+        }
+        let staged = root.join(relative);
+        if let Ok(metadata) = fs::symlink_metadata(&staged) {
+            let explicit_directory = metadata.is_dir()
+                && self
+                    .staged_directories
+                    .contains(&fs::canonicalize(&staged)?);
+            if !metadata.is_dir() || !directory || explicit_directory {
+                return Err(rars::Error::InvalidHeader(
+                    "multiple archive entries map to the same output path",
+                ));
+            }
+        }
+        Ok(root.clone())
+    }
+
+    fn record_staged_path(&mut self, path: &Path, directory: bool) -> rars::Result<()> {
+        if directory {
+            self.staged_directories.insert(fs::canonicalize(path)?);
+        }
+        self.staged_paths.push(path.to_path_buf());
         Ok(())
     }
-}
 
-fn rar50_extracted_meta(meta: &rars::rar50::ExtractedEntryMeta) -> rars::ExtractedEntryMeta {
-    // The library resolves attributes against the host OS. Convert the name
-    // only for this destination adapter; outputs retain the original identity.
-    let mut common = rars::rar50_meta(meta);
-    common.name = rar50_entry_name(&meta.name, meta.host_os);
-    common
+    fn remember_directory_time(
+        &mut self,
+        destination: &Path,
+        meta: &rars::ExtractedEntryMeta,
+    ) -> rars::Result<()> {
+        if meta.is_directory
+            && time::extracted_system_time(self.family, meta.file_time, meta.mtime_refinement)
+                .is_none()
+        {
+            match fs::metadata(destination) {
+                Ok(metadata) if metadata.is_dir() => self
+                    .directory_times
+                    .push((destination.to_path_buf(), metadata.modified()?)),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Move every staged output to its destination. The library extracts
+    /// members one at a time and verifies each before asking for the next
+    /// output, so everything staged before a new callback has passed its
+    /// checksum. Publishing here keeps verified members when a later one fails
+    /// and holds at most one member in staging.
+    fn publish_verified(&mut self) -> rars::Result<()> {
+        // Publish new inodes rather than truncating any existing hard-link target.
+        while self.published < self.outputs.len() {
+            let staged = self.staged_paths[self.published].clone();
+            let relative = self.outputs[self.published]
+                .path
+                .strip_prefix(self.out_dir)
+                .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?
+                .to_path_buf();
+            let destination = output::checked_output_path(self.out_dir, &relative)?;
+            // The alias check resolves the destination already when it exists.
+            let existing = match &self.staging {
+                Some(staging) => staging.reject_alias(&destination)?,
+                None => fs::canonicalize(&destination).ok(),
+            };
+            if let Some(identity) = existing {
+                if self.published_identities.contains(&identity) {
+                    return Err(rars::Error::InvalidHeader(
+                        "multiple archive entries map to the same output path",
+                    ));
+                }
+            }
+            if fs::symlink_metadata(&staged)?.is_dir() {
+                fs::create_dir_all(&destination)?;
+            } else {
+                fs::create_dir_all(destination.parent().expect("validated path has parent"))?;
+                output::checked_output_path(self.out_dir, &relative)?;
+                if self.overwrite == OverwritePolicy::Always
+                    && self.staged_redirections.contains(&staged)
+                {
+                    match fs::symlink_metadata(&destination) {
+                        Ok(metadata) if metadata.is_dir() => fs::remove_dir(&destination)?,
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                // A hard link's target was published before the link was staged.
+                let hardlink_target = self
+                    .hardlink_targets
+                    .get(&staged)
+                    .map(|target| self.published_paths.get(target).unwrap_or(target).as_path());
+                output::publish_verified_output(
+                    &staged,
+                    &destination,
+                    self.overwrite,
+                    hardlink_target,
+                )?;
+            }
+            // Later redirections resolve this entry at its published location.
+            if self.created_paths.get(&relative) == Some(&staged) {
+                self.created_paths
+                    .insert(relative.clone(), destination.clone());
+            }
+            self.published_paths
+                .insert(staged.clone(), destination.clone());
+            // Symlinks may be dangling; their destination entries were reserved above.
+            if let Ok(identity) = fs::canonicalize(&destination) {
+                if !fs::symlink_metadata(&destination)?.file_type().is_symlink() {
+                    self.published_identities.insert(identity);
+                }
+            }
+            self.published += 1;
+        }
+        Ok(())
+    }
+
+    /// Keep what verified before `error`. The library reports a failure before
+    /// asking for another output, so the last staged member is verified only
+    /// when the error names a different entry. Without a name it is discarded.
+    fn publish_before_failure(&mut self, error: &rars::Error) -> rars::Result<()> {
+        let last_verified = matches!(
+            (failed_entry_name(error), self.archive_names.last()),
+            (Some(failed), Some(last)) if failed != last.as_slice()
+        );
+        if !last_verified && self.outputs.len() > self.published {
+            self.outputs.pop();
+        }
+        self.publish_verified()
+    }
+
+    /// Publish the final member once the whole extraction call has succeeded.
+    fn publish(mut self) -> rars::Result<Vec<ExtractedOutput>> {
+        self.publish_verified()?;
+        for (path, modified) in &self.directory_times {
+            output::set_modified_time(path, *modified)?;
+        }
+        Ok(std::mem::take(&mut self.outputs))
+    }
 }
 
 fn extract_single_archive(
@@ -865,30 +1081,12 @@ fn extract_single_archive(
     options: ArchiveReadOptions<'_>,
     state: &RefCell<ExtractOutputState<'_>>,
 ) -> rars::Result<()> {
-    match archive {
-        DetectedArchive::Rar50Plus(archive) => archive.extract_to_with_redirections(
-            options,
-            |meta| state.borrow_mut().open_rar50_entry(meta),
-            |meta, redirection| {
-                state
-                    .borrow_mut()
-                    .create_rar50_redirection(meta, redirection)
-            },
-        ),
-        _ => extract_archive_to_with_options(archive, options, |meta| {
-            if options.legacy_name_encoding.is_none() || meta.name_is_unicode {
-                return state.borrow_mut().open_entry(meta);
-            }
-            let mut decoded = meta.clone();
-            decoded.name = rars::filename::decoded_name(
-                &meta.name,
-                meta.name_is_unicode,
-                options.legacy_name_encoding,
-            )?
-            .into_owned();
-            state.borrow_mut().open_entry(&decoded)
-        }),
-    }
+    state.borrow_mut().legacy_name_encoding = options.legacy_name_encoding;
+    archive.extract_with_links(
+        options,
+        |meta| state.borrow_mut().open_entry(meta),
+        |meta, link| state.borrow_mut().create_link(meta, link),
+    )
 }
 
 fn extract_volume_archives(
@@ -896,42 +1094,13 @@ fn extract_volume_archives(
     options: ArchiveReadOptions<'_>,
     state: &RefCell<ExtractOutputState<'_>>,
 ) -> rars::Result<()> {
-    if archives
-        .iter()
-        .all(|archive| matches!(archive, DetectedArchive::Rar50Plus(_)))
-    {
-        let rar50_archives: Vec<_> = archives
-            .iter()
-            .map(|archive| match archive {
-                DetectedArchive::Rar50Plus(archive) => archive.clone(),
-                _ => unreachable!("all archives are RAR5"),
-            })
-            .collect();
-        return rars::rar50::extract_volumes_to_with_redirections(
-            &rar50_archives,
-            options,
-            |meta| state.borrow_mut().open_rar50_entry(meta),
-            |meta, redirection| {
-                state
-                    .borrow_mut()
-                    .create_rar50_redirection(meta, redirection)
-            },
-        );
-    }
-
-    extract_volumes_to_with_options(archives, options, |meta| {
-        if options.legacy_name_encoding.is_none() || meta.name_is_unicode {
-            return state.borrow_mut().open_entry(meta);
-        }
-        let mut decoded = meta.clone();
-        decoded.name = rars::filename::decoded_name(
-            &meta.name,
-            meta.name_is_unicode,
-            options.legacy_name_encoding,
-        )?
-        .into_owned();
-        state.borrow_mut().open_entry(&decoded)
-    })
+    state.borrow_mut().legacy_name_encoding = options.legacy_name_encoding;
+    extract_volumes_with_links(
+        archives,
+        options,
+        |meta| state.borrow_mut().open_entry(meta),
+        |meta, link| state.borrow_mut().create_link(meta, link),
+    )
 }
 
 fn validate_extract_destination(out_dir: &Path) -> CliResult<()> {
@@ -1297,7 +1466,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
     let inputs = collect_inputs(input_paths)?;
     let total: u64 = inputs.iter().map(|entry| entry.size).sum();
     progress.finish(format!(
-        "Found {} files ({})",
+        "Found {} entries ({})",
         inputs.len(),
         indicatif::HumanBytes(total)
     ));
@@ -1338,13 +1507,11 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
                 let entries: Vec<_> = inputs
                     .iter()
                     .map(|input| {
-                        let entry = rars::rar15_40::StreamingEntry::new(
-                            input.name.clone(),
-                            rars::EntrySource::from_path(input.path.clone()),
-                        )
-                        .with_file_time(input.dos_mtime)
-                        .with_file_attr(rar15_file_attr(input.unix_mode, input.file_attr))
-                        .with_host_os(3);
+                        let entry =
+                            rars::rar15_40::StreamingEntry::new(input.name.clone(), input.source())
+                                .with_file_time(input.dos_mtime)
+                                .with_file_attr(rar15_file_attr(input.unix_mode, input.file_attr))
+                                .with_host_os(RAR15_HOST_NATIVE);
                         let entry = match file_comment.as_deref() {
                             Some(comment) => entry.with_file_comment(comment.to_vec()),
                             None => entry,
@@ -1385,12 +1552,10 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
                 let entries: Vec<_> = inputs
                     .iter()
                     .map(|input| {
-                        let entry = rars::rar13::StreamingEntry::new(
-                            input.name.clone(),
-                            rars::EntrySource::from_path(input.path.clone()),
-                        )
-                        .with_file_time(input.dos_mtime)
-                        .with_file_attr(input.file_attr);
+                        let entry =
+                            rars::rar13::StreamingEntry::new(input.name.clone(), input.source())
+                                .with_file_time(input.dos_mtime)
+                                .with_file_attr(input.file_attr);
                         let entry = match file_comment.as_deref() {
                             Some(comment) => entry.with_file_comment(comment.to_vec()),
                             None => entry,
@@ -1487,6 +1652,10 @@ struct LegacyVolumeWrite<'a> {
 }
 
 fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> CliResult<()> {
+    let inputs = collect_inputs(plan.input_paths)?;
+    if inputs.len() != 1 || inputs[0].is_directory {
+        return Err("multivolume writer supports one regular input file".into());
+    }
     warn_if_buffered_write_is_large(plan.input_paths, plan.target);
     progress.spinner("Scanning inputs");
     let owned = read_inputs_with_progress(
@@ -1498,8 +1667,14 @@ fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> 
             progress.advance(bytes);
         },
     )?;
-    // Invariant: one input, checked before anything was read.
-    let entry = owned.first().expect("one input checked above");
+    // Collection runs again while reading; check it too so an input tree that
+    // changed since preflight cannot silently lose every member after the first.
+    let [entry] = owned.as_slice() else {
+        return Err("multivolume writer supports one regular input file".into());
+    };
+    if entry.file_attr & 0x10 != 0 {
+        return Err("multivolume writer supports one regular input file".into());
+    }
     progress.finish(format!(
         "Read 1 file ({})",
         indicatif::HumanBytes(entry.data.len() as u64)
@@ -1530,7 +1705,7 @@ fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> 
                         data: &entry.data,
                         file_time: entry.dos_mtime,
                         file_attr: rar15_file_attr(entry.unix_mode, entry.file_attr),
-                        host_os: 3,
+                        host_os: RAR15_HOST_NATIVE,
                         password,
                         file_comment: plan.file_comment,
                     },
@@ -1545,7 +1720,7 @@ fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> 
                         data: &entry.data,
                         file_time: entry.dos_mtime,
                         file_attr: rar15_file_attr(entry.unix_mode, entry.file_attr),
-                        host_os: 3,
+                        host_os: RAR15_HOST_NATIVE,
                         password,
                         file_comment: plan.file_comment,
                     },
@@ -1624,27 +1799,28 @@ fn write_plain_rar50_streaming(
     let inputs = collect_inputs(input_paths)?;
     let total: u64 = inputs.iter().map(|entry| entry.size).sum();
     progress.finish(format!(
-        "Found {} files ({})",
+        "Found {} entries ({})",
         inputs.len(),
         indicatif::HumanBytes(total)
     ));
     let entries: Vec<_> = inputs
         .into_iter()
         .map(|entry| {
+            let source = entry.source();
             let name = if cfg!(unix) {
                 rars::filename::encode_rar50(&entry.name).into_owned()
             } else {
                 entry.name
             };
-            let entry =
-                rars::rar50::ArchiveEntry::new(name, rars::EntrySource::from_path(entry.path))
-                    .with_mtime(entry.unix_mtime)
-                    .with_attributes(u64::from(
-                        entry
-                            .unix_mode
-                            .unwrap_or_else(|| u32::from(entry.file_attr)),
-                    ))
-                    .with_host_os(RAR50_HOST_NATIVE);
+            let entry = rars::rar50::ArchiveEntry::new(name, source)
+                .with_directory(entry.is_directory)
+                .with_mtime(entry.unix_mtime)
+                .with_attributes(u64::from(
+                    entry
+                        .unix_mode
+                        .unwrap_or_else(|| u32::from(entry.file_attr)),
+                ))
+                .with_host_os(RAR50_HOST_NATIVE);
             let entry = match file_comment {
                 Some(comment) => entry.with_service(rars::rar50::ServiceEntry::new(
                     b"CMT".to_vec(),
@@ -1949,13 +2125,26 @@ fn write_archive_streaming(
     if archive_path == Path::new("-") || archive_path == Path::new("/dev/stdout") {
         return write(&mut std::io::stdout());
     }
+    write_archive_file(archive_path, write)
+}
+
+/// Replaces the destination entry only after writing and syncing succeeds.
+/// Existing symlinks and hard links are replaced rather than written through.
+fn write_archive_file<T>(
+    archive_path: &Path,
+    write: impl FnOnce(&mut dyn Write) -> CliResult<T>,
+) -> CliResult<T> {
     let (temporary, mut output) = create_streaming_archive_temp(archive_path)?;
-    let result = (|| -> CliResult<()> {
-        write(&mut output)?;
+    let result = (|| -> CliResult<T> {
+        let value = write(&mut output)?;
         output.sync_all()?;
-        fs::rename(&temporary, archive_path)?;
-        Ok(())
+        Ok(value)
     })();
+    drop(output);
+    let result = result.and_then(|value| {
+        fs::rename(&temporary, archive_path)?;
+        Ok(value)
+    });
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
@@ -2041,14 +2230,16 @@ fn write_volume_parts(
     parts: &[Vec<u8>],
     progress: &CliProgress,
 ) -> CliResult<()> {
+    // Naming can fail before any filesystem work (for example after .r99).
+    // Plan the complete set first so that refusal cannot overwrite old parts.
+    let paths = (0..parts.len())
+        .map(|index| volume_part_path(first_path, index))
+        .collect::<CliResult<Vec<_>>>()?;
     let total = parts.iter().map(|part| part.len() as u64).sum();
     progress.bar(format!("Writing {} volumes", parts.len()), total);
-    let mut paths = Vec::with_capacity(parts.len());
-    for (index, bytes) in parts.iter().enumerate() {
-        let path = volume_part_path(first_path, index)?;
-        let mut file = fs::File::create(&path)?;
+    for (path, bytes) in paths.iter().zip(parts) {
+        let mut file = fs::File::create(path)?;
         write_bytes_with_progress(&mut file, bytes, progress)?;
-        paths.push(path);
     }
     progress.finish("Volumes written");
     print_created_volumes(&paths);
@@ -2104,6 +2295,624 @@ pub(crate) fn resolve_password_args(args: &PasswordArgs) -> CliResult<Option<Pas
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn single_thread_workers_run_on_the_caller_and_drain_panicking_jobs() {
+        const CHILD: &str = "RARS_INLINE_POOL_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::single_thread_workers_run_on_the_caller_and_drain_panicking_jobs",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "fresh-process pool probe failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        super::configure_threads(Some(1)).unwrap();
+        assert_eq!(rayon::current_num_threads(), 1);
+        assert_eq!(rayon::current_thread_index(), Some(0));
+        let caller = std::thread::current().id();
+        let sum: usize = (0..128usize)
+            .into_par_iter()
+            .map(|value| {
+                assert_eq!(std::thread::current().id(), caller);
+                let (left, right) = rayon::join(|| value, || value + 1);
+                left + right
+            })
+            .sum();
+        assert_eq!(sum, (0..128usize).map(|value| 2 * value + 1).sum());
+
+        let sibling_finished = AtomicBool::new(false);
+        let panic = std::panic::catch_unwind(|| {
+            rayon::join(
+                || panic!("intentional synchronous worker failure"),
+                || sibling_finished.store(true, Ordering::SeqCst),
+            );
+        });
+        assert!(panic.is_err());
+        assert!(sibling_finished.load(Ordering::SeqCst));
+        assert_eq!((0..16usize).into_par_iter().sum::<usize>(), 120);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn volume_preflight_reports_parent_symlink_loops_and_cleans_staging() {
+        let root = crate::scratch::case("volume-preflight-symlink-loop");
+        let first = root.join("archive.rar");
+        let blocked = root.join("loop/archive.rar");
+        std::os::unix::fs::symlink("loop", root.join("loop")).unwrap();
+        let mut sink = stage_two_volumes(&first);
+        sink.first_path = &blocked;
+        let error = sink.finish(Ok(())).unwrap_err();
+        assert_eq!(error.exit_code(), 1);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        assert!(std::fs::symlink_metadata(root.join("loop"))
+            .unwrap()
+            .is_symlink());
+    }
+
+    fn append_rar50_test_header(bytes: &mut Vec<u8>, body: &[u8]) {
+        assert!(body.len() < 128);
+        let mut encoded = vec![body.len() as u8];
+        encoded.extend_from_slice(body);
+        bytes.extend_from_slice(&rars::crc32::crc32(&encoded).to_le_bytes());
+        bytes.extend_from_slice(&encoded);
+    }
+
+    #[test]
+    fn info_preserves_unknown_services_before_an_archive_comment() {
+        let mut bytes = b"Rar!\x1a\x07\x01\x00".to_vec();
+        append_rar50_test_header(&mut bytes, &[1, 0, 0]);
+        // Zero-length stored service records, with an unknown name preceding
+        // CMT. The comment search must traverse earlier service headers.
+        append_rar50_test_header(&mut bytes, b"\x03\0\0\0\0\0\0\x05OTHER");
+        append_rar50_test_header(&mut bytes, b"\x03\0\0\0\0\0\0\x03CMT");
+        append_rar50_test_header(&mut bytes, &[5, 0, 0]);
+        let archive = rars::rar50::Archive::parse(&bytes).unwrap();
+        assert_eq!(archive.services().count(), 2);
+        assert_eq!(archive.archive_comment().unwrap(), Some(Vec::new()));
+        super::info_rar50_verbose("services.rar", &archive, super::ArchiveReadOptions::new())
+            .unwrap();
+        super::info_rar50_terse("services.rar", &archive, super::ArchiveReadOptions::new())
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collection_extraction_preserves_fixture_redirections_and_unicode_names() {
+        let fixtures =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../rars/tests/fixtures");
+        let root = crate::scratch::case("collection-extract-redirections");
+        let archive =
+            rars::rar50::Archive::parse_path(fixtures.join("rar50/wild/symlink.rar")).unwrap();
+        let state = std::cell::RefCell::new(super::ExtractOutputState::new(
+            &root,
+            super::OverwritePolicy::Never,
+            rars::ArchiveFamily::Rar50Plus,
+        ));
+        super::extract_volume_archives(
+            &[super::DetectedArchive::Rar50Plus(archive)],
+            super::ArchiveReadOptions::new(),
+            &state,
+        )
+        .unwrap();
+        state.into_inner().publish().unwrap();
+        assert_eq!(
+            std::fs::read_link(root.join("symlink.txt")).unwrap(),
+            std::path::PathBuf::from("file.txt")
+        );
+        assert_eq!(
+            std::fs::read_link(root.join("dirlink")).unwrap(),
+            std::path::PathBuf::from("dir")
+        );
+        assert!(root.join("file.txt").is_file());
+
+        let root = crate::scratch::case("collection-redirection-refusal");
+        std::fs::write(root.join("symlink.txt"), b"existing destination").unwrap();
+        let archive =
+            rars::rar50::Archive::parse_path(fixtures.join("rar50/wild/symlink.rar")).unwrap();
+        let state = std::cell::RefCell::new(super::ExtractOutputState::new(
+            &root,
+            super::OverwritePolicy::Never,
+            rars::ArchiveFamily::Rar50Plus,
+        ));
+        assert!(super::extract_volume_archives(
+            &[super::DetectedArchive::Rar50Plus(archive)],
+            super::ArchiveReadOptions::new(),
+            &state
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(root.join("symlink.txt")).unwrap(),
+            b"existing destination"
+        );
+
+        let root = crate::scratch::case("collection-extract-unicode");
+        let archive = rars::rar15_40::Archive::parse_path(
+            fixtures.join("rar15_40/encrypted/rar4_junrar_file_content_encrypted_unicode.rar"),
+        )
+        .unwrap();
+        let state = std::cell::RefCell::new(super::ExtractOutputState::new(
+            &root,
+            super::OverwritePolicy::Never,
+            rars::ArchiveFamily::Rar15To40,
+        ));
+        let mut options = super::ArchiveReadOptions::with_optional_password(Some(b"test"));
+        options.legacy_name_encoding = Some(rars::filename::LegacyNameEncoding::Cp850);
+        super::extract_volume_archives(
+            &[super::DetectedArchive::Rar15To40(archive)],
+            options,
+            &state,
+        )
+        .unwrap();
+        state.into_inner().publish().unwrap();
+        assert_eq!(
+            std::fs::read(root.join("新建文本文档.txt")).unwrap(),
+            b"aaaaaaaaaa"
+        );
+    }
+
+    #[test]
+    fn repeated_worker_configuration_reports_the_global_pool_error() {
+        // Other tests may have initialized Rayon already. Either way, a second
+        // attempt must expose the library error through the CLI diagnostic.
+        let _ = super::configure_threads(Some(2));
+        let error = super::configure_threads(Some(2)).unwrap_err();
+        assert_eq!(error.exit_code(), 1);
+        assert!(error
+            .to_string()
+            .contains("failed to configure parallel workers"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn buffered_volume_warning_uses_file_sizes_without_reading_payloads() {
+        const CHILD_INPUT: &str = "RARS_CLI_TEST_BUFFER_WARNING_INPUT";
+        if let Some(path) = std::env::var_os(CHILD_INPUT) {
+            let path = std::path::PathBuf::from(path);
+            super::warn_if_buffered_write_is_large(
+                std::slice::from_ref(&path),
+                super::ArchiveVersion::Rar50,
+            );
+            super::warn_if_buffered_write_is_large(
+                &[path.with_file_name("missing")],
+                super::ArchiveVersion::Rar14,
+            );
+            super::warn_if_buffered_write_is_large(&[path], super::ArchiveVersion::Rar14);
+            return;
+        }
+        let root = crate::scratch::case("buffered-volume-warning");
+        let path = root.join("sparse.bin");
+        let file = std::fs::File::create(&path).unwrap();
+        for (size, expected_warnings) in [(0, 0), (256 * 1024 * 1024, 1)] {
+            // A sparse file exercises the real metadata threshold without
+            // allocating or decoding hundreds of megabytes.
+            file.set_len(size).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::buffered_volume_warning_uses_file_sizes_without_reading_payloads",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_INPUT, &path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(
+                stderr.matches("warning:").count(),
+                expected_warnings,
+                "{stderr}"
+            );
+            if expected_warnings != 0 {
+                assert!(stderr.contains("--format rar14 builds a volume set in memory"));
+                assert!(stderr.contains("--format rar50 splits as it goes"));
+            }
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_sniffing_reports_permission_errors_after_successful_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::scratch::case("archive-sniff-permissions");
+        let path = root.join("private.rar");
+        std::fs::write(&path, b"private contents").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
+        // Privileged runners can still read mode-zero files. Restore the mode
+        // before returning so the scratch cleanup always remains possible.
+        let privileged = std::fs::File::open(&path).is_ok();
+        if !privileged {
+            let error = super::looks_like_archive_path(&path)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("failed to inspect extract output path"));
+            assert!(error.contains(&path.display().to_string()));
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!super::looks_like_archive_path(&path).unwrap());
+    }
+
+    #[test]
+    fn info_accepts_independent_archive_metadata_fields() {
+        // The reader admits independent NAME and TIME bits, including neither.
+        // Build physical headers because the writer deliberately requires a
+        // creation time whenever it emits a name.
+        for flags in [0u8, 1, 2, 3] {
+            let mut record = vec![2, flags]; // metadata record type, field bits
+            if flags & 1 != 0 {
+                record.extend_from_slice(b"\x08name.rar");
+            }
+            if flags & 2 != 0 {
+                record.extend_from_slice(&0x01dcd60e662d7a32u64.to_le_bytes());
+            }
+            let mut extra = vec![record.len() as u8];
+            extra.extend_from_slice(&record);
+            let mut main = vec![1, 1, extra.len() as u8, 0]; // main, extras, size, archive flags
+            main.extend_from_slice(&extra);
+            let mut bytes = b"Rar!\x1a\x07\x01\x00".to_vec();
+            append_rar50_test_header(&mut bytes, &main);
+            append_rar50_test_header(&mut bytes, &[5, 0, 0]); // end header with no flags
+            let archive = rars::rar50::Archive::parse(&bytes).unwrap();
+            let metadata = archive.main.archive_metadata().unwrap();
+            assert_eq!(
+                metadata.name.as_deref(),
+                (flags & 1 != 0).then_some(b"name.rar".as_slice())
+            );
+            assert_eq!(metadata.creation_time.is_some(), flags & 2 != 0);
+            super::info_rar50_terse("metadata.rar", &archive, super::ArchiveReadOptions::new())
+                .unwrap();
+            super::info_rar50_verbose("metadata.rar", &archive, super::ArchiveReadOptions::new())
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn verbose_info_reports_lazy_comment_and_compression_errors() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../rars/tests/fixtures");
+        let mut legacy = rars::rar13::Archive::parse_path(root.join("rar13/FCOMM.RAR")).unwrap();
+        let entry = legacy
+            .entries
+            .iter_mut()
+            .find(|entry| entry.has_file_comment())
+            .unwrap();
+        entry.extra.clear();
+        let error =
+            super::info_rar13_verbose("broken13.rar", &legacy, super::ArchiveReadOptions::new())
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("failed to decode file comment"));
+        assert!(error.contains("broken13.rar"));
+
+        let mut authenticity =
+            rars::rar13::Archive::parse_path(root.join("rar13/rar140_av/rar140_av_patched.rar"))
+                .unwrap();
+        authenticity.main.extra.clear();
+        let error = super::info_rar13_verbose(
+            "broken-av.rar",
+            &authenticity,
+            super::ArchiveReadOptions::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("failed to parse authenticity verification"));
+        assert!(error.contains("broken-av.rar"));
+
+        let mut legacy15 =
+            rars::rar15_40::Archive::parse_path(root.join("rar15_40/rars_generated/comments.rar"))
+                .unwrap();
+        let file = legacy15
+            .blocks
+            .iter_mut()
+            .find_map(|block| match block {
+                rars::rar15_40::Block::File(file) if file.has_file_comment() => Some(file),
+                _ => None,
+            })
+            .unwrap();
+        file.file_comment.truncate(1);
+        let error = super::info_rar15_40_verbose(
+            "broken15.rar",
+            &legacy15,
+            super::ArchiveReadOptions::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("failed to decode file comment"));
+        assert!(error.contains("broken15.rar"));
+
+        let mut modern =
+            rars::rar50::Archive::parse_path(root.join("rar50/with_all_services.rar")).unwrap();
+        let file = modern
+            .blocks
+            .iter_mut()
+            .find_map(|block| match block {
+                rars::rar50::Block::File(file) => Some(file),
+                _ => None,
+            })
+            .unwrap();
+        file.compression_info = u64::MAX;
+        let error =
+            super::info_rar50_verbose("broken50.rar", &modern, super::ArchiveReadOptions::new())
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("failed to decode RAR 5 compression info"));
+        assert!(error.contains("hello.txt"));
+    }
+
+    #[test]
+    fn volume_publication_reports_backup_cleanup_failure_after_success() {
+        let root = crate::scratch::case("volume-backup-cleanup-failure");
+        let first = root.join("archive.rar");
+        let paths: Vec<_> = (0..2)
+            .map(|i| super::rar50_volume_part_path(&first, i, 2).unwrap())
+            .collect();
+        std::fs::write(&paths[0], b"old archive").unwrap();
+        let retained = root.join("retained-original");
+        let mut blocked_backup = None;
+        let error = stage_two_volumes(&first)
+            .finish_with_rename(Ok(()), |source, destination| {
+                if blocked_backup.is_none() {
+                    let backup = std::fs::read_dir(&root)?
+                        .map(|entry| entry.unwrap().path())
+                        .find(|path| std::fs::read(path).is_ok_and(|bytes| bytes == b"old archive"))
+                        .unwrap();
+                    // Simulate an external replacement after backup creation. The
+                    // real cleanup must report its error without undoing publication.
+                    std::fs::rename(&backup, &retained)?;
+                    std::fs::create_dir(&backup)?;
+                    blocked_backup = Some(backup);
+                }
+                std::fs::rename(source, destination)
+            })
+            .unwrap_err();
+        let error = error.to_string();
+        assert!(error.contains("volumes published, but cannot remove backups"));
+        assert!(error.contains(&blocked_backup.unwrap().display().to_string()));
+        assert_eq!(std::fs::read(retained).unwrap(), b"old archive");
+        for (i, path) in paths.iter().enumerate() {
+            assert_eq!(std::fs::read(path).unwrap(), format!("new {i}").as_bytes());
+        }
+    }
+
+    #[test]
+    fn add_command_validation_and_filter_selection_preserve_explicit_requests() {
+        use clap::Parser;
+        let arguments = || {
+            let parsed =
+                super::cli::Cli::try_parse_from(["rars", "add", "archive.rar", "input.txt"])
+                    .unwrap();
+            let super::Command::Add(args) = parsed.command else {
+                panic!("expected add")
+            };
+            args
+        };
+        let mut args = arguments();
+        args.level = Some(6);
+        assert_eq!(super::build_add_command(args).err().unwrap().exit_code(), 2);
+        let mut args = arguments();
+        args.store = true;
+        args.level = Some(1);
+        assert!(super::build_add_command(args)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("--store"));
+        let mut args = arguments();
+        args.level = Some(0);
+        assert!(super::build_add_command(args).unwrap().store);
+        let mut args = arguments();
+        args.level = Some(0);
+        args.store = true;
+        assert!(super::build_add_command(args).unwrap().store);
+        let mut args = arguments();
+        args.store = true;
+        args.solid = true;
+        assert!(super::build_add_command(args)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("solid output requires compression"));
+        for target in [
+            super::ArchiveVersion::Rar13,
+            super::ArchiveVersion::Rar50,
+            super::ArchiveVersion::Rar70,
+        ] {
+            assert!(super::AddWritePlan::for_target(target).is_err());
+        }
+        use rars::rar50::FilterPolicy;
+        assert!(matches!(
+            super::rar50_filter_policy(false, false, true, false, None, None, false),
+            FilterPolicy::None
+        ));
+        assert!(matches!(
+            super::rar50_filter_policy(true, false, true, false, None, None, false),
+            FilterPolicy::Auto
+        ));
+    }
+
+    #[test]
+    fn extraction_destinations_refuse_files_and_duplicate_planned_paths() {
+        let root = crate::scratch::case("extract-destination-boundaries");
+        let file = root.join("plain.txt");
+        std::fs::write(&file, b"not an archive").unwrap();
+        assert!(super::validate_extract_destination(&file)
+            .unwrap_err()
+            .to_string()
+            .contains("not a directory"));
+        assert!(super::validate_extract_destination(&root).is_ok());
+        assert!(super::validate_extract_destination(&root.join("missing")).is_ok());
+        assert!(!super::looks_like_archive_path(&file).unwrap());
+        assert!(!super::looks_like_archive_path(&root).unwrap());
+        assert!(!super::looks_like_archive_path(&root.join("missing")).unwrap());
+        assert!(super::reject_ambiguous_extract_target(&[]).is_ok());
+        let mut state = super::ExtractOutputState::new(
+            &root,
+            super::OverwritePolicy::Always,
+            rars::ArchiveFamily::Rar50Plus,
+        );
+        state.reserve_output_path(file.clone()).unwrap();
+        assert!(matches!(
+            state.reserve_output_path(file),
+            Err(rars::Error::InvalidHeader(
+                "multiple archive entries map to the same output path"
+            ))
+        ));
+        #[cfg(unix)]
+        {
+            let loop_path = root.join("loop");
+            std::os::unix::fs::symlink("loop", &loop_path).unwrap();
+            assert!(super::looks_like_archive_path(&loop_path)
+                .unwrap_err()
+                .to_string()
+                .contains("failed to inspect"));
+            assert!(super::reject_ambiguous_extract_target(&[loop_path]).is_err());
+            assert!(
+                super::looks_like_archive_path(std::path::Path::new("/dev/null"))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("not a regular file or directory")
+            );
+        }
+    }
+
+    #[test]
+    fn reader_errors_keep_password_exit_classes_and_service_labels() {
+        let password_error = super::CliError::from(rars::Error::NeedPassword);
+        assert_eq!(password_error.exit_code(), 3);
+        assert_eq!(
+            super::CliError::from(rars::Error::InvalidHeader("invalid")).exit_code(),
+            1
+        );
+        for (name, label) in [
+            (b"QO".as_slice(), "quick-open"),
+            (b"RR", "recovery"),
+            (b"CMT", "comment"),
+            (b"ACL", "acl"),
+            (b"STM", "stream"),
+            (b"OTHER", "OTHER"),
+        ] {
+            assert_eq!(super::service_label(name), label);
+        }
+    }
+
+    #[test]
+    fn archive_publication_failures_preserve_destinations_and_clean_staging() {
+        let root = crate::scratch::case("archive-publication-errors");
+        let archive = root.join("archive.rar");
+        std::fs::write(&archive, b"original").unwrap();
+        let error = super::write_archive_file(&archive, |output| {
+            output.write_all(b"partial")?;
+            Err::<(), _>(super::CliError::general("injected writer failure"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "injected writer failure");
+        assert_eq!(std::fs::read(&archive).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+
+        let directory = root.join("directory.rar");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(super::write_archive_file(&directory, |output| {
+            output.write_all(b"new")?;
+            Ok(())
+        })
+        .is_err());
+        assert!(directory.is_dir());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        assert!(super::create_streaming_archive_temp(std::path::Path::new("/")).is_err());
+        assert!(super::create_streaming_archive_temp(&root.join("missing/archive.rar")).is_err());
+
+        // Every name is owned by this test's private directory. A collision must
+        // never truncate an existing staging file, including after exhaustion.
+        for sequence in 0..128u8 {
+            let temporary = root.join(format!(
+                ".archive.rar.rars-writing-{}-{sequence:02x}",
+                std::process::id()
+            ));
+            std::fs::write(temporary, b"occupied").unwrap();
+        }
+        assert_eq!(
+            super::create_streaming_archive_temp(&archive)
+                .unwrap_err()
+                .to_string(),
+            "could not allocate a unique temporary archive file"
+        );
+        let first = root.join(format!(
+            ".archive.rar.rars-writing-{}-00",
+            std::process::id()
+        ));
+        assert_eq!(std::fs::read(&first).unwrap(), b"occupied");
+        std::fs::remove_file(&first).unwrap();
+        let (temporary, output) = super::create_streaming_archive_temp(&archive).unwrap();
+        assert_eq!(temporary, first);
+        drop(output);
+        std::fs::remove_file(temporary).unwrap();
+    }
+
+    #[test]
+    fn archive_comments_escape_controls_and_preserve_text() {
+        for (bytes, expected) in [
+            (b"".as_slice(), ""),
+            (b"\0\0", ""),
+            (b"hello\r\n\0\0", "hello"),
+            (b"first\n\tsecond", "first\n\tsecond"),
+            (b"\x1b[31m\r\x7f", "\\x1b[31m\\x0d\\x7f"),
+            (b"invalid \xff", "invalid \u{fffd}"),
+            ("café\u{0085}".as_bytes(), "café\\x85"),
+        ] {
+            assert_eq!(super::render_comment_safe(bytes), expected);
+            super::print_comment("  ", bytes);
+        }
+        super::print_entry_table(std::iter::empty());
+        super::print_entry_table([(u64::MAX, 0, "large.txt".to_owned())]);
+    }
+
+    #[test]
+    fn size_and_thread_parsers_reject_invalid_and_overflowing_values() {
+        for value in ["", "  ", "k", "M", "G", "-1", "1.5k", "nope"] {
+            assert!(super::parse_size_string(value).is_err(), "{value:?}");
+        }
+        assert_eq!(super::parse_size_string(" 2K ").unwrap(), 2048);
+        assert_eq!(super::parse_size_string("0").unwrap(), 0);
+        assert_eq!(
+            super::parse_size_string(&usize::MAX.to_string()).unwrap(),
+            usize::MAX
+        );
+        assert!(super::parse_size_string(&format!("{}k", usize::MAX))
+            .unwrap_err()
+            .contains("overflows usize"));
+        assert!(super::parse_size_string(&format!("{}0", usize::MAX)).is_err());
+        assert_eq!(super::parse_thread_count("1").unwrap(), 1);
+        assert_eq!(
+            super::parse_thread_count(&usize::MAX.to_string()).unwrap(),
+            usize::MAX
+        );
+        assert_eq!(
+            super::parse_thread_count("0").unwrap_err(),
+            "thread count must be at least 1"
+        );
+        for value in ["", "-1", " 1", "1k"] {
+            assert!(super::parse_thread_count(value).is_err(), "{value:?}");
+        }
+    }
+
     fn stage_two_volumes(first_path: &std::path::Path) -> super::CliVolumeSink<'_> {
         use rars::rar50::VolumeSink;
         use std::io::Write;
@@ -2302,6 +3111,15 @@ mod tests {
             rar50_buffered_decode_limit_hint(&error),
             "\nhint: retry with --rar50-buffered-decode-limit 943718400 if you trust this archive and have enough memory"
         );
+        let offset_context = Error::AtArchiveOffset {
+            offset: 123,
+            source: Box::new(error),
+        };
+        assert_eq!(
+            super::find_rar50_buffered_decode_limit_error(&offset_context),
+            Some((512 * 1024 * 1024, 900 * 1024 * 1024))
+        );
+        assert!(rar50_buffered_decode_limit_hint(&offset_context).contains("943718400"));
     }
 
     #[test]

@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::rar50::{self, Archive, Block};
 use rars::{ArchiveReadOptions, Error};
 use std::cell::RefCell;
@@ -89,7 +91,7 @@ fn streamed_split_members_match_buffered_plain_encrypted_and_solid_fixtures() {
 }
 
 #[test]
-fn oversized_filtered_split_member_returns_the_same_typed_limit_as_unsplit() {
+fn oversized_filtered_split_member_streams_like_unsplit() {
     let payload = b"\xe8\0\0\0\0filtered payload block\n".repeat(256);
     let entry = rar50::ArchiveEntry::new(
         b"filtered".to_vec(),
@@ -118,11 +120,9 @@ fn oversized_filtered_split_member_returns_the_same_typed_limit_as_unsplit() {
         collect(&volumes, payload.len() as u64, None).unwrap(),
         vec![payload.clone()]
     );
-    let error = collect(&volumes, payload.len() as u64 - 1, None).unwrap_err();
-    assert!(
-        matches!(cause(&error), Error::Rar50BufferedDecodeLimitExceeded { limit, required }
-        if *limit == payload.len() as u64 - 1 && *required == payload.len() as u64),
-        "{error:?}"
+    assert_eq!(
+        collect(&volumes, payload.len() as u64 - 1, None).unwrap(),
+        vec![payload]
     );
 }
 

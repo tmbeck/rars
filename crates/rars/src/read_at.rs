@@ -84,5 +84,8 @@ impl Seek for ReadAtReader {
 }
 
 pub(crate) fn as_reader(source: Arc<dyn ReadAt>) -> ReadAtReader {
-    ReadAtReader { source, position: 0 }
+    ReadAtReader {
+        source,
+        position: 0,
+    }
 }

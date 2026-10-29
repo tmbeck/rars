@@ -2,6 +2,7 @@
 /// extracted from a word; only the two edge bytes need masking. The final
 /// partial byte stays zero-padded so callers can inspect or resume the buffer.
 #[inline]
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn write_msb_bits(
     bytes: &mut Vec<u8>,
     bit_pos: &mut usize,
@@ -35,15 +36,17 @@ pub(crate) fn write_msb_bits(
     }
 }
 
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn match_length(input: &[u8], pos: usize, distance: usize, max_length: usize) -> usize {
-    if distance == 0 || distance > pos {
-        return 0;
-    }
+    // Encoders supply older match-finder candidates or remembered distances
+    // already admitted at an earlier position in this forward-moving parse.
+    debug_assert!(distance != 0 && distance <= pos);
 
     let max_length = max_length.min(input.len().saturating_sub(pos));
     match_length_scalar(input, pos, distance, max_length, 0)
 }
 
+#[cfg(any(test, feature = "write"))]
 fn match_length_scalar(
     input: &[u8],
     pos: usize,
@@ -100,16 +103,7 @@ pub(crate) fn next_x86_opcode(
         return None;
     }
 
-    next_x86_opcode_scalar(data, start, end_exclusive, cmp_mask)
-}
-
-fn next_x86_opcode_scalar(
-    data: &[u8],
-    start: usize,
-    end_exclusive: usize,
-    cmp_mask: u8,
-) -> Option<usize> {
-    data[start..end_exclusive]
+    data[start..end]
         .iter()
         .position(|&byte| byte & cmp_mask == 0xe8)
         .map(|offset| start + offset)
@@ -118,6 +112,18 @@ fn next_x86_opcode_scalar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opcode_scan_clamps_the_end_and_handles_empty_extents() {
+        assert_eq!(next_x86_opcode(b"a\xe8b", 0, usize::MAX, 0xff), Some(1));
+        assert_eq!(next_x86_opcode(b"a\xe8b", 2, usize::MAX, 0xff), None);
+        assert_eq!(
+            next_x86_opcode(b"a\xe8b", usize::MAX, usize::MAX, 0xff),
+            None
+        );
+        assert_eq!(next_x86_opcode(b"a\xe8b", 1, 1, 0xff), None);
+        assert_eq!(next_x86_opcode(b"", 0, usize::MAX, 0xff), None);
+    }
 
     fn reference_match_length(
         input: &[u8],
@@ -130,6 +136,27 @@ mod tests {
             length += 1;
         }
         length
+    }
+
+    #[test]
+    fn match_length_clamps_the_requested_extent_at_input_end() {
+        let input = b"abcdabcdabcdabcd";
+        for pos in 1..=input.len() {
+            for distance in 1..=pos {
+                for requested in [0, 1, 3, 8, 32, usize::MAX] {
+                    let available = requested.min(input.len() - pos);
+                    assert_eq!(
+                        match_length(input, pos, distance, requested),
+                        reference_match_length(input, pos, distance, available),
+                        "pos={pos}, distance={distance}, requested={requested}"
+                    );
+                }
+            }
+        }
+        // The public RAR13 match finder also permits positions past EOF.
+        // There are no bytes to compare, so no indexing is attempted.
+        assert_eq!(match_length(input, input.len() + 1, 1, usize::MAX), 0);
+        assert_eq!(match_length(input, usize::MAX, usize::MAX, usize::MAX), 0);
     }
 
     #[test]

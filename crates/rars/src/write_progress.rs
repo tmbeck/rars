@@ -1,112 +1,5 @@
-/// A high-level archive-writing operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum WriteOperation {
-    /// Decoding and verifying source payloads for a rewrite; may overlap encoding.
-    Staging,
-    /// Compressing or otherwise preparing member payloads.
-    Compression,
-    /// Building a RAR 5 recovery record.
-    Recovery,
-    /// Writing finished archive bytes to the output.
-    Emission,
-}
-
-/// Progress reported by archive writers.
-///
-/// Callbacks can be invoked concurrently when parallel compression is enabled.
-/// Each member starts before its source is consumed and finishes after its packed
-/// payload is prepared. Different members may overlap. `Advanced` is the absolute
-/// byte counter; entry events must not be added to it. A failed operation does not
-/// report `OperationFinished`. Emission can contain recovery sub-operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum WriteProgressEvent<'a> {
-    /// An operation has started.
-    OperationStarted {
-        operation: WriteOperation,
-        total_bytes: Option<u64>,
-        total_entries: Option<usize>,
-        pass: usize,
-    },
-    /// Work on one archive member has started.
-    EntryStarted {
-        operation: WriteOperation,
-        index: usize,
-        total_entries: usize,
-        name: &'a [u8],
-        input_bytes: u64,
-    },
-    /// Work on one archive member has finished.
-    EntryFinished {
-        operation: WriteOperation,
-        index: usize,
-        total_entries: usize,
-        name: &'a [u8],
-        input_bytes: u64,
-    },
-    /// Absolute progress within the current operation or pass.
-    Advanced {
-        operation: WriteOperation,
-        completed_bytes: u64,
-        total_bytes: u64,
-        pass: usize,
-    },
-    /// One volume of a multi-volume set has been written out.
-    VolumeFinished {
-        volume_number: usize,
-        total_volumes: Option<usize>,
-        bytes: u64,
-    },
-    /// An operation has finished.
-    OperationFinished {
-        operation: WriteOperation,
-        total_bytes: Option<u64>,
-        total_entries: Option<usize>,
-        pass: usize,
-    },
-}
-
-/// Receives archive-writing progress events.
-pub trait WriteProgress: Send + Sync {
-    fn report(&self, event: WriteProgressEvent<'_>);
-
-    /// Returns true when the caller wants the active write operation to stop.
-    /// Writers retain an observed request for the rest of the write.
-    /// Cancellation is cooperative: it cannot interrupt a blocked caller I/O
-    /// operation or an indivisible allocation or cryptographic setup call.
-    fn is_cancelled(&self) -> bool {
-        false
-    }
-}
-
-impl<F> WriteProgress for F
-where
-    F: Fn(WriteProgressEvent<'_>) + Send + Sync,
-{
-    fn report(&self, event: WriteProgressEvent<'_>) {
-        self(event);
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct ProgressReporter<'a>(pub(crate) &'a dyn WriteProgress);
-
-impl std::fmt::Debug for ProgressReporter<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ProgressReporter(..)")
-    }
-}
-
-impl ProgressReporter<'_> {
-    pub(crate) fn report(self, event: WriteProgressEvent<'_>) {
-        self.0.report(event);
-    }
-
-    pub(crate) fn is_cancelled(self) -> bool {
-        self.0.is_cancelled()
-    }
-}
+pub(crate) use crate::progress::ProgressReporter;
+use crate::progress::{WriteOperation, WriteProgress, WriteProgressEvent};
 
 pub(crate) struct WorkTracker<'a> {
     progress: Option<ProgressReporter<'a>>,
@@ -302,7 +195,110 @@ impl<T: std::io::Seek> std::io::Seek for CancellableIo<'_, T> {
 
 #[cfg(test)]
 #[test]
-fn progress_reporter_debug_does_not_expose_the_callback() {
-    let callback = |_event: WriteProgressEvent<'_>| {};
-    assert_eq!(format!("{:?}", ProgressReporter(&callback)), "ProgressReporter(..)");
+fn callback_panic_keeps_peer_progress_and_completion_usable() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let panic_once = AtomicBool::new(true);
+    let reported = Mutex::new(Vec::new());
+    let callback = |event: WriteProgressEvent<'_>| {
+        if let WriteProgressEvent::Advanced {
+            completed_bytes, ..
+        } = event
+        {
+            if panic_once.swap(false, Ordering::Relaxed) {
+                panic!("injected progress callback panic");
+            }
+            reported.lock().unwrap().push(completed_bytes);
+        }
+    };
+    let work = WorkTracker::new(
+        Some(ProgressReporter(&callback)),
+        WriteOperation::Compression,
+        10,
+    );
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| work.advance(3));
+        assert!(worker.join().is_err());
+        let peer = scope.spawn(|| work.advance(2));
+        assert!(peer.join().unwrap());
+    });
+    assert!(work.finish());
+    assert_eq!(*reported.lock().unwrap(), [5, 10]);
+}
+
+/// Count accepted output without buffering an archive or guessing its final size.
+pub(crate) struct EmissionWriter<'a> {
+    output: &'a mut dyn std::io::Write,
+    progress: Option<ProgressReporter<'a>>,
+    completed: u64,
+    reported: u64,
+    started: bool,
+}
+impl<'a> EmissionWriter<'a> {
+    pub(crate) fn new(
+        output: &'a mut dyn std::io::Write,
+        progress: Option<ProgressReporter<'a>>,
+    ) -> Self {
+        Self {
+            output,
+            progress,
+            completed: 0,
+            reported: 0,
+            started: false,
+        }
+    }
+    fn start(&mut self) -> crate::Result<()> {
+        check_cancelled(self.progress)?;
+        if !self.started {
+            self.started = true;
+            if let Some(progress) = self.progress {
+                progress.report(WriteProgressEvent::OperationStarted {
+                    operation: WriteOperation::Emission,
+                    total_bytes: None,
+                    total_entries: None,
+                    pass: 1,
+                });
+            }
+        }
+        check_cancelled(self.progress)
+    }
+    fn advance(&mut self) -> crate::Result<()> {
+        if self.completed != self.reported {
+            self.reported = self.completed;
+            if let Some(progress) = self.progress {
+                progress.report(WriteProgressEvent::BytesWritten {
+                    completed_bytes: self.completed,
+                });
+            }
+        }
+        check_cancelled(self.progress)
+    }
+    pub(crate) fn finish(&mut self) -> crate::Result<()> {
+        self.start()?;
+        self.advance()?;
+        if let Some(progress) = self.progress {
+            progress.report(WriteProgressEvent::OperationFinished {
+                operation: WriteOperation::Emission,
+                total_bytes: Some(self.completed),
+                total_entries: None,
+                pass: 1,
+            });
+        }
+        check_cancelled(self.progress)
+    }
+}
+impl std::io::Write for EmissionWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.start().map_err(std::io::Error::other)?;
+        let written = self.output.write(&bytes[..bytes.len().min(64 * 1024)])?;
+        self.completed += written as u64;
+        if self.completed - self.reported >= 64 * 1024 {
+            self.advance().map_err(std::io::Error::other)?;
+        }
+        check_cancelled(self.progress).map_err(std::io::Error::other)?;
+        Ok(written)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        check_cancelled(self.progress).map_err(std::io::Error::other)?;
+        self.output.flush()
+    }
 }

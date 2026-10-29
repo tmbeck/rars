@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::{
     ArchiveVersion, Builder, ErrorKind, WriteCancellation, WriteOperation, WriteProgress,
     WriteProgressEvent, WriterResources,
@@ -66,7 +68,12 @@ fn resource_cancellation_stops_source_loading() {
                     .kind(),
                 ErrorKind::Cancelled
             );
-            assert!(output.is_empty());
+            if precancel {
+                assert!(output.is_empty());
+            } else {
+                // Only the archive header can precede source verification.
+                assert!(output.len() < 100_000);
+            }
         }
     }
 }
@@ -93,6 +100,9 @@ impl WriteProgress for Stop {
                 completed_bytes,
                 ..
             } => !self.finished && operation == self.operation && completed_bytes > 0,
+            WriteProgressEvent::BytesWritten { completed_bytes } => {
+                !self.finished && self.operation == WriteOperation::Emission && completed_bytes > 0
+            }
             WriteProgressEvent::OperationFinished { operation, .. } => {
                 self.finished && operation == self.operation
             }
@@ -239,7 +249,10 @@ fn cancellation_from_final_zero_byte_progress_is_not_reported_as_success() {
         .unwrap();
     let stop = StopAtFinalAdvance(AtomicBool::new(false));
     assert_eq!(
-        builder.to_bytes_with_progress(Some(&stop)).unwrap_err().kind(),
+        builder
+            .to_bytes_with_progress(Some(&stop))
+            .unwrap_err()
+            .kind(),
         ErrorKind::Cancelled
     );
 }

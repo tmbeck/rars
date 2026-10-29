@@ -149,9 +149,86 @@ fn bench_literal_baseline(c: &mut Criterion) {
     group.finish();
 }
 
+// The size sweep above uses greedy parsers. RAR5 writer levels 2..5 instead
+// use the optimal parser and its tree finder, so time that path explicitly.
+fn bench_optimal_compression(c: &mut Criterion) {
+    let mut state = 0x1234_5678u32;
+    let noise: Vec<_> = (0..128 * 1024)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 31) as u8
+        })
+        .collect();
+    let mut group = c.benchmark_group("rar50_optimal_parse");
+    for (name, data) in [
+        ("repeated_text", payload(128 * 1024)),
+        ("two_symbol_noise", noise),
+    ] {
+        let options = Rar50EncodeOptions::new(128).with_optimal_parse(true);
+        let packed = Unpack50Encoder::with_options(options)
+            .encode_member(&data, 0)
+            .unwrap();
+        assert_eq!(decode_rar50(&packed, data.len()), data);
+        group.throughput(Throughput::Bytes(data.len() as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(name), &data, |b, data| {
+            b.iter(|| {
+                black_box(
+                    Unpack50Encoder::with_options(options)
+                        .encode_member(black_box(data), 0)
+                        .expect("optimal compression should succeed"),
+                )
+            });
+        });
+    }
+    group.finish();
+}
+
+// Expose per-pass preparation on short or literal-heavy inputs as well as
+// the match-rich fixtures above. The unique-byte fixtures have no repeated
+// four-byte prefix, while deterministic full-byte noise rarely has a match.
+fn bench_optimal_setup(c: &mut Criterion) {
+    let noise = |size| {
+        let mut state = 0x8bad_f00du32;
+        (0..size)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut rare_repeat = noise(4 * 1024);
+    rare_repeat.copy_within(128..144, 192);
+    let mut group = c.benchmark_group("rar50_optimal_setup");
+    for (name, data) in [
+        ("unique_32B", (0..32).collect::<Vec<u8>>()),
+        ("unique_256B", (0..=255).collect::<Vec<u8>>()),
+        ("repeated_32B", b"abcd".repeat(8)),
+        ("rare_repeat_4KiB", rare_repeat),
+        ("literal_heavy_4KiB", noise(4 * 1024)),
+        ("literal_heavy_64KiB", noise(64 * 1024)),
+    ] {
+        let options = Rar50EncodeOptions::new(128).with_optimal_parse(true);
+        let packed = Unpack50Encoder::with_options(options)
+            .encode_member(&data, 0)
+            .unwrap();
+        assert_eq!(decode_rar50(&packed, data.len()), data);
+        group.throughput(Throughput::Bytes(data.len() as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(name), &data, |b, data| {
+            b.iter(|| {
+                black_box(
+                    Unpack50Encoder::with_options(options)
+                        .encode_member(black_box(data), 0)
+                        .expect("optimal compression should succeed"),
+                )
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     name = benches;
     config = Criterion::default().sample_size(10);
-    targets = bench_compression, bench_decompression, bench_literal_baseline
+    targets = bench_compression, bench_decompression, bench_literal_baseline, bench_optimal_compression, bench_optimal_setup
 );
 criterion_main!(benches);

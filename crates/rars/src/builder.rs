@@ -7,14 +7,14 @@
 //! are thin translations of the type below, which is the point of it living
 //! here rather than in one of them.
 
-use crate::write_progress::{check_cancelled, CancellableIo, ProgressReporter, ResourceProgress};
+use crate::write_progress::{check_cancelled, EmissionWriter, ProgressReporter, ResourceProgress};
 use crate::{
     rar13, rar15_40, rar50, ArchiveFamily, ArchiveVersion, EntrySource, Error, FeatureSet, Result,
     WriteProgress, WriterResources,
 };
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 struct ConvertedEntries {
     entries: Vec<rar50::ArchiveEntry>,
@@ -33,77 +33,38 @@ const DOS_ARCHIVE_ATTR: u32 = 0x20;
 const RAR15_HOST_UNIX: u8 = 3;
 const RAR50_HOST_UNIX: u64 = 1;
 
-pub(crate) struct PendingArchive {
-    pub(crate) path: Option<PathBuf>,
-    _charge: Option<crate::streaming::CapacityCharge>,
-}
+type PendingArchive =
+    crate::pending_archive::PendingArchive<Option<crate::streaming::CapacityCharge>>;
 
 impl PendingArchive {
-    pub(crate) fn create(destination: &Path) -> Result<(Self, fs::File)> {
-        Self::with_resources(destination, &WriterResources::default())
-    }
-    fn with_resources(destination: &Path, resources: &WriterResources) -> Result<(Self, fs::File)> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        Self::with_sequence(destination, resources, || NEXT.fetch_add(1, Ordering::Relaxed))
+    fn path_charge(
+        resources: &WriterResources,
+        capacity: usize,
+    ) -> Result<Option<crate::streaming::CapacityCharge>> {
+        let mut charge = resources.execution_charge();
+        if let Some(charge) = &mut charge {
+            charge.grow_to(capacity as u64)?;
+        }
+        Ok(charge)
     }
 
+    fn with_resources(destination: &Path, resources: &WriterResources) -> Result<(Self, fs::File)> {
+        Self::with_admission(destination, |capacity| {
+            Self::path_charge(resources, capacity)
+        })
+    }
+
+    #[cfg(test)]
     fn with_sequence(
         destination: &Path,
         resources: &WriterResources,
-        mut next_sequence: impl FnMut() -> u64,
+        next_sequence: impl FnMut() -> u64,
     ) -> Result<(Self, fs::File)> {
-        for _ in 0..128 {
-            let sequence = next_sequence();
-            let mut name = [0u8; 64];
-            let mut name_writer = std::io::Cursor::new(&mut name[..]);
-            write!(
-                name_writer,
-                ".rars-writing-{}-{sequence:016x}",
-                std::process::id()
-            )?;
-            let name_len = name_writer.position() as usize;
-            let name = std::str::from_utf8(&name[..name_len]).expect("ASCII temporary name");
-            let directory = destination.parent().unwrap_or_else(|| Path::new(""));
-            let capacity = directory
-                .as_os_str()
-                .len()
-                .checked_add(1 + name_len)
-                .ok_or(Error::InvalidArgument("temporary path capacity overflows"))?;
-            let mut charge = resources.execution_charge();
-            if let Some(charge) = &mut charge {
-                charge.grow_to(capacity as u64)?;
-            }
-            let mut path = PathBuf::with_capacity(capacity);
-            path.push(directory);
-            path.push(name);
-            match fs::File::options().write(true).create_new(true).open(&path) {
-                Ok(file) => {
-                    return Ok((
-                        Self {
-                            path: Some(path),
-                            _charge: charge,
-                        },
-                        file,
-                    ))
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "could not allocate a unique archive temporary file",
+        Self::create_with_sequence(
+            destination,
+            |capacity| Self::path_charge(resources, capacity),
+            next_sequence,
         )
-        .into())
-    }
-}
-
-impl Drop for PendingArchive {
-    fn drop(&mut self) {
-        if let Some(path) = &self.path {
-            let _ = fs::remove_file(path);
-        }
     }
 }
 
@@ -117,8 +78,8 @@ enum EntryAttributes {
 ///
 /// The bytes are either held directly or fetched from an [`EntrySource`] when
 /// the writer reaches the member. Sources are what keep a large archive off the
-/// heap; the legacy families cannot stream, so they read each source into
-/// `data` first.
+/// heap. Legacy single archives pass sources to the per-member writers;
+/// legacy volume collection still materializes its one input.
 #[derive(Debug, Clone)]
 struct BuilderEntry {
     id: usize,
@@ -934,10 +895,10 @@ impl Builder {
             };
             self.add_source(name, EntrySource::from_path(path), None, unix_mode(&meta))?;
         } else {
-            return Err(Error::InvalidArgument(
-                "input path is not a regular file or directory",
-            )
-            .at_entry(archive_name.to_vec(), "adding"));
+            return Err(
+                Error::InvalidArgument("input path is not a regular file or directory")
+                    .at_entry(archive_name.to_vec(), "adding"),
+            );
         }
         Ok(())
     }
@@ -1100,15 +1061,9 @@ impl Builder {
             self.write_streaming_rar50(&mut output, &WriterResources::default(), progress)?;
             return Ok(output);
         }
-        let resources = WriterResources::default();
-        let progress = ResourceProgress::new(&resources, progress.map(ProgressReporter));
-        let reporting = Some(ProgressReporter(&progress));
-        check_cancelled(reporting)?;
-        let data = self
-            .materialized(reporting)?
-            .build_single(Some(&progress))?;
-        check_cancelled(reporting)?;
-        Ok(data)
+        let mut output = Vec::new();
+        self.write_to(&mut output, &WriterResources::default(), progress)?;
+        Ok(output)
     }
 
     /// Encode into a collector that remains charged until handoff or drop.
@@ -1136,8 +1091,11 @@ impl Builder {
     ///
     /// RAR 5 and RAR 7 stream using the supplied workspace and spool policy;
     /// see [`WriterResources`] for its scope and bare-WASM memory limits.
-    /// The legacy families encode into memory first, so this is
-    /// [`to_bytes`](Self::to_bytes) followed by a write.
+    /// Legacy families emit headers and members directly, retaining compressed
+    /// members in memory. Stored sources are read twice to prepare and verify
+    /// checksums. Legacy managed-memory quotas are not supported.
+    /// On failure, `output` may contain a partial archive. Use
+    /// [`write_to_path`](Self::write_to_path) for atomic file publication.
     pub fn write_to(
         &self,
         output: &mut dyn Write,
@@ -1161,39 +1119,9 @@ impl Builder {
         let progress = ResourceProgress::new(resources, progress.map(ProgressReporter));
         let reporting = Some(ProgressReporter(&progress));
         check_cancelled(reporting)?;
-        let data = self
-            .materialized(reporting)?
-            .build_single(Some(&progress))?;
-        check_cancelled(reporting)?;
-        progress.report(crate::WriteProgressEvent::OperationStarted {
-            operation: crate::WriteOperation::Emission,
-            total_bytes: Some(data.len() as u64),
-            total_entries: None,
-            pass: 1,
-        });
-        let mut output = CancellableIo {
-            inner: output,
-            progress: reporting,
-        };
-        for (index, chunk) in data.chunks(64 * 1024).enumerate() {
-            output.write_all(chunk)?;
-            progress.report(crate::WriteProgressEvent::Advanced {
-                operation: crate::WriteOperation::Emission,
-                completed_bytes: ((index + 1) * 64 * 1024).min(data.len()) as u64,
-                total_bytes: data.len() as u64,
-                pass: 1,
-            });
-            check_cancelled(reporting)?;
-        }
-        check_cancelled(reporting)?;
-        progress.report(crate::WriteProgressEvent::OperationFinished {
-            operation: crate::WriteOperation::Emission,
-            total_bytes: Some(data.len() as u64),
-            total_entries: None,
-            pass: 1,
-        });
-        check_cancelled(reporting)?;
-        Ok(())
+        let mut output = EmissionWriter::new(output, reporting);
+        self.write_legacy_to(&mut output, resources, Some(&progress))?;
+        output.finish()
     }
 
     /// Write the archive to `path`, streaming where the format allows it.
@@ -1268,7 +1196,8 @@ impl Builder {
         let control = ResourceProgress::new(resources, progress.map(ProgressReporter));
         let progress = Some(&control as &dyn WriteProgress);
         check_cancelled(progress.map(ProgressReporter))?;
-        let this = self.materialized(progress.map(ProgressReporter))?;
+        self.single_volume_entry()?;
+        let this = self.materialized_volume_input(progress.map(ProgressReporter))?;
         let result = match self.format.family() {
             ArchiveFamily::Rar15To40 => this.build_rar15_volumes(volume_size, progress),
             ArchiveFamily::Rar13 => this.build_rar13_volumes(volume_size, progress),
@@ -1329,6 +1258,7 @@ impl Builder {
     }
 
     fn volume_payload_size(&self) -> Result<usize> {
+        self.check_encryption_option()?;
         self.check_recovery_option()?;
         if self.legacy_unpack_version.is_some() {
             return Err(Error::InvalidArgument(
@@ -1402,7 +1332,33 @@ impl Builder {
         Ok(())
     }
 
+    fn check_encryption_option(&self) -> Result<()> {
+        if cfg!(feature = "encryption") {
+            return Ok(());
+        }
+        let encrypted_entry = self.entries.iter().any(|entry| {
+            let data_password = entry
+                .encryption
+                .as_ref()
+                .map_or(self.password.as_deref(), |encryption| {
+                    encryption.data_password.as_deref()
+                });
+            let comment_password = entry
+                .encryption
+                .as_ref()
+                .map_or(self.password.as_deref(), |encryption| {
+                    encryption.comment_password.as_deref()
+                });
+            data_password.is_some() || (entry.file_comment.is_some() && comment_password.is_some())
+        });
+        if self.encrypt_headers || self.comment_password.is_some() || encrypted_entry {
+            crate::crypto::require_encryption()?;
+        }
+        Ok(())
+    }
+
     fn check_single(&self) -> Result<()> {
+        self.check_encryption_option()?;
         self.check_recovery_option()?;
         self.check_redirection_targets()?;
         if !self.streams_rar50()
@@ -1423,16 +1379,14 @@ impl Builder {
         Ok(())
     }
 
-    /// A copy with every source read into memory, for the writers that cannot
-    /// take one. Returns a borrow when there is nothing to read, so the common
-    /// case does not copy the members twice.
-    fn materialized(
+    /// Legacy volume collection needs its one input as a slice. Borrow an
+    /// inline input; read a source without copying any other member payloads.
+    fn materialized_volume_input(
         &self,
         progress: Option<ProgressReporter<'_>>,
     ) -> Result<std::borrow::Cow<'_, Self>> {
         check_cancelled(progress)?;
-        // All RAR5/7 entry points dispatch to the streaming writer before
-        // calling this legacy-only helper.
+        // The caller has validated the legacy volume path and its one input.
         if !self.entries.iter().any(|entry| entry.source.is_some()) {
             return Ok(std::borrow::Cow::Borrowed(self));
         }
@@ -1451,11 +1405,16 @@ impl Builder {
         Ok(std::borrow::Cow::Owned(owned))
     }
 
-    fn build_single(&self, progress: Option<&dyn WriteProgress>) -> Result<Vec<u8>> {
+    fn write_legacy_to(
+        &self,
+        output: &mut dyn Write,
+        resources: &WriterResources,
+        progress: Option<&dyn WriteProgress>,
+    ) -> Result<()> {
         match self.format.family() {
             ArchiveFamily::Rar50Plus => unreachable!("RAR 5/7 use the streaming writer"),
-            ArchiveFamily::Rar15To40 => self.build_rar15_single(progress),
-            ArchiveFamily::Rar13 => self.build_rar13_single(progress),
+            ArchiveFamily::Rar15To40 => self.write_rar15_single(output, resources, progress),
+            ArchiveFamily::Rar13 => self.write_rar13_single(output, resources, progress),
         }
     }
 
@@ -1633,11 +1592,17 @@ impl Builder {
         options
     }
 
-    fn build_rar15_single(&self, progress: Option<&dyn WriteProgress>) -> Result<Vec<u8>> {
+    fn write_rar15_single(
+        &self,
+        output: &mut dyn Write,
+        resources: &WriterResources,
+        progress: Option<&dyn WriteProgress>,
+    ) -> Result<()> {
         let entries: Vec<_> = self
             .entries
             .iter()
             .map(|entry| rar15_40::RetainedFileEntry {
+                source: entry.source.as_ref(),
                 file: rar15_40::FileEntry {
                     name: &entry.name,
                     data: &entry.data,
@@ -1670,11 +1635,13 @@ impl Builder {
                 crate::write_plan::MemberCoding::Compressed
             },
             self.comment.as_deref(),
+            resources,
             progress,
             self.encrypt_headers
                 .then_some(self.password.as_deref())
                 .flatten(),
             self.comment_password.as_deref(),
+            output,
         )
     }
 
@@ -1686,13 +1653,17 @@ impl Builder {
         options
     }
 
-    fn build_rar13_single(&self, progress: Option<&dyn WriteProgress>) -> Result<Vec<u8>> {
-        let options = self.rar13_options();
-        if self.store {
-            let entries: Vec<_> = self
-                .entries
-                .iter()
-                .map(|entry| rar13::StoredEntry {
+    fn write_rar13_single(
+        &self,
+        output: &mut dyn Write,
+        resources: &WriterResources,
+        progress: Option<&dyn WriteProgress>,
+    ) -> Result<()> {
+        let entries: Vec<_> = self
+            .entries
+            .iter()
+            .map(|entry| rar13::BorrowedFileEntry {
+                file: rar13::FileEntry {
                     name: &entry.name,
                     data: &entry.data,
                     file_time: entry.mtime.unwrap_or(0),
@@ -1704,39 +1675,23 @@ impl Builder {
                             encryption.data_password.as_deref()
                         }),
                     file_comment: entry.file_comment.as_deref(),
-                })
-                .collect();
-            rar13::write_stored_archive_with_comment_and_progress(
-                &entries,
-                options,
-                self.comment.as_deref(),
-                progress,
-            )
-        } else {
-            let entries: Vec<_> = self
-                .entries
-                .iter()
-                .map(|entry| rar13::FileEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    file_time: entry.mtime.unwrap_or(0),
-                    file_attr: entry.rar13_attr(),
-                    password: entry
-                        .encryption
-                        .as_ref()
-                        .map_or(self.password.as_deref(), |encryption| {
-                            encryption.data_password.as_deref()
-                        }),
-                    file_comment: entry.file_comment.as_deref(),
-                })
-                .collect();
-            rar13::write_compressed_archive_with_comment_and_progress(
-                &entries,
-                options,
-                self.comment.as_deref(),
-                progress,
-            )
-        }
+                },
+                source: entry.source.as_ref(),
+            })
+            .collect();
+        rar13::write_archive_with_sources(
+            &entries,
+            self.rar13_options(),
+            if self.store {
+                crate::write_plan::MemberCoding::Stored
+            } else {
+                crate::write_plan::MemberCoding::Compressed
+            },
+            self.comment.as_deref(),
+            resources,
+            progress,
+            output,
+        )
     }
 
     fn single_volume_entry(&self) -> Result<&BuilderEntry> {
@@ -1825,37 +1780,9 @@ impl Builder {
     }
 }
 
-/// Reject absolute paths, `..`, drive prefixes and NUL bytes without assuming
-/// a filename encoding. Destination filesystem representability and RAR5 Unix
-/// byte mapping are separate from archive member identity validation.
-pub fn validate_entry_name(name: Vec<u8>) -> Result<Vec<u8>> {
-    crate::filename::validate_relative(&name)?;
-    Ok(name)
-}
-
-/// The path a member name denotes below an output directory, or an error if it
-/// denotes anywhere else. Backslashes are separators, because that is what a
-/// DOS-era writer put in the header. On Unix non-UTF-8 bytes are preserved.
-/// This is the legacy path convention, not a RAR5 wire-name decoder.
-pub fn entry_relative_path(name: &[u8]) -> Result<std::path::PathBuf> {
-    use std::path::{Component, PathBuf};
-
-    crate::filename::validate_relative(name)?;
-    let bytes: Vec<_> = name
-        .iter()
-        .map(|&b| if b == b'\\' { b'/' } else { b })
-        .collect();
-    let text = crate::filename::native_string(&bytes)?;
-    let mut out = PathBuf::new();
-    for component in Path::new(&text).components() {
-        match component {
-            Component::Normal(part) => out.push(part),
-            Component::CurDir => {}
-            _ => return Err(Error::UnsafePath("unsafe archive path")),
-        }
-    }
-    Ok(out)
-}
+// Retain the established public paths while the implementations live with
+// the reader filename utilities.
+pub use crate::filename::{entry_relative_path, validate_entry_name};
 
 #[cfg(unix)]
 fn unix_mode(metadata: &fs::Metadata) -> Option<u32> {
@@ -1878,12 +1805,13 @@ mod tests {
         std::fs::write(root.join(name(0)), b"occupied").unwrap();
         let resources = crate::WriterResources::default().with_temp_dir(&*root);
         let mut sequence = 0;
-        let (pending, file) = super::PendingArchive::with_sequence(&destination, &resources, || {
-            let value = sequence;
-            sequence += 1;
-            value
-        })
-        .unwrap();
+        let (pending, file) =
+            super::PendingArchive::with_sequence(&destination, &resources, || {
+                let value = sequence;
+                sequence += 1;
+                value
+            })
+            .unwrap();
         assert_eq!(sequence, 2);
         assert_eq!(pending.path.as_deref(), Some(root.join(name(1)).as_path()));
         drop(file);
@@ -1939,10 +1867,8 @@ mod tests {
         let converted = builder.rar50_entries_with_resources(&resources).unwrap();
         assert_eq!(
             resources.managed_memory_in_use() - baseline_charge,
-            (std::mem::size_of::<crate::rar50::ServiceEntry>()
-                + 3
-                + comment.len()
-                + password.len()) as u64
+            (std::mem::size_of::<crate::rar50::ServiceEntry>() + 3 + comment.len() + password.len())
+                as u64
         );
         drop(converted);
         assert_eq!(resources.managed_memory_in_use(), 0);
@@ -1954,7 +1880,10 @@ mod tests {
 
         let mut volume = Builder::new(ArchiveVersion::Rar29).volume_size(Some(64));
         assert_eq!(
-            volume.add_directory(b"dir".to_vec(), None, None).unwrap_err().kind(),
+            volume
+                .add_directory(b"dir".to_vec(), None, None)
+                .unwrap_err()
+                .kind(),
             ErrorKind::InvalidArgument
         );
         assert_eq!(
@@ -2028,14 +1957,21 @@ mod tests {
         let id = builder.entry_id(b"file").unwrap();
         builder.rename_by_id(id, b"file".to_vec()).unwrap();
         let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
-        assert_eq!(archive.read_member(b"file", None).unwrap().unwrap(), b"payload");
+        assert_eq!(
+            archive.read_member(b"file", None).unwrap().unwrap(),
+            b"payload"
+        );
     }
 
     #[test]
     fn builder_rejects_unsupported_per_entry_password_shapes() {
         use crate::{ArchiveVersion, Builder, ErrorKind};
 
-        for format in [ArchiveVersion::Rar13, ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+        for format in [
+            ArchiveVersion::Rar13,
+            ArchiveVersion::Rar29,
+            ArchiveVersion::Rar50,
+        ] {
             let mut builder = Builder::new(format).store(true);
             builder
                 .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
@@ -2081,6 +2017,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn rar13_entry_encryption_override_can_clear_the_builder_password() {
         use crate::{ArchiveReader, ArchiveVersion, Builder};
 
@@ -2101,7 +2038,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_builder_materializes_only_the_entries_with_sources() {
+    fn legacy_builder_combines_inline_and_source_members() {
         use crate::{ArchiveReader, ArchiveVersion, Builder, EntrySource};
 
         let mut builder = Builder::new(ArchiveVersion::Rar29).store(true);
@@ -2243,6 +2180,54 @@ mod tests {
     }
 
     #[test]
+    fn directories_inside_a_solid_run_are_flagged_solid() {
+        // 7-Zip restarts its decoder at any header without FHD_SOLID, so a
+        // directory between two members of a run must carry it, or the member
+        // after the directory cannot be read there.
+        let text = b"shared text ".repeat(200);
+        for target in [
+            ArchiveVersion::Rar20,
+            ArchiveVersion::Rar29,
+            ArchiveVersion::Rar30,
+            ArchiveVersion::Rar40,
+        ] {
+            let mut builder = Builder::new(target).solid(true);
+            builder
+                .add_directory(b"first".to_vec(), Some(0), None)
+                .unwrap();
+            builder
+                .add_bytes(b"first/a".to_vec(), text.clone(), Some(0), None)
+                .unwrap();
+            builder
+                .add_directory(b"second".to_vec(), Some(0), None)
+                .unwrap();
+            builder
+                .add_bytes(b"second/b".to_vec(), text.clone(), Some(0), None)
+                .unwrap();
+            let archive = crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            let flags: Vec<_> = archive
+                .as_rar15_40()
+                .unwrap()
+                .files()
+                .map(|file| (file.is_directory(), file.is_solid()))
+                .collect();
+            // Nothing precedes the first directory or the first member; the
+            // second directory and member continue the run.
+            assert_eq!(
+                flags,
+                [(true, false), (false, false), (true, true), (false, true)],
+                "{target:?}"
+            );
+            assert_eq!(
+                archive.read_member(b"second/b", None).unwrap().unwrap(),
+                text,
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
     fn legacy_comments_coexist_with_salt_and_extended_times() {
         let mut builder = Builder::new(ArchiveVersion::Rar29)
             .password(Some(b"secret".to_vec()))
@@ -2282,6 +2267,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn legacy_header_encryption_survives_removing_encrypted_member() {
         let mut builder = Builder::new(ArchiveVersion::Rar30)
             .password(Some(b"secret".to_vec()))
@@ -2407,13 +2393,13 @@ mod tests {
     #[test]
     fn empty_rewrites_retain_archive_settings() {
         for format in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
-            for encrypted in [false, true] {
+            for encrypted in crate::test_features::encryption_cases() {
                 let password = encrypted.then_some(b"secret".as_slice());
                 let builder = Builder::new(format)
                     .solid(true)
                     .password(password.map(<[u8]>::to_vec))
                     .header_encryption(encrypted)
-                    .recovery_percent(Some(5))
+                    .recovery_percent(cfg!(feature = "recovery").then_some(5))
                     .comment(Some(b"comment".to_vec()));
                 let options = crate::ArchiveReadOptions {
                     password,
@@ -2435,7 +2421,7 @@ mod tests {
                     crate::ArchiveReader::read_owned_with_options(rewritten, options).unwrap();
                 let raw = output.as_rar50().unwrap();
                 assert!(raw.main.is_solid());
-                assert!(raw.main.has_recovery_record());
+                assert_eq!(raw.main.has_recovery_record(), cfg!(feature = "recovery"));
                 assert_eq!(raw.main.encrypted_headers, encrypted);
                 assert_eq!(raw.files().count(), 0);
                 assert!(output.rewrite_preservation_issues().is_empty());
@@ -2444,6 +2430,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn header_encryption_does_not_require_encrypted_members() {
         let mut builder = Builder::new(ArchiveVersion::Rar50)
             .password(Some(b"secret".to_vec()))
@@ -2474,30 +2461,51 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let root = crate::scratch::case("builder-non-utf8-name");
-        fs::write(root.join(OsStr::from_bytes(b"bad-\xff")), b"payload").unwrap();
+        let raw_source = root.join(OsStr::from_bytes(b"bad-\xff"));
+        let native_name = match fs::write(&raw_source, b"payload") {
+            Ok(()) => b"bad-\xff".as_slice(),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::InvalidInput
+                    || error.raw_os_error() == Some(libc::EILSEQ) =>
+            {
+                // Some Unix filesystems reject byte names. The builder must
+                // report the missing/unrepresentable source, never queue a
+                // substituted filename or silently claim it was archived.
+                for format in ArchiveVersion::ALL {
+                    let mut builder = Builder::new(format);
+                    let error = builder.add_path(&raw_source, b"explicit").unwrap_err();
+                    assert_eq!(error.kind(), crate::ErrorKind::Io);
+                    assert!(builder.is_empty());
+                }
+                // Continue exercising collection and explicit naming in every
+                // format with a name this filesystem can actually represent.
+                let name = "valid-日本語".as_bytes();
+                fs::write(root.join(OsStr::from_bytes(name)), b"payload").unwrap();
+                name
+            }
+            Err(error) => panic!("raw filename probe failed unexpectedly: {error}"),
+        };
+        let source = root.join(OsStr::from_bytes(native_name));
         for format in ArchiveVersion::ALL {
             let mut builder = Builder::new(format);
             for unsafe_name in [b"../bad-\xff".as_slice(), b"/bad-\xff"] {
-                assert!(builder
-                    .add_path(&root.join(OsStr::from_bytes(b"bad-\xff")), unsafe_name)
-                    .is_err());
+                assert!(builder.add_path(&source, unsafe_name).is_err());
                 assert!(builder.is_empty());
             }
             builder.add_path(&root, b"root").unwrap();
+            let native_archive_name = [b"root/".as_slice(), native_name].concat();
             let name = if format.family() == ArchiveFamily::Rar50Plus {
-                crate::filename::encode_rar50(b"root/bad-\xff").into_owned()
+                crate::filename::encode_rar50(&native_archive_name).into_owned()
             } else {
-                b"root/bad-\xff".to_vec()
+                native_archive_name
             };
             let archive = crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
             assert_eq!(
                 archive.read_member(&name, None).unwrap().unwrap(),
                 b"payload"
             );
-            // A caller can still give a non-Unicode source an explicit name.
-            builder
-                .add_path(&root.join(OsStr::from_bytes(b"bad-\xff")), b"explicit")
-                .unwrap();
+            // The same native source can also have an explicit archive name.
+            builder.add_path(&source, b"explicit").unwrap();
             assert_eq!(
                 builder.names().collect::<Vec<_>>(),
                 vec![name.as_slice(), &b"explicit"[..]]
@@ -2672,4 +2680,104 @@ mod tests {
             .unwrap();
         assert!(volumes.len() > 1, "expected a split, got {}", volumes.len());
     }
+}
+
+#[cfg(test)]
+#[test]
+fn parentless_output_path_uses_default_resources_and_publishes_readable_archives() {
+    struct Destination(std::path::PathBuf);
+    impl Drop for Destination {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    static NEXT: crate::atomic64::AtomicU64 = crate::atomic64::AtomicU64::new(0);
+    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let destination = Destination(std::path::PathBuf::from(format!(
+        ".rars-parentless-test-{}-{sequence}.rar",
+        std::process::id()
+    )));
+    assert!(destination.0.parent().unwrap().as_os_str().is_empty());
+    for version in [
+        ArchiveVersion::Rar13,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar50,
+    ] {
+        let mut builder = Builder::new(version).store(true);
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        builder.write_to_path(&destination.0, None).unwrap();
+        let archive =
+            crate::ArchiveReader::read_owned(std::fs::read(&destination.0).unwrap()).unwrap();
+        assert_eq!(
+            archive.read_member(b"file", None).unwrap().unwrap(),
+            b"payload"
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn converted_redirections_charge_targets_and_preserve_them_in_output() {
+    let resources = WriterResources::default().with_max_memory_bytes(1 << 20);
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_unix_symlink(b"link".to_vec(), b"a".to_vec(), false, None, None)
+        .unwrap();
+    let short = builder.rar50_entries_with_resources(&resources).unwrap();
+    let short_charge = resources.managed_memory_in_use();
+    drop(short);
+    assert_eq!(resources.managed_memory_in_use(), 0);
+    let target = "destination-😀".as_bytes();
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_unix_symlink(b"link".to_vec(), target.to_vec(), false, None, None)
+        .unwrap();
+    let converted = builder.rar50_entries_with_resources(&resources).unwrap();
+    assert_eq!(
+        resources.managed_memory_in_use() - short_charge,
+        (target.len() - 1) as u64
+    );
+    assert_eq!(
+        converted.entries[0]
+            .redirection
+            .as_ref()
+            .unwrap()
+            .target_name,
+        target
+    );
+    drop(converted);
+    assert_eq!(resources.managed_memory_in_use(), 0);
+    let bytes = builder.to_bytes_with_resources(&resources, None).unwrap();
+    let archive = crate::ArchiveReader::read_owned(bytes).unwrap();
+    let member = archive.members().next().unwrap();
+    assert_eq!(member.unix_symlink().unwrap().target_name, target);
+    assert_eq!(resources.managed_memory_in_use(), 0);
+}
+
+#[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
+#[test]
+fn pending_archive_accepts_maximum_sequence_without_a_destination_parent() {
+    let destination = Path::new("");
+    assert!(destination.parent().is_none());
+    let expected = std::path::PathBuf::from(format!(
+        ".rars-writing-{}-{:016x}",
+        std::process::id(),
+        u64::MAX
+    ));
+    assert!(
+        !expected.exists(),
+        "unique maximum-sequence path is already occupied"
+    );
+    let resources = WriterResources::default().with_max_memory_bytes(1 << 20);
+    let (pending, file) =
+        PendingArchive::with_sequence(destination, &resources, || u64::MAX).unwrap();
+    assert_eq!(pending.path.as_ref().unwrap(), &expected);
+    assert!(expected.is_file());
+    assert!(expected.as_os_str().len() <= 41);
+    drop(file);
+    drop(pending);
+    assert!(!expected.exists());
+    assert_eq!(resources.managed_memory_in_use(), 0);
 }

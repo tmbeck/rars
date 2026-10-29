@@ -9,7 +9,7 @@
 //! window. Inserting costs one store, so a caller can skip past bytes it has
 //! already decided about for free, which is what the lazy encoders do.
 //!
-//! [`TreeMatchFinder`] keeps the positions sharing a hash in a binary tree
+//! `TreeMatchFinder` keeps the positions sharing a hash in a binary tree
 //! ordered by the bytes that follow them, after LZMA. One descent finds every
 //! improving match and re-hangs the tree under the new position, and each node
 //! on the way down narrows a proven-prefix bound, so the descent never re-reads
@@ -76,6 +76,7 @@ pub(crate) struct MatchFinder<const MIN_MATCH: usize, B: Budget = Allowance> {
     newest: usize,
 }
 
+#[cfg(any(test, feature = "write"))]
 impl<const MIN_MATCH: usize> MatchFinder<MIN_MATCH> {
     pub(crate) fn new(window: usize) -> Self {
         Self::with_allowance(window, &Allowance::default()).expect("unlimited finder allocation")
@@ -114,6 +115,7 @@ impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
         })
     }
 
+    #[cfg(feature = "write")]
     pub(crate) fn allowance(&self) -> B {
         self.head.allowance()
     }
@@ -160,6 +162,151 @@ impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
             return NO_POSITION;
         }
         older
+    }
+}
+
+// Fusing insertion and lookup shares one hash and skips the self link.
+impl<B: Budget> MatchFinder<4, B> {
+    /// Insert a readable position and return its first older candidate. Like
+    /// the encoder's ordinary insertion schedule, positions arrive in order.
+    #[inline]
+    pub(crate) fn insert_and_first(&mut self, input: &[u8], pos: usize) -> usize {
+        debug_assert!(pos + 4 <= input.len());
+        self.record_and_first(Self::hash(input, pos), pos)
+    }
+
+    #[inline]
+    fn record_and_first(&mut self, hash: usize, pos: usize) -> usize {
+        debug_assert!(pos >= self.newest);
+        let previous = self.head[hash];
+        self.prev[pos & self.mask] = previous;
+        self.head[hash] = pos as u32;
+        self.newest = pos;
+        // The ordinary first() sees the sentinel rather than this position,
+        // so it never reaches its otherwise valid previous link.
+        if pos as u32 == NO_LINK {
+            return NO_POSITION;
+        }
+        let older = if pos <= u32::MAX as usize {
+            previous as usize
+        } else {
+            resolve(self.newest, previous)
+        };
+        if older < pos {
+            older
+        } else {
+            NO_POSITION
+        }
+    }
+
+    /// Preserve the ordinary collector's candidate visits, cutoffs and every
+    /// improving run, including sub-four-byte hash collisions. A verified
+    /// four-byte prefix only needs its remaining suffix compared again.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub(crate) fn collect_improving(
+        &self,
+        input: &[u8],
+        pos: usize,
+        first: usize,
+        max_length: usize,
+        max_distance: usize,
+        cut: usize,
+        nice: usize,
+        out: &mut Buffer<(u32, u32), B>,
+    ) -> std::result::Result<(), B::Failure> {
+        if self.newest <= u32::MAX as usize {
+            self.collect_improving_with_positions::<true>(
+                input,
+                pos,
+                first,
+                max_length,
+                max_distance,
+                cut,
+                nice,
+                out,
+            )
+        } else {
+            self.collect_improving_with_positions::<false>(
+                input,
+                pos,
+                first,
+                max_length,
+                max_distance,
+                cut,
+                nice,
+                out,
+            )
+        }
+    }
+
+    #[inline]
+    fn previous_for_collection<const SHORT: bool>(&self, candidate: usize) -> usize {
+        let raw = self.prev[candidate & self.mask];
+        let older = if SHORT {
+            // Before wrapping, raw links are absolute positions. The sentinel
+            // is also >= every candidate, so the same rejection covers it.
+            raw as usize
+        } else {
+            resolve(self.newest, raw)
+        };
+        if older >= candidate {
+            NO_POSITION
+        } else {
+            older
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn collect_improving_with_positions<const SHORT: bool>(
+        &self,
+        input: &[u8],
+        pos: usize,
+        first: usize,
+        max_length: usize,
+        max_distance: usize,
+        cut: usize,
+        nice: usize,
+        out: &mut Buffer<(u32, u32), B>,
+    ) -> std::result::Result<(), B::Failure> {
+        debug_assert!(max_length >= 4 && pos + max_length <= input.len());
+        if cut == 0 {
+            return Ok(());
+        }
+        let prefix = u32::from_le_bytes(input[pos..pos + 4].try_into().unwrap());
+        let mut longest = 0;
+        let mut checked = 0;
+        let mut candidate = first;
+        while candidate != NO_POSITION && longest < max_length && longest < nice {
+            if candidate >= pos {
+                candidate = self.previous_for_collection::<SHORT>(candidate);
+                continue;
+            }
+            let distance = pos - candidate;
+            if distance > max_distance {
+                break;
+            }
+            checked += 1;
+            if input[candidate + longest] == input[pos + longest] {
+                let difference = prefix
+                    ^ u32::from_le_bytes(input[candidate..candidate + 4].try_into().unwrap());
+                let length = if difference != 0 {
+                    (difference.trailing_zeros() / 8) as usize
+                } else {
+                    4 + super::fast::match_length(input, pos + 4, distance, max_length - 4)
+                };
+                if length > longest {
+                    out.push((length as u32, distance as u32))?;
+                    longest = length;
+                }
+            }
+            if checked >= cut {
+                break;
+            }
+            candidate = self.previous_for_collection::<SHORT>(candidate);
+        }
+        Ok(())
     }
 }
 
@@ -215,6 +362,7 @@ impl<B: Budget> TreeMatchFinder<B> {
         })
     }
 
+    #[cfg(feature = "write")]
     pub(crate) fn allowance(&self) -> B {
         self.head.allowance()
     }
@@ -235,6 +383,19 @@ impl<B: Budget> TreeMatchFinder<B> {
     /// left, as the tree collector does. On allocation refusal, discard the finder:
     /// the insertion may have been partially applied before output growth failed.
     pub(crate) fn matches(
+        &mut self,
+        input: &[u8],
+        pos: usize,
+        len_limit: usize,
+        max_distance: usize,
+        cut: usize,
+        out: &mut Buffer<(u32, u32), B>,
+    ) -> std::result::Result<(), B::Failure> {
+        self.matches_with_extension::<true>(input, pos, len_limit, max_distance, cut, out)
+    }
+
+    // The scalar specialization is retained for differential tests only.
+    fn matches_with_extension<const FAST: bool>(
         &mut self,
         input: &[u8],
         pos: usize,
@@ -284,8 +445,13 @@ impl<B: Budget> TreeMatchFinder<B> {
             let mut len = len0.min(len1);
             if input[current + len] == input[pos + len] {
                 len += 1;
-                while len < len_limit && input[current + len] == input[pos + len] {
-                    len += 1;
+                if FAST {
+                    len +=
+                        super::fast::match_length(input, pos + len, pos - current, len_limit - len);
+                } else {
+                    while len < len_limit && input[current + len] == input[pos + len] {
+                        len += 1;
+                    }
                 }
                 if len > longest {
                     if pos - current <= max_distance {
@@ -362,6 +528,269 @@ mod tests {
         assert_eq!(resolve(1_000, 999), 999);
         assert_eq!(resolve(1_000, 1_000), 1_000);
         assert_eq!(resolve(1_000, NO_LINK), NO_POSITION);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ordinary_chain_frontier<B: super::Budget>(
+        finder: &MatchFinder<4, B>,
+        input: &[u8],
+        pos: usize,
+        max_length: usize,
+        max_distance: usize,
+        cut: usize,
+        nice: usize,
+        out: &mut super::Buffer<(u32, u32), B>,
+    ) -> std::result::Result<(), B::Failure> {
+        if cut == 0 {
+            return Ok(());
+        }
+        let mut longest = 0;
+        let mut checked = 0;
+        let mut candidate = finder.first(input, pos);
+        while candidate != NO_POSITION && longest < max_length && longest < nice {
+            if candidate >= pos {
+                candidate = finder.previous(candidate);
+                continue;
+            }
+            let distance = pos - candidate;
+            if distance > max_distance {
+                break;
+            }
+            checked += 1;
+            if input[candidate + longest] == input[pos + longest] {
+                let length = super::super::fast::match_length(input, pos, distance, max_length);
+                if length > longest {
+                    out.push((length as u32, distance as u32))?;
+                    longest = length;
+                }
+            }
+            if checked >= cut {
+                break;
+            }
+            candidate = finder.previous(candidate);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn raw_fused_frontiers_preserve_collisions_overlap_cut_and_expiry() {
+        let mut random = Vec::with_capacity(24 * 1024);
+        let mut state = 0x7a59_1234_aa55_0123u64;
+        for _ in 0..24 * 1024 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            random.push(state as u8);
+        }
+        let patterned = b"abcdabcdXYZabcdabcdXYQ----abcdabcdXYZabcdabcdXYR".repeat(48);
+        for input in [&random[..], &patterned[..]] {
+            for (window, cut, cap, nice) in [
+                (1, 0, 4, 512),
+                (8, 1, 17, 8),
+                (64, 2, 65, 512),
+                (4096, 128, 513, 512),
+                (65536, 128, 4096, 512),
+            ] {
+                let mut fused = MatchFinder::<4>::new(window);
+                let mut ordinary = MatchFinder::<4>::new(window);
+                let allowance = super::Allowance::default();
+                let mut actual = super::Buffer::new(&allowance);
+                let mut wide = super::Buffer::new(&allowance);
+                let mut expected = super::Buffer::new(&allowance);
+                for pos in 0..input.len() - 3 {
+                    let first = fused.insert_and_first(input, pos);
+                    ordinary.insert(input, pos);
+                    actual.clear();
+                    wide.clear();
+                    expected.clear();
+                    let limit = cap.min(input.len() - pos);
+                    let distance = pos.min(window);
+                    ordinary_chain_frontier(
+                        &ordinary,
+                        input,
+                        pos,
+                        limit,
+                        distance,
+                        cut,
+                        nice,
+                        &mut expected,
+                    )
+                    .unwrap();
+                    fused
+                        .collect_improving(
+                            input,
+                            pos,
+                            first,
+                            limit,
+                            distance,
+                            cut,
+                            nice,
+                            &mut actual,
+                        )
+                        .unwrap();
+                    fused
+                        .collect_improving_with_positions::<false>(
+                            input, pos, first, limit, distance, cut, nice, &mut wide,
+                        )
+                        .unwrap();
+                    assert_eq!(&wide[..], &expected[..]);
+                    assert_eq!(
+                        &actual[..],
+                        &expected[..],
+                        "position {pos}, window {window}, cut {cut}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn raw_fused_insertion_preserves_wrapped_positions_and_sentinel() {
+        let wrap = 1usize << 32;
+        let mut fused = MatchFinder::<4>::new(64);
+        let mut ordinary = MatchFinder::<4>::new(64);
+        for pos in [wrap - 5, wrap - 1, wrap, wrap + 16, wrap + 70000] {
+            let actual = fused.record_and_first(0, pos);
+            ordinary.prev[pos & ordinary.mask] = ordinary.head[0];
+            ordinary.head[0] = pos as u32;
+            ordinary.newest = ordinary.newest.max(pos);
+            let mut expected = resolve(ordinary.newest, ordinary.head[0]);
+            if expected != NO_POSITION && expected >= pos {
+                expected = ordinary.previous(expected);
+            }
+            assert_eq!(actual, expected, "position {pos}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn raw_fused_predecessor_specializations_preserve_stale_links_and_wrap() {
+        let wrap = 1usize << 32;
+        let mut finder = MatchFinder::<4>::new(64);
+        for (newest, candidate, raw) in [
+            (64, 32, 0),
+            (64, 32, 32),
+            (64, 32, 63),
+            (64, 32, NO_LINK),
+            (wrap - 1, wrap - 2, 0),
+            (wrap - 1, wrap - 2, NO_LINK),
+            (wrap + 16, wrap + 8, 0),
+            (wrap + 16, wrap + 8, 32),
+            (wrap + 16, wrap + 8, NO_LINK),
+            (wrap + 16, 8, 0),
+        ] {
+            finder.newest = newest;
+            finder.prev[candidate & finder.mask] = raw;
+            let expected = finder.previous(candidate);
+            assert_eq!(finder.previous_for_collection::<false>(candidate), expected);
+            if newest <= u32::MAX as usize {
+                assert_eq!(finder.previous_for_collection::<true>(candidate), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn raw_tree_fast_extension_preserves_runs_and_complete_topology() {
+        let mut input = b"abcdabcdXYZabcdabcdXYQ----abcdabcdXYZabcdabcdXYR".repeat(128);
+        input.extend(std::iter::repeat_n(b'z', 2048));
+        for (window, cut, cap) in [(8, 0, 4), (64, 1, 17), (256, 2, 512), (8192, 128, 513)] {
+            let mut scalar = TreeMatchFinder::new(window);
+            let mut fast = TreeMatchFinder::new(window);
+            let allowance = super::Allowance::default();
+            let mut expected = super::Buffer::new(&allowance);
+            let mut actual = super::Buffer::new(&allowance);
+            for pos in 0..input.len() - 3 {
+                expected.clear();
+                actual.clear();
+                let limit = cap.min(input.len() - pos);
+                let distance = pos.min(window.saturating_sub(1));
+                scalar
+                    .matches_with_extension::<false>(
+                        &input,
+                        pos,
+                        limit,
+                        distance,
+                        cut,
+                        &mut expected,
+                    )
+                    .unwrap();
+                fast.matches_with_extension::<true>(&input, pos, limit, distance, cut, &mut actual)
+                    .unwrap();
+                assert_eq!(
+                    &actual[..],
+                    &expected[..],
+                    "position {pos}, window {window}, cut {cut}"
+                );
+                // Only this hash and the touched child slots can change.
+                // Compare the full topology periodically and at final expiry.
+                if pos % 127 == 0 || pos == input.len() - 4 {
+                    assert_eq!(&fast.head[..], &scalar.head[..]);
+                    assert_eq!(&fast.son[..], &scalar.son[..]);
+                }
+            }
+        }
+    }
+
+    fn raw_collision_fixture() -> Vec<u8> {
+        let prefix = b"abcd";
+        let hash = MatchFinder::<4>::hash(prefix, 0);
+        let collision = (0u32..1 << 24)
+            .find_map(|upper| {
+                let word = (u32::from(b'a') | (upper << 8)).to_le_bytes();
+                (word[1] != b'b' && MatchFinder::<4>::hash(&word, 0) == hash).then_some(word)
+            })
+            .unwrap();
+        let mut input = vec![0; 48];
+        input[..12].copy_from_slice(b"abcdlongtail");
+        input[16..20].copy_from_slice(&collision);
+        input[32..44].copy_from_slice(b"abcdlongtail");
+        input
+    }
+
+    #[test]
+    fn raw_fused_subfour_runs_preserve_allocation_refusal_and_cleanup() {
+        use super::super::workspace::RefusingBudget;
+        let input = raw_collision_fixture();
+        let probe = RefusingBudget::new(usize::MAX);
+        let mut finder = MatchFinder::<4, _>::with_allowance(64, &probe).unwrap();
+        finder.insert(&input, 0);
+        finder.insert(&input, 16);
+        let first = finder.insert_and_first(&input, 32);
+        let mut runs = super::Buffer::new(&probe);
+        finder
+            .collect_improving(&input, 32, first, 12, 32, 128, 512, &mut runs)
+            .unwrap();
+        assert_eq!(runs[0].0, 1);
+        assert_eq!(runs[1], (12, 32));
+        let attempts = probe.attempts();
+        drop((runs, finder));
+        assert_eq!(probe.used(), 0);
+        for fail_at in 0..attempts {
+            let fused_budget = RefusingBudget::new(fail_at);
+            let ordinary_budget = RefusingBudget::new(fail_at);
+            let run = |budget: &RefusingBudget, fused: bool| {
+                let mut finder = MatchFinder::<4, _>::with_allowance(64, budget)?;
+                finder.insert(&input, 0);
+                finder.insert(&input, 16);
+                let first = if fused {
+                    finder.insert_and_first(&input, 32)
+                } else {
+                    finder.insert(&input, 32);
+                    finder.first(&input, 32)
+                };
+                let mut output = super::Buffer::new(budget);
+                if fused {
+                    finder.collect_improving(&input, 32, first, 12, 32, 128, 512, &mut output)
+                } else {
+                    ordinary_chain_frontier(&finder, &input, 32, 12, 32, 128, 512, &mut output)
+                }
+            };
+            assert_eq!(run(&fused_budget, true), run(&ordinary_budget, false));
+            assert_eq!(fused_budget.attempts(), ordinary_budget.attempts());
+            assert_eq!(fused_budget.used(), 0);
+            assert_eq!(ordinary_budget.used(), 0);
+        }
     }
 
     /// Every improving match at each position of `input`, walked in order the

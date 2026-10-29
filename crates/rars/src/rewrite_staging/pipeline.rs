@@ -1,13 +1,11 @@
 //! Demand-driven, archive-order decoding for one scoped writer call.
 use super::*;
+use crate::atomic64::AtomicU64;
 use crate::streaming::SourceFactory;
 use crate::{Error, ReadCancellation};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Condvar, Mutex,
-};
+use std::sync::{atomic::Ordering, Condvar, Mutex};
 
 #[derive(Default)]
 struct State {
@@ -23,6 +21,7 @@ pub(super) struct Delivery {
     changed: Condvar,
     cancellation: ReadCancellation,
     pub(super) used: Arc<AtomicU64>,
+    max_preparation_window: usize,
 }
 
 struct Lease {
@@ -57,10 +56,31 @@ struct Source {
     delivery: Arc<Delivery>,
 }
 impl SourceFactory for Source {
+    fn max_preparation_window(&self) -> usize {
+        self.delivery.max_preparation_window
+    }
     fn len(&self) -> Result<u64> {
         Ok(self.size)
     }
     fn open(&self) -> Result<Box<dyn crate::EntryReader>> {
+        self.open_with_cancellation(|| self.delivery.cancellation.is_cancelled())
+    }
+    fn release(&self) {
+        self.delivery
+            .state
+            .lock()
+            .unwrap()
+            .ready
+            .remove(&self.index);
+        self.delivery.changed.notify_all();
+    }
+}
+
+impl Source {
+    fn open_with_cancellation(
+        &self,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<Box<dyn crate::EntryReader>> {
         let mut state = self.delivery.state.lock().unwrap();
         state.requested = Some(
             state
@@ -72,7 +92,7 @@ impl SourceFactory for Source {
             if let Some(error) = &state.error {
                 return Err(error.clone());
             }
-            if self.delivery.cancellation.is_cancelled() {
+            if is_cancelled() {
                 return Err(Error::Cancelled);
             }
             if let Some(lease) = state.ready.get(&self.index).cloned() {
@@ -85,20 +105,11 @@ impl SourceFactory for Source {
             if state.published.contains(&self.index) {
                 return Err(Error::WriterFailure("rewrite source already consumed"));
             }
-            if state.done || self.delivery.cancellation.is_cancelled() {
+            if state.done || is_cancelled() {
                 return Err(Error::Cancelled);
             }
             state = self.delivery.changed.wait(state).unwrap();
         }
-    }
-    fn release(&self) {
-        self.delivery
-            .state
-            .lock()
-            .unwrap()
-            .ready
-            .remove(&self.index);
-        self.delivery.changed.notify_all();
     }
 }
 
@@ -158,6 +169,22 @@ pub(super) fn run<T>(
     consume: impl FnOnce(Vec<EntrySource>) -> Result<T>,
 ) -> Result<T> {
     options.check_cancelled()?;
+    let sizes: BTreeMap<_, _> = archive
+        .members()
+        .enumerate()
+        .map(|(i, member)| (i, member.meta.unpacked_size))
+        .collect();
+    // A preparation window can retain every source until its members are emitted.
+    // Bound it by the largest selected payload so even mixed-size windows fit.
+    let largest = indices
+        .iter()
+        .filter_map(|index| sizes.get(index))
+        .copied()
+        .max()
+        .unwrap_or(0);
+    let max_preparation_window = usize::try_from(staging.max_staged_bytes / largest.max(1))
+        .unwrap_or(usize::MAX)
+        .max(1);
     let delivery = Arc::new(Delivery {
         state: Mutex::new(State::default()),
         changed: Condvar::new(),
@@ -165,12 +192,8 @@ pub(super) fn run<T>(
             .cancellation
             .map_or_else(ReadCancellation::new, ReadCancellation::child),
         used: Arc::new(AtomicU64::new(0)),
+        max_preparation_window,
     });
-    let sizes: BTreeMap<_, _> = archive
-        .members()
-        .enumerate()
-        .map(|(i, member)| (i, member.meta.unpacked_size))
-        .collect();
     let sources = indices
         .iter()
         .map(|&index| {
@@ -217,20 +240,42 @@ pub(super) fn run<T>(
         match result {
             Err(error) => Err(error),
             Ok(value) => {
-                match decoded {
-                    Err(Error::Cancelled) if requested != indices.iter().copied().max() => {}
-                    other => other?,
-                }
+                finish_decoder(decoded, requested != indices.iter().copied().max())?;
                 Ok(value)
             }
         }
     })
 }
 
+fn finish_decoder(decoded: Result<()>, unused_sources: bool) -> Result<()> {
+    match decoded {
+        // Stopping an unused source can race with entry selection, which adds
+        // context to cancellation. Its category is unchanged by that context.
+        Err(error) if unused_sources && error.kind() == crate::ErrorKind::Cancelled => Ok(()),
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn unused_source_shutdown_accepts_contextual_cancellation_only() {
+        let cancelled = Error::AtEntry {
+            name: b"file".to_vec(),
+            operation: "selecting",
+            source: Box::new(Error::Cancelled),
+        };
+        assert_eq!(finish_decoder(Err(cancelled.clone()), true), Ok(()));
+        assert_eq!(
+            finish_decoder(Err(cancelled.clone()), false),
+            Err(cancelled)
+        );
+        let error = Error::InvalidArgument("decoder refused");
+        assert_eq!(finish_decoder(Err(error.clone()), true), Err(error));
+    }
 
     struct CancelAtStagingFinish(AtomicBool);
 
@@ -258,6 +303,7 @@ mod tests {
             changed: Condvar::new(),
             cancellation: ReadCancellation::new(),
             used: Arc::new(AtomicU64::new(0)),
+            max_preparation_window: usize::MAX,
         })
     }
 
@@ -315,6 +361,63 @@ mod tests {
             Err(Error::Cancelled)
         ));
         assert_eq!(delivery.used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn cancellation_between_observations_refuses_to_wait_for_a_source() {
+        let delivery = delivery();
+        let source = Source {
+            index: 0,
+            size: 1,
+            delivery: delivery.clone(),
+        };
+        let mut observations = 0;
+        let result = source.open_with_cancellation(|| {
+            let cancelled = delivery.cancellation.is_cancelled();
+            observations += 1;
+            if observations == 1 {
+                // Model cancellation after the first atomic load returned false.
+                delivery.cancellation.cancel();
+            }
+            cancelled
+        });
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(observations, 2);
+        let state = delivery.state.lock().unwrap();
+        assert_eq!(state.requested, Some(0));
+        assert!(!state.done);
+        assert!(state.ready.is_empty());
+        assert!(state.published.is_empty());
+        assert_eq!(delivery.used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn published_source_delivers_bytes_and_releases_its_charge() {
+        let delivery = delivery();
+        let source = Source {
+            index: 0,
+            size: 7,
+            delivery: delivery.clone(),
+        };
+        assert_eq!(source.len().unwrap(), 7);
+        // Native staging charges the bytes before publishing the lease.
+        delivery.used.store(7, Ordering::Relaxed);
+        delivery
+            .publish(0, EntrySource::from_bytes(b"payload".to_vec()))
+            .unwrap();
+        let mut reader = source.open().unwrap();
+        delivery.wait_for(0).unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"payload");
+        source.release();
+        assert_eq!(delivery.used.load(Ordering::Relaxed), 7);
+        drop(reader);
+        assert_eq!(delivery.used.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            source.open(),
+            Err(Error::WriterFailure("rewrite source already consumed"))
+        ));
     }
 
     #[test]

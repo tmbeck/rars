@@ -133,6 +133,859 @@ fn info_lists_rar15_40_metadata() {
 }
 
 #[test]
+fn info_displays_services_redirections_and_legacy_comments_in_both_modes() {
+    for (path, terse, verbose) in [
+        (
+            fixture_rar50("with_all_services.rar"),
+            vec![
+                "Comment: This is the archive comment.",
+                "Services: quick-open, recovery",
+                "hello.txt",
+            ],
+            vec!["service: QO", "service: RR", "crc=none", "hello.txt"],
+        ),
+        (
+            fixture_rar50("wild/symlink.rar"),
+            vec!["symlink.txt → file.txt", "dirlink → dir"],
+            vec!["redirection: type=1", "target=file.txt"],
+        ),
+        (
+            fixture_rar15_40("rar300/with_comment_rar300.rar"),
+            vec![
+                "Comment: This is the archive comment.",
+                "Subblocks: ArchiveComment",
+                "hello.txt",
+            ],
+            vec![
+                "comment: This is the archive comment.",
+                "subblock: ArchiveComment CMT",
+            ],
+        ),
+        (
+            fixture("COMMENT.RAR"),
+            vec!["Comment: This is the archive comment."],
+            vec!["archive comment extension:", "(packed)"],
+        ),
+    ] {
+        for (is_verbose, expected) in [(false, terse), (true, verbose)] {
+            let mut command = rars();
+            command.arg("info");
+            if is_verbose {
+                command.arg("--verbose");
+            }
+            let output = command.arg(&path).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}: {}",
+                path.display(),
+                stderr(&output)
+            );
+            let text = stdout(&output);
+            for expected in expected {
+                assert!(text.contains(expected), "missing {expected:?}: {text}");
+            }
+            if path == fixture_rar50("with_all_services.rar") {
+                // The archive CMT is displayed once as a comment, rather than
+                // again in the remaining service list.
+                assert!(!text.contains("service: CMT"));
+                assert!(!text.contains("Services: comment"));
+            }
+        }
+    }
+}
+
+#[test]
+fn extraction_volume_failures_preserve_existing_files_and_legacy_encoding() {
+    let root = scratch("extract-volume-boundaries");
+    let output_directory = root.join("out");
+    let parts: Vec<_> = [
+        "rar300/stored_multivol_rar300.rar",
+        "rar300/stored_multivol_rar300.r00",
+        "rar300/stored_multivol_rar300.r01",
+        "rar300/stored_multivol_rar300.r02",
+    ]
+    .into_iter()
+    .map(fixture_rar15_40)
+    .collect();
+    let extract = rars()
+        .args(["extract", "--legacy-name-encoding", "cp850"])
+        .args(&parts)
+        .arg(&output_directory)
+        .output()
+        .unwrap();
+    assert!(extract.status.success(), "{}", stderr(&extract));
+    let destination = output_directory.join("stored-volume.txt");
+    assert_eq!(
+        fs::read(&destination).unwrap(),
+        expected_rar15_40_stored_volume_payload()
+    );
+    fs::write(&destination, b"keep existing contents").unwrap();
+    let refusal = rars()
+        .args(["extract", "--legacy-name-encoding", "cp850"])
+        .args(&parts)
+        .arg(&output_directory)
+        .output()
+        .unwrap();
+    assert!(!refusal.status.success());
+    assert!(stderr(&refusal).contains("failed to extract volume set"));
+    assert_eq!(fs::read(&destination).unwrap(), b"keep existing contents");
+    let incomplete = rars()
+        .arg("extract")
+        .args(&parts[..2])
+        .arg(root.join("incomplete"))
+        .output()
+        .unwrap();
+    assert!(!incomplete.status.success());
+    assert!(stderr(&incomplete).contains("failed to extract volume set"));
+
+    let single = rars()
+        .args(["extract", "--legacy-name-encoding", "cp850"])
+        .arg(fixture("README_store.rar"))
+        .arg(root.join("single"))
+        .output()
+        .unwrap();
+    assert!(single.status.success(), "{}", stderr(&single));
+    assert!(root.join("single/README").is_file());
+}
+
+#[test]
+fn info_displays_archive_name_and_creation_time_in_both_modes() {
+    let root = scratch("info-archive-metadata");
+    let source = root.join("file.txt");
+    let archive = root.join("named.rar");
+    fs::write(&source, b"metadata payload").unwrap();
+    let create = rars()
+        .args([
+            "add",
+            "--format",
+            "rar70",
+            "--store",
+            "--archive-name",
+            "original.rar",
+        ])
+        .arg(&archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(create.status.success(), "{}", stderr(&create));
+    for (arguments, name, time) in [
+        (vec!["info"], "Archive name: original.rar", "Created:"),
+        (
+            vec!["info", "--verbose"],
+            "archive name: original.rar",
+            "archive creation time:",
+        ),
+    ] {
+        let info = rars().args(arguments).arg(&archive).output().unwrap();
+        assert!(info.status.success(), "{}", stderr(&info));
+        let text = stdout(&info);
+        assert!(text.contains(name), "{text}");
+        assert!(text.contains(time), "{text}");
+    }
+}
+
+#[test]
+fn extracts_rar50_volume_fixture_through_the_cli() {
+    let root = scratch("extract-rar50-volumes");
+    let parts: Vec<_> = (1..=3)
+        .map(|part| fixture_rar50(&format!("stored_multivol.part{part}.rar")))
+        .collect();
+    let output = rars()
+        .arg("extract")
+        .args(&parts)
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let data = fs::read(root.join("random_4k.bin")).unwrap();
+    assert_eq!(data.len(), 4096);
+    assert_eq!(crc32(&data), 0xb9c5_4415);
+    assert!(stdout(&output).contains("x random_4k.bin"));
+}
+
+#[test]
+fn creates_legacy_volumes_with_explicit_compression_settings() {
+    for (format, flags) in [
+        ("rar14", vec!["--store"]),
+        ("rar14", vec!["--level", "3"]),
+        ("rar20", vec!["--level", "3", "--dict-size", "64k"]),
+        ("rar29", vec!["--level", "3", "--dict-size", "64k"]),
+    ] {
+        let root = scratch("legacy-volume-options");
+        let source = root.join("payload.bin");
+        let archive = root.join("split.rar");
+        let payload = deterministic_noise(1024);
+        fs::write(&source, &payload).unwrap();
+        let create = rars()
+            .args(["add", "--format", format, "--volume-size", "256"])
+            .args(flags)
+            .arg(&archive)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(create.status.success(), "{format}: {}", stderr(&create));
+        let extract = rars()
+            .arg("extract")
+            .arg(&archive)
+            .arg(root.join("out"))
+            .output()
+            .unwrap();
+        assert!(extract.status.success(), "{format}: {}", stderr(&extract));
+        assert_eq!(fs::read(root.join("out/payload.bin")).unwrap(), payload);
+    }
+}
+
+#[test]
+fn info_reports_comment_output_limits_for_every_archive_family() {
+    for path in [
+        fixture("COMMENT.RAR"),
+        fixture_rar15_40("rar300/with_comment_rar300.rar"),
+        fixture_rar50("with_comment.rar"),
+    ] {
+        for verbose in [false, true] {
+            let mut command = rars();
+            command.args(["info", "--max-member-output-bytes", "0"]);
+            if verbose {
+                command.arg("--verbose");
+            }
+            let output = command.arg(&path).output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{}: {}",
+                path.display(),
+                stderr(&output)
+            );
+            let text = stderr(&output);
+            assert!(text.contains("failed to decode archive comment"), "{text}");
+            assert!(text.contains(&path.display().to_string()), "{text}");
+        }
+    }
+}
+
+#[test]
+fn add_refuses_header_encryption_without_password_and_stdout_volume_sets() {
+    let root = scratch("add-invalid-destinations");
+    let source = root.join("file.txt");
+    let archive = root.join("output.rar");
+    fs::write(&source, b"small payload").unwrap();
+    let no_password = rars()
+        .args(["add", "--format", "rar50", "--encrypt-headers"])
+        .arg(&archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert_eq!(no_password.status.code(), Some(2));
+    assert!(stderr(&no_password).contains("--encrypt-headers needs a --password"));
+    assert!(!archive.exists());
+    for destination in ["-", "/dev/stdout"] {
+        let output = rars()
+            .args([
+                "add",
+                "--format",
+                "rar50",
+                "--store",
+                "--volume-size",
+                "256",
+                destination,
+            ])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(stderr(&output).contains("volume sets cannot be written to stdout"));
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn info_identifies_self_extracting_archives_and_unpacked_legacy_comments() {
+    let sfx = rars()
+        .arg("info")
+        .arg(fixture("SFXSRC.EXE"))
+        .output()
+        .unwrap();
+    assert!(sfx.status.success(), "{}", stderr(&sfx));
+    assert!(stdout(&sfx).contains("(SFX, payload at offset "));
+    let root = scratch("info-unpacked-comment");
+    let archive = root.join("comment.rar");
+    // Current writers pack archive comments. The legacy reader also accepts
+    // the original uncompressed extension: length followed by comment bytes.
+    let comment = b"unpacked note";
+    let mut bytes = b"RE~^".to_vec();
+    bytes.extend_from_slice(&(7u16 + 2 + comment.len() as u16).to_le_bytes());
+    bytes.push(0x82); // required flag and archive-comment flag, no packed flag
+    bytes.extend_from_slice(&(comment.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(comment);
+    fs::write(&archive, bytes).unwrap();
+    let output = rars()
+        .args(["info", "--verbose"])
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("archive comment extension:"));
+    assert!(text.contains("comment: unpacked note"));
+    assert!(!text.contains("(packed)"));
+}
+
+#[test]
+fn legacy_stdout_aliases_emit_archives_and_quick_open_refuses_encrypted_headers() {
+    let root = scratch("stdout-aliases-and-header-conflict");
+    let source = root.join("payload.txt");
+    fs::write(&source, b"stdout payload").unwrap();
+    for destination in ["-", "/dev/stdout"] {
+        let output = rars()
+            .args(["add", "--format", "rar14", "--store", destination])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        let archive = rars::rar13::Archive::parse(&output.stdout).unwrap();
+        assert_eq!(archive.entries.len(), 1);
+        assert_eq!(archive.entries[0].name, b"payload.txt");
+        let saved = root.join("captured.rar");
+        fs::write(&saved, &output.stdout).unwrap();
+        assert_archive_tests_and_extracts_file(&saved, None, "payload.txt", b"stdout payload");
+    }
+    let archive = root.join("conflict.rar");
+    let conflict = rars()
+        .args([
+            "add",
+            "--format",
+            "rar50",
+            "--store",
+            "--quick-open",
+            "--encrypt-headers",
+            "--password",
+            "pass",
+        ])
+        .arg(&archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(!conflict.status.success());
+    assert!(stderr(&conflict).contains("quick-open cannot be combined with header encryption"));
+    assert!(!archive.exists());
+}
+
+#[test]
+fn info_keeps_file_comment_services_separate_from_archive_comments() {
+    let root = scratch("info-file-comment-services");
+    let source = root.join("payload.txt");
+    let archive = root.join("services.rar");
+    fs::write(&source, b"service payload").unwrap();
+    let create = rars()
+        .args([
+            "add",
+            "--format",
+            "rar50",
+            "--store",
+            "--quick-open",
+            "--file-comment",
+            "member note",
+        ])
+        .arg(&archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(create.status.success(), "{}", stderr(&create));
+    for verbose in [false, true] {
+        let mut command = rars();
+        command.arg("info");
+        if verbose {
+            command.arg("--verbose");
+        }
+        let output = command.arg(&archive).output().unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        let text = stdout(&output);
+        if verbose {
+            assert!(text.contains("service: CMT"), "{text}");
+            assert!(text.contains("service: QO"), "{text}");
+        } else {
+            assert!(text.contains("Services:"), "{text}");
+            assert!(text.contains("comment"), "{text}");
+            assert!(text.contains("quick-open"), "{text}");
+        }
+        assert!(!text.contains("Comment:"), "{text}");
+        assert!(!text.contains("  comment:"), "{text}");
+    }
+}
+
+#[test]
+fn explicit_utf8_legacy_decoding_refuses_invalid_names_without_outputs() {
+    let root = scratch("legacy-name-decoding-errors");
+    let legacy13 = write_stored_archive(
+        &[StoredEntry {
+            name: b"\xff.txt",
+            data: b"payload",
+            file_time: 0,
+            file_attr: 0x20,
+            password: None,
+            file_comment: None,
+        }],
+        WriterOptions::default(),
+    )
+    .unwrap();
+    let legacy15 = rar15_40::write_stored_archive(
+        &[rar15_40::StoredEntry {
+            name: b"\xff.txt",
+            data: b"payload",
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        }],
+        rar15_40::WriterOptions::new(rars::ArchiveVersion::Rar15, rars::FeatureSet::store_only()),
+    )
+    .unwrap();
+    for (index, bytes) in [legacy13, legacy15].into_iter().enumerate() {
+        let archive = root.join(format!("legacy-{index}.rar"));
+        fs::write(&archive, bytes).unwrap();
+        for verbose in [false, true] {
+            let mut command = rars();
+            command.args(["info", "--legacy-name-encoding", "utf-8"]);
+            if verbose {
+                command.arg("--verbose");
+            }
+            let output = command.arg(&archive).output().unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            assert!(stderr(&output).contains("legacy name is not valid UTF-8"));
+        }
+        let destination = root.join(format!("out-{index}"));
+        let extract = rars()
+            .args(["extract", "--legacy-name-encoding", "utf-8"])
+            .arg(&archive)
+            .arg(&destination)
+            .output()
+            .unwrap();
+        assert_eq!(extract.status.code(), Some(1));
+        assert!(stderr(&extract).contains("legacy name is not valid UTF-8"));
+        assert!(!destination.exists());
+    }
+}
+
+#[test]
+fn split_legacy_name_decoding_errors_do_not_create_output() {
+    let root = scratch("split-legacy-name-decoding-error");
+    let payload = [b'x'; 128];
+    let parts = rars::rar13::write_stored_volumes(
+        StoredEntry {
+            name: b"\xff.txt",
+            data: &payload,
+            file_time: 0,
+            file_attr: 0x20,
+            password: None,
+            file_comment: None,
+        },
+        WriterOptions::default(),
+        64,
+    )
+    .unwrap();
+    assert!(parts.len() > 1);
+    let paths: Vec<_> = parts
+        .into_iter()
+        .enumerate()
+        .map(|(index, bytes)| {
+            let path = root.join(format!("invalid.part{:02}.rar", index + 1));
+            fs::write(&path, bytes).unwrap();
+            path
+        })
+        .collect();
+    let destination = root.join("out");
+    let output = rars()
+        .args(["extract", "--legacy-name-encoding", "utf-8"])
+        .args(&paths)
+        .arg(&destination)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("legacy name is not valid UTF-8"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!destination.exists());
+}
+
+#[test]
+fn unicode_archive_names_override_explicit_legacy_encoding() {
+    let root = scratch("unicode-overrides-legacy-encoding");
+    let output = rars()
+        .args([
+            "extract",
+            "--legacy-name-encoding",
+            "cp850",
+            "--password",
+            "test",
+        ])
+        .arg(fixture_rar15_40(
+            "encrypted/rar4_junrar_file_content_encrypted_unicode.rar",
+        ))
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        fs::read(root.join("新建文本文档.txt")).unwrap(),
+        b"aaaaaaaaaa"
+    );
+}
+
+#[test]
+fn creates_encrypted_rar14_archives_through_the_streaming_cli() {
+    for stored in [false, true] {
+        let root = scratch("rar14-encrypted-streaming");
+        let source = root.join("secret.txt");
+        let archive = root.join("encrypted.rar");
+        fs::write(&source, b"legacy secret").unwrap();
+        let mut command = rars();
+        command.args(["add", "--format", "rar14", "--password", "pass"]);
+        command.args(["--level", if stored { "0" } else { "3" }]);
+        if stored {
+            command.arg("--store");
+        }
+        let output = command.arg(&archive).arg(&source).output().unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        let parsed = rars::rar13::Archive::parse_path(&archive).unwrap();
+        assert!(parsed.entries[0].is_encrypted());
+        let missing_password = rars().arg("test").arg(&archive).output().unwrap();
+        assert_password_required(&missing_password);
+        assert_archive_tests_and_extracts_file(
+            &archive,
+            Some("pass"),
+            "secret.txt",
+            b"legacy secret",
+        );
+    }
+}
+
+#[test]
+fn legacy_volume_output_creation_failure_has_context_and_leaves_no_archive() {
+    let root = scratch("legacy-volume-output-error");
+    let source = root.join("payload.txt");
+    let archive = root.join("missing/split.rar");
+    fs::write(&source, b"volume output error payload").unwrap();
+    let output = rars()
+        .args([
+            "add",
+            "--format",
+            "rar14",
+            "--store",
+            "--volume-size",
+            "256",
+        ])
+        .arg(&archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let text = stderr(&output);
+    assert!(
+        text.contains("failed to write volume set starting at"),
+        "{text}"
+    );
+    assert!(text.contains(&archive.display().to_string()), "{text}");
+    assert!(!archive.exists());
+    assert!(!root.join("missing").exists());
+}
+
+#[test]
+fn modern_volume_staging_failure_preserves_the_output_directory() {
+    let root = scratch("modern-volume-staging-error");
+    let source = root.join("payload.txt");
+    let archive = root.join("missing/split.rar");
+    fs::write(&source, b"volume staging error payload").unwrap();
+    let output = rars()
+        .args([
+            "add",
+            "--format",
+            "rar50",
+            "--store",
+            "--volume-size",
+            "256",
+        ])
+        .arg("--temp-dir")
+        .arg(&root)
+        .arg(&archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("failed to create temporary archive"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!root.join("missing").exists());
+    assert_eq!(fs::read(&source).unwrap(), b"volume staging error payload");
+}
+
+#[cfg(unix)]
+#[test]
+fn streaming_input_permission_failures_preserve_existing_archives() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = scratch("streaming-input-permission-errors");
+    let source = root.join("private.txt");
+    let archive = root.join("existing.rar");
+    fs::write(&source, b"private payload").unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o0)).unwrap();
+    if fs::File::open(&source).is_ok() {
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+        return; // privileged runners bypass Unix file permissions
+    }
+    for (format, volume) in [("rar14", false), ("rar50", false), ("rar14", true)] {
+        fs::write(&archive, b"existing archive").unwrap();
+        let mut command = rars();
+        command.args(["add", "--format", format, "--store"]);
+        if volume {
+            command.args(["--volume-size", "256"]);
+        }
+        let output = command.arg(&archive).arg(&source).output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert!(
+            stderr(&output).contains("private.txt"),
+            "{}",
+            stderr(&output)
+        );
+        assert_eq!(fs::read(&archive).unwrap(), b"existing archive");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+    }
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[test]
+fn modern_writer_memory_limit_is_forwarded_for_success_and_refusal() {
+    let root = scratch("modern-explicit-memory-limit");
+    let source = root.join("payload.txt");
+    let archive = root.join("bounded.rar");
+    fs::write(&source, b"bounded writer payload").unwrap();
+    let stored = rars()
+        .args([
+            "add",
+            "--format",
+            "rar50",
+            "--store",
+            "--memory-limit",
+            "64m",
+        ])
+        .arg(&archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(stored.status.success(), "{}", stderr(&stored));
+    assert_archive_tests_and_extracts_file(
+        &archive,
+        None,
+        "payload.txt",
+        b"bounded writer payload",
+    );
+    let original = fs::read(&archive).unwrap();
+    let refused = rars()
+        .args(["add", "--format", "rar50", "--memory-limit", "1"])
+        .arg(&archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(stderr(&refused).contains("memory"), "{}", stderr(&refused));
+    assert_eq!(fs::read(&archive).unwrap(), original);
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+}
+
+#[test]
+fn coding_conflict_diagnostics_refuse_before_replacing_an_archive() {
+    let root = scratch("coding-conflict-diagnostics");
+    let source = root.join("payload.txt");
+    let archive = root.join("existing.rar");
+    fs::write(&source, b"payload").unwrap();
+    fs::write(&archive, b"existing archive").unwrap();
+    for (arguments, message) in [
+        (
+            vec!["--format", "rar50", "--solid", "--delta-filter", "1"],
+            "cannot be used with --solid",
+        ),
+        (
+            vec!["--format", "rar29", "--store", "--auto-filter"],
+            "needs something to compress",
+        ),
+        (
+            vec!["--format", "rar29", "--store", "--ppmd"],
+            "needs something to compress",
+        ),
+        (
+            vec!["--format", "rar29", "--level", "0", "--delta-filter", "1"],
+            "needs something to compress",
+        ),
+    ] {
+        let output = rars()
+            .arg("add")
+            .args(arguments)
+            .arg(&archive)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(stderr(&output).contains(message), "{}", stderr(&output));
+        assert_eq!(fs::read(&archive).unwrap(), b"existing archive");
+    }
+}
+
+#[test]
+fn duplicate_archive_entries_are_refused_even_when_overwriting_is_allowed() {
+    let root = scratch("duplicate-archive-entry-paths");
+    let entries = [
+        StoredEntry {
+            name: b"duplicate.txt",
+            data: b"first contents",
+            file_time: 0,
+            file_attr: 0x20,
+            password: None,
+            file_comment: None,
+        },
+        StoredEntry {
+            name: b"duplicate.txt",
+            data: b"second contents",
+            file_time: 0,
+            file_attr: 0x20,
+            password: None,
+            file_comment: None,
+        },
+    ];
+    let legacy = write_stored_archive(&entries, WriterOptions::default()).unwrap();
+    let modern_entries: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            rars::rar50::ArchiveEntry::new(
+                entry.name.to_vec(),
+                rars::EntrySource::from_bytes(entry.data),
+            )
+        })
+        .collect();
+    let mut modern = Vec::new();
+    rars::rar50::write_streaming_archive_to(
+        &modern_entries,
+        rars::rar50::WriterOptions::new(
+            rars::ArchiveVersion::Rar50,
+            rars::FeatureSet::store_only(),
+        )
+        .with_compression_level(0),
+        rars::rar50::ArchiveExtras::default(),
+        &rars::WriterResources::new(64 * 1024 * 1024),
+        &mut modern,
+    )
+    .unwrap();
+    for (format, bytes) in [("legacy", legacy), ("modern", modern)] {
+        let archive = root.join(format!("duplicates-{format}.rar"));
+        fs::write(&archive, bytes).unwrap();
+        let destination = root.join(format!("out-{format}"));
+        let output = rars()
+            .args(["extract", "--overwrite", "always"])
+            .arg(&archive)
+            .arg(&destination)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            stderr(&output).contains("multiple archive entries map to the same output path"),
+            "{}",
+            stderr(&output)
+        );
+        // The first copy was verified before its duplicate was refused.
+        assert_eq!(
+            fs::read(destination.join("duplicate.txt")).unwrap(),
+            b"first contents"
+        );
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn encrypted_volume_sets_require_a_password_before_testing_or_extraction() {
+    for parts in [
+        (1..=3)
+            .map(|i| fixture_rar50(&format!("encrypted_multivol.part{i}.rar")))
+            .collect::<Vec<_>>(),
+        [
+            "encrypted_split/ESPLIT.RAR",
+            "encrypted_split/ESPLIT.R00",
+            "encrypted_split/ESPLIT.R01",
+        ]
+        .into_iter()
+        .map(fixture)
+        .collect(),
+    ] {
+        let root = scratch("encrypted-volume-missing-password");
+        let test = rars()
+            .arg("test")
+            .args(&parts)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_password_required(&test);
+        let destination = root.join("out");
+        let extract = rars()
+            .arg("extract")
+            .args(&parts)
+            .arg(&destination)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_password_required(&extract);
+        assert!(!destination.exists());
+    }
+}
+
+#[test]
+fn missing_password_file_refuses_add_without_replacing_the_archive() {
+    let root = scratch("add-missing-password-file");
+    let source = root.join("payload.txt");
+    let archive = root.join("existing.rar");
+    let missing = root.join("missing-password");
+    fs::write(&source, b"payload").unwrap();
+    fs::write(&archive, b"existing archive").unwrap();
+    let output = rars()
+        .args(["add", "--password-file"])
+        .arg(&missing)
+        .arg(&archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains(&missing.display().to_string()));
+    assert_eq!(fs::read(&archive).unwrap(), b"existing archive");
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+}
+
+#[test]
+fn legacy_volume_name_exhaustion_preserves_existing_archives() {
+    let root = scratch("legacy-volume-name-exhaustion");
+    let source = root.join("p");
+    let archive = root.join("archive.rar");
+    let second = root.join("archive.r00");
+    fs::write(&source, [b'x'; 128]).unwrap();
+    fs::write(&archive, b"existing archive").unwrap();
+    fs::write(&second, b"existing second volume").unwrap();
+    let output = rars()
+        .args(["add", "--format", "rar14", "--store", "--volume-size", "1"])
+        .arg(&archive)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains(".r00 through .r99"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fs::read(&archive).unwrap(), b"existing archive");
+    assert_eq!(fs::read(&second).unwrap(), b"existing second volume");
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
+}
+
+#[test]
 fn test_verifies_rar15_40_stored_fixture() {
     let output = rars()
         .arg("test")
@@ -498,6 +1351,16 @@ fn extracts_non_utf8_output_path_where_native_names_support_bytes() {
     {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
+        if !scratch::supports_raw_byte_names(&dir) {
+            assert!(!extract.status.success());
+            assert!(
+                stderr(&extract).contains("failed to write extracted entry"),
+                "{}",
+                stderr(&extract)
+            );
+            assert!(!out_dir.join("\u{fffd}.txt").exists());
+            return;
+        }
         assert!(extract.status.success(), "{}", stderr(&extract));
         assert_eq!(
             fs::read(out_dir.join(OsStr::from_bytes(b"\xff.txt"))).unwrap(),
@@ -554,6 +1417,25 @@ fn rejects_output_path_that_is_existing_symlink() {
         "{stderr}"
     );
     assert_eq!(fs::read(&target).unwrap(), b"do not overwrite\n");
+}
+
+#[test]
+fn test_reports_directory_entries_and_redirection_warnings() {
+    let output = rars()
+        .arg("test")
+        .arg(fixture_rar50("wild/symlink.rar"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let stdout = stdout(&output);
+    let stderr = stderr(&output);
+    assert!(stdout.contains("OK dir/"), "{stdout}");
+    for name in ["symlink.txt", "dirlink"] {
+        assert!(
+            stderr.contains(&format!("redirection entry '{name}' is not recreated")),
+            "{stderr}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -846,18 +1728,70 @@ fn password_file_and_stdin_password_unlock_encrypted_archives() {
         .unwrap();
     assert!(create.status.success(), "stderr: {}", stderr(&create));
 
-    let mut command = rars();
-    command
-        .args(["test", "--password", "-"])
-        .arg(&archive)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().unwrap();
-    child.stdin.as_mut().unwrap().write_all(b"pass\n").unwrap();
-    let test = child.wait_with_output().unwrap();
-    assert!(test.status.success(), "stderr: {}", stderr(&test));
-    assert!(stdout(&test).contains("OK secret.txt"));
+    for flag in ["--password", "--password-file"] {
+        let mut command = rars();
+        command
+            .args(["test", flag, "-"])
+            .arg(&archive)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        child.stdin.as_mut().unwrap().write_all(b"pass\n").unwrap();
+        let test = child.wait_with_output().unwrap();
+        assert!(test.status.success(), "stderr: {}", stderr(&test));
+        assert!(stdout(&test).contains("OK secret.txt"));
+    }
+}
+
+#[test]
+fn missing_passwords_fail_without_prompting_when_stdin_is_not_a_terminal() {
+    for name in [
+        "encrypted/header_rar300_password.rar",
+        "encrypted/per_file_rar300_password.rar",
+    ] {
+        let output = rars()
+            .arg("test")
+            .arg(fixture_rar15_40(name))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+        assert!(!stderr(&output).contains("password: "));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn stdin_password_read_errors_are_reported_for_both_flags() {
+    let dir = scratch("stdin-password-read-error");
+    for flag in ["--password", "--password-file"] {
+        let output = rars()
+            .args(["test", flag, "-"])
+            .arg(fixture_rar15_40("encrypted/header_rar300_password.rar"))
+            .stdin(Stdio::from(fs::File::open(&dir).unwrap()))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert!(stderr(&output).contains("error:"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn password_prompts_use_real_controlling_terminals() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/test_cli_tty.py");
+    let output = Command::new("python3")
+        .arg(script)
+        .arg(env!("CARGO_BIN_EXE_rars"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
 }
 
 #[test]
@@ -886,7 +1820,14 @@ fn prints_usage_for_help_command() {
     let output = rars().arg("--help").output().unwrap();
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     let stdout = stdout(&output);
-    assert!(stdout.contains("Usage: rars [OPTIONS] <COMMAND>"));
+    let binary_name = Path::new(env!("CARGO_BIN_EXE_rars"))
+        .file_name()
+        .unwrap()
+        .to_string_lossy();
+    assert!(
+        stdout.contains(&format!("Usage: {binary_name} [OPTIONS] <COMMAND>")),
+        "stdout: {stdout}"
+    );
     assert!(stdout.contains("--threads <N>"));
     assert!(stdout.contains("Exit codes:"));
     assert!(stdout.contains("info"));
@@ -1025,6 +1966,24 @@ fn add_accepts_equals_flags_and_double_dash_input() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn add_progress_renders_on_real_terminals() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/test_cli_tty.py");
+    let output = Command::new("python3")
+        .arg(script)
+        .arg(env!("CARGO_BIN_EXE_rars"))
+        .arg("progress")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+}
+
 #[test]
 fn add_progress_modes_are_plain_when_stderr_is_captured() {
     let dir = scratch("add-progress-modes");
@@ -1090,7 +2049,7 @@ fn rar50_add_uses_rar5_host_os_values() {
 
     let parsed = rars::rar50::Archive::parse_path(&archive).unwrap();
     let file = parsed.files().next().unwrap();
-    assert_eq!(file.host_os, 1);
+    assert_eq!(file.host_os, u64::from(cfg!(unix)));
 
     assert_archive_tests_and_extracts_file(
         &archive,
@@ -1234,14 +2193,31 @@ fn extraction_refuses_overwrite_unless_explicitly_allowed() {
         .unwrap();
     assert!(first.status.success(), "stderr: {}", stderr(&first));
 
+    let destination = out_dir.join("hello.txt");
+    let existing = b"existing output must survive\n";
+    fs::write(&destination, existing).unwrap();
+    let native_error = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+        .unwrap_err();
+    assert_eq!(native_error.kind(), io::ErrorKind::AlreadyExists);
+
     let second = rars()
         .arg("x")
         .arg(&archive)
         .arg(&out_dir)
         .output()
         .unwrap();
-    assert!(!second.status.success());
-    assert!(stderr(&second).contains("File exists"));
+    assert_eq!(second.status.code(), Some(1));
+    let diagnostic = stderr(&second);
+    assert!(
+        diagnostic.contains("failed to write extracted entry")
+            && diagnostic.contains("I/O error:")
+            && diagnostic.contains(&out_dir.display().to_string()),
+        "stderr: {diagnostic}"
+    );
+    assert_eq!(fs::read(&destination).unwrap(), existing);
 
     let overwrite = rars()
         .args(["x", "--overwrite=always"])
@@ -1251,7 +2227,7 @@ fn extraction_refuses_overwrite_unless_explicitly_allowed() {
         .unwrap();
     assert!(overwrite.status.success(), "stderr: {}", stderr(&overwrite));
     assert_eq!(
-        fs::read(out_dir.join("hello.txt")).unwrap(),
+        fs::read(&destination).unwrap(),
         b"overwrite policy payload\n"
     );
 }
@@ -1360,6 +2336,157 @@ fn add_recurses_directory_inputs_and_preserves_relative_paths() {
 }
 
 #[test]
+fn add_preserves_empty_directories_across_archive_generations() {
+    let dir = scratch("add-empty-directories");
+    for with_file in [false, true] {
+        let tree = dir.join(if with_file { "mixed" } else { "empty" });
+        fs::create_dir_all(tree.join("nested/empty-child")).unwrap();
+        fs::create_dir(tree.join("sibling")).unwrap();
+        if with_file {
+            fs::write(tree.join("nested/leaf.txt"), b"leaf").unwrap();
+        }
+        for format in [
+            "rar14", "rar15", "rar20", "rar29", "rar30", "rar40", "rar50", "rar70",
+        ] {
+            for stored in [false, true] {
+                let name = format!("{format}-{with_file}-{stored}");
+                let archive = dir.join(format!("{name}.rar"));
+                let out = dir.join(format!("{name}-out"));
+                let mut add = rars();
+                add.args(["a", "--format", format]);
+                if stored {
+                    add.arg("--store");
+                }
+                let result = add.arg(&archive).arg(&tree).output().unwrap();
+                assert!(result.status.success(), "{name}: {}", stderr(&result));
+                let test = rars().arg("test").arg(&archive).output().unwrap();
+                assert!(test.status.success(), "{name}: {}", stderr(&test));
+                let extract = rars().arg("x").arg(&archive).arg(&out).output().unwrap();
+                assert!(extract.status.success(), "{name}: {}", stderr(&extract));
+                let extracted = out.join(tree.file_name().unwrap());
+                for path in ["", "nested", "nested/empty-child", "sibling"] {
+                    assert!(
+                        extracted.join(path).is_dir(),
+                        "{name}: missing directory {path}"
+                    );
+                }
+                assert_eq!(
+                    fs::read_dir(extracted.join("nested/empty-child"))
+                        .unwrap()
+                        .count(),
+                    0
+                );
+                if with_file {
+                    assert_eq!(
+                        fs::read(extracted.join("nested/leaf.txt")).unwrap(),
+                        b"leaf"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn add_preserves_directory_metadata_across_archive_generations() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("add-directory-metadata");
+    let input = dir.join("tree");
+    fs::create_dir_all(input.join("empty")).unwrap();
+    fs::write(input.join("child"), b"payload").unwrap();
+    let timestamp = UNIX_EPOCH + Duration::from_secs(1_700_000_002);
+    for path in [&input, &input.join("empty")] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o750)).unwrap();
+        fs::File::open(path)
+            .unwrap()
+            .set_modified(timestamp)
+            .unwrap();
+    }
+    for format in [
+        "rar14", "rar15", "rar20", "rar29", "rar30", "rar40", "rar50", "rar70",
+    ] {
+        let archive = dir.join(format!("{format}.rar"));
+        let out = dir.join(format!("{format}-out"));
+        let add = rars()
+            .args(["a", "--store", "--format", format])
+            .arg(&archive)
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(add.status.success(), "{format}: {}", stderr(&add));
+        let extract = rars().arg("x").arg(&archive).arg(&out).output().unwrap();
+        assert!(extract.status.success(), "{format}: {}", stderr(&extract));
+        for path in ["tree", "tree/empty"] {
+            let metadata = fs::metadata(out.join(path)).unwrap();
+            assert_eq!(metadata.modified().unwrap(), timestamp, "{format} {path}");
+            // RAR1.x directory headers carry DOS attributes, which have no Unix mode.
+            if !["rar14", "rar15"].contains(&format) {
+                assert_eq!(
+                    metadata.permissions().mode() & 0o777,
+                    0o750,
+                    "{format} {path}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn modern_volumes_preserve_empty_directories_alongside_split_files() {
+    let dir = scratch("modern-volume-directories");
+    let tree = dir.join("tree");
+    fs::create_dir_all(tree.join("empty/nested")).unwrap();
+    let payload = deterministic_noise(4096);
+    fs::write(tree.join("payload"), &payload).unwrap();
+    for format in ["rar50", "rar70"] {
+        let archive = dir.join(format!("tree-{format}.rar"));
+        let add = rars()
+            .args(["a", "--store", "--volume-size", "1k", "--format", format])
+            .arg(&archive)
+            .arg(&tree)
+            .output()
+            .unwrap();
+        assert!(add.status.success(), "{format}: {}", stderr(&add));
+        let first = dir.join(format!("tree-{format}.part01.rar"));
+        assert!(dir.join(format!("tree-{format}.part02.rar")).is_file());
+        let out = dir.join(format!("{format}-out"));
+        let extract = rars().arg("x").arg(&first).arg(&out).output().unwrap();
+        assert!(extract.status.success(), "{format}: {}", stderr(&extract));
+        assert!(out.join("tree/empty/nested").is_dir());
+        assert_eq!(fs::read(out.join("tree/payload")).unwrap(), payload);
+    }
+}
+
+#[test]
+fn legacy_volumes_reject_directory_inputs_before_writing_any_members() {
+    let dir = scratch("legacy-volume-directory");
+    let input = dir.join("tree");
+    fs::create_dir(&input).unwrap();
+    fs::write(input.join("one"), b"first").unwrap();
+    fs::write(input.join("two"), b"second").unwrap();
+    for format in ["rar14", "rar15", "rar20", "rar29", "rar30", "rar40"] {
+        let archive = dir.join(format!("{format}.rar"));
+        let add = rars()
+            .args(["a", "--store", "--volume-size", "1k", "--format", format])
+            .arg(&archive)
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(
+            !add.status.success(),
+            "{format} must reject a tree rather than discard its members"
+        );
+        assert!(
+            stderr(&add).contains("one regular input file"),
+            "{format}: {}",
+            stderr(&add)
+        );
+        assert!(!archive.exists());
+    }
+}
+
+#[test]
 fn add_rejects_duplicate_archive_names() {
     let dir = scratch("add-duplicate-names");
     let source = dir.join("same.txt");
@@ -1380,17 +2507,17 @@ fn add_rejects_duplicate_archive_names() {
 #[test]
 fn info_and_test_escape_control_characters_in_archive_names() {
     let dir = scratch("escaped-display-names");
-    let source = dir.join("line\nname.txt");
     let archive = dir.join("created.rar");
-    fs::write(&source, b"escaped display payload\n").unwrap();
-
-    let create = rars()
-        .args(["a", "--format", "rar50", "--store"])
-        .arg(&archive)
-        .arg(&source)
-        .output()
+    let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(
+            b"line\nname.txt".to_vec(),
+            b"escaped display payload\n".to_vec(),
+            None,
+            None,
+        )
         .unwrap();
-    assert!(create.status.success(), "stderr: {}", stderr(&create));
+    builder.write_to_path(&archive, None).unwrap();
 
     let info = rars().args(["info", "-v"]).arg(&archive).output().unwrap();
     assert!(info.status.success(), "stderr: {}", stderr(&info));
@@ -4211,6 +5338,51 @@ fn repair_rejects_non_rar_input_without_raw_inline_scan() {
 }
 
 #[test]
+fn repair_reports_rebuilt_recovery_and_end_records() {
+    let dir = scratch("repair-rebuilt-record-reports");
+    let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50)
+        .store(true)
+        .recovery_percent(Some(20));
+    builder
+        .add_bytes(b"file".to_vec(), vec![b'p'; 32 * 1024], None, None)
+        .unwrap();
+    let original = builder.to_bytes().unwrap();
+    let archive = rars::rar50::Archive::parse(&original).unwrap();
+    let recovery = archive
+        .services()
+        .find(|service| service.name == b"RR")
+        .unwrap()
+        .block
+        .data_range
+        .start;
+    for (end_damaged, message) in [
+        (false, "rebuilt recovery record"),
+        (true, "rebuilt archive end"),
+    ] {
+        let mut damaged = original.clone();
+        if end_damaged {
+            // Truncate the recovery tail, leaving enough redundancy to rebuild
+            // both the recovery record and the archive end.
+            damaged.truncate(damaged.len() - 4096);
+        } else {
+            damaged[recovery + 0x48] ^= 0xff;
+        }
+        let input = dir.join("damaged.rar");
+        let output = dir.join("repaired.rar");
+        fs::write(&input, damaged).unwrap();
+        let command = rars()
+            .arg("repair")
+            .arg(&input)
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(command.status.success(), "{}", stderr(&command));
+        assert!(stdout(&command).contains(message), "{}", stdout(&command));
+        assert_eq!(fs::read(&output).unwrap(), original);
+    }
+}
+
+#[test]
 fn repairs_rar250_protect_head_archive() {
     let dir = scratch("repair-rar250-protect-head");
     let archive = dir.join("damaged.rar");
@@ -5761,29 +6933,56 @@ fn native_filename_round_trip_across_archive_generations() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
     let dir = scratch("native-filenames");
-    let input = dir.join(OsStr::from_bytes(b"tree-\xfe"));
+    let raw_names = scratch::supports_raw_byte_names(&dir);
+    let input = dir.join(OsStr::from_bytes(if raw_names {
+        b"tree-\xfe"
+    } else {
+        "tree-日本語".as_bytes()
+    }));
     fs::create_dir(&input).unwrap();
-    let names: &[&[u8]] = &[
+    let all_names: &[&[u8]] = &[
         b"file-\xff",
         b"file-\xfe",
         "file-\u{fffd}".as_bytes(),
         "private-\u{e0ff}".as_bytes(),
         "marker-\u{fffe}".as_bytes(),
     ];
-    for name in names {
-        fs::write(input.join(OsStr::from_bytes(name)), name).unwrap();
+    let mut names = Vec::new();
+    for &name in all_names {
+        match fs::write(input.join(OsStr::from_bytes(name)), name) {
+            Ok(()) => names.push(name),
+            Err(error)
+                if error.kind() == io::ErrorKind::InvalidInput
+                    || error.raw_os_error() == Some(libc::EILSEQ) =>
+            {
+                // Unrepresentable names are covered by the rejection test below.
+            }
+            Err(error) => panic!("failed to create filename fixture {name:?}: {error}"),
+        }
     }
-    let direct = dir.join(OsStr::from_bytes(b"direct-\xfd"));
+    let direct = dir.join(OsStr::from_bytes(if raw_names {
+        b"direct-\xfd"
+    } else {
+        "direct-кириллица".as_bytes()
+    }));
     fs::write(&direct, b"direct").unwrap();
     for format in [
         "rar14", "rar15", "rar20", "rar29", "rar30", "rar40", "rar50", "rar70",
     ] {
         let archive = dir
             .join(OsStr::from_bytes(format!("{format}-").as_bytes()))
-            .with_extension(OsStr::from_bytes(b"\xff.rar"));
+            .with_extension(OsStr::from_bytes(if raw_names {
+                b"\xff.rar"
+            } else {
+                b"rar"
+            }));
         let out = dir
             .join(OsStr::from_bytes(format!("out-{format}-").as_bytes()))
-            .with_extension(OsStr::from_bytes(b"\xfe"));
+            .with_extension(OsStr::from_bytes(if raw_names {
+                b"\xfe"
+            } else {
+                b"unicode"
+            }));
         let add = rars()
             .args(["a", "--store", "--format", format])
             .arg(&archive)
@@ -5802,14 +7001,14 @@ fn native_filename_round_trip_across_archive_generations() {
         }
         let extract = rars().arg("x").arg(&archive).arg(&out).output().unwrap();
         assert!(extract.status.success(), "{format}: {}", stderr(&extract));
-        for name in names {
+        for name in &names {
             assert_eq!(
                 fs::read(
                     out.join(input.file_name().unwrap())
                         .join(OsStr::from_bytes(name))
                 )
                 .unwrap(),
-                *name,
+                **name,
                 "{format}"
             );
         }
@@ -5829,7 +7028,7 @@ fn native_filename_round_trip_across_archive_generations() {
             {
                 Ok(result) => {
                     assert!(result.status.success(), "{}", stderr(&result));
-                    for name in names {
+                    for name in &names {
                         assert_eq!(
                             fs::read(
                                 reference_out
@@ -5837,7 +7036,7 @@ fn native_filename_round_trip_across_archive_generations() {
                                     .join(OsStr::from_bytes(name))
                             )
                             .unwrap(),
-                            *name
+                            **name
                         );
                     }
                 }
@@ -5852,19 +7051,103 @@ fn native_filename_round_trip_across_archive_generations() {
 
 #[cfg(unix)]
 #[test]
+fn native_archive_names_unsupported_by_the_filesystem_are_rejected() {
+    use rars::ArchiveVersion;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let dir = scratch("unrepresentable-native-names");
+    for (index, name) in [b"file-\xff".as_slice(), "marker-\u{fffe}".as_bytes()]
+        .into_iter()
+        .enumerate()
+    {
+        let probe = dir.join(OsStr::from_bytes(name));
+        match fs::write(&probe, b"probe") {
+            Ok(()) => {
+                fs::remove_file(probe).unwrap();
+                continue;
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::InvalidInput
+                    || error.raw_os_error() == Some(libc::EILSEQ) => {}
+            Err(error) => panic!("filename probe failed unexpectedly: {error}"),
+        }
+        for version in [
+            ArchiveVersion::Rar14,
+            ArchiveVersion::Rar15,
+            ArchiveVersion::Rar20,
+            ArchiveVersion::Rar29,
+            ArchiveVersion::Rar30,
+            ArchiveVersion::Rar40,
+            ArchiveVersion::Rar50,
+            ArchiveVersion::Rar70,
+        ] {
+            let modern = matches!(version, ArchiveVersion::Rar50 | ArchiveVersion::Rar70);
+            let archive_name = if modern {
+                rars::filename::encode_rar50(name).into_owned()
+            } else {
+                name.to_vec()
+            };
+            let mut builder = rars::Builder::new(version).store(true);
+            builder
+                .add_bytes(
+                    archive_name,
+                    b"payload".to_vec(),
+                    None,
+                    modern.then_some(0o644),
+                )
+                .unwrap();
+            let archive = dir.join(format!("{version}-{index}.rar"));
+            builder.write_to_path(&archive, None).unwrap();
+            let out = dir.join(format!("{version}-{index}-out"));
+            let extract = rars().arg("x").arg(&archive).arg(&out).output().unwrap();
+            assert!(
+                !extract.status.success(),
+                "{version}: unrepresentable name must not be substituted"
+            );
+            assert!(
+                stderr(&extract).contains("failed to write extracted entry"),
+                "{version}: {}",
+                stderr(&extract)
+            );
+            if out.exists() {
+                assert_eq!(
+                    fs::read_dir(&out).unwrap().count(),
+                    0,
+                    "{version}: no replacement filenames"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn native_filename_encrypted_volume_round_trip() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
     let dir = scratch("native-encrypted-volumes");
-    let source = dir.join(OsStr::from_bytes(b"member-\xff"));
-    let password = dir.join(OsStr::from_bytes(b"password-\xfe"));
+    let raw_names = scratch::supports_raw_byte_names(&dir);
+    let source = dir.join(OsStr::from_bytes(if raw_names {
+        b"member-\xff"
+    } else {
+        "member-日本語".as_bytes()
+    }));
+    let password = dir.join(OsStr::from_bytes(if raw_names {
+        b"password-\xfe"
+    } else {
+        "password-кириллица".as_bytes()
+    }));
     let payload = deterministic_noise(4096);
     fs::write(&source, &payload).unwrap();
     fs::write(&password, b"password").unwrap();
     for format in ["rar30", "rar50"] {
         let root = dir.join(format);
         fs::create_dir(&root).unwrap();
-        let archive = root.join(OsStr::from_bytes(b"archive-\xff.rar"));
+        let archive = root.join(OsStr::from_bytes(if raw_names {
+            b"archive-\xff.rar"
+        } else {
+            "archive-日本語.rar".as_bytes()
+        }));
         let add = rars()
             .args([
                 "a",
@@ -5882,11 +7165,19 @@ fn native_filename_encrypted_volume_round_trip() {
             .unwrap();
         assert!(add.status.success(), "{format}: {}", stderr(&add));
         let first = if format == "rar50" {
-            root.join(OsStr::from_bytes(b"archive-\xff.part01.rar"))
+            root.join(OsStr::from_bytes(if raw_names {
+                b"archive-\xff.part01.rar"
+            } else {
+                "archive-日本語.part01.rar".as_bytes()
+            }))
         } else {
             archive
         };
-        let out = root.join(OsStr::from_bytes(b"out-\xfe"));
+        let out = root.join(OsStr::from_bytes(if raw_names {
+            b"out-\xfe"
+        } else {
+            "out-日本語".as_bytes()
+        }));
         let extract = rars()
             .args(["x", "--password-file"])
             .arg(&password)

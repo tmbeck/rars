@@ -104,65 +104,7 @@ impl PlanShape {
     }
 }
 
-/// Something a caller can ask a writer for, that a format may not be able to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum WriterOption {
-    Feature(Feature),
-    CompressionLevel,
-    /// An engine other than the format's default, which today means PPMd.
-    CompressionMethod,
-    DictionarySize,
-    Filter,
-    RecoveryRecord,
-    VolumeSize,
-    ArchiveComment,
-    FileComment,
-    ArchiveMetadata,
-    Password,
-    MemoryLimit,
-    TempDir,
-}
-
-impl WriterOption {
-    pub const ALL: [Self; 15] = [
-        Self::Feature(Feature::Solid),
-        Self::Feature(Feature::HeaderEncryption),
-        Self::Feature(Feature::QuickOpen),
-        Self::CompressionLevel,
-        Self::CompressionMethod,
-        Self::DictionarySize,
-        Self::Filter,
-        Self::RecoveryRecord,
-        Self::VolumeSize,
-        Self::ArchiveComment,
-        Self::FileComment,
-        Self::ArchiveMetadata,
-        Self::Password,
-        Self::MemoryLimit,
-        Self::TempDir,
-    ];
-
-    /// How this option is named in a library message. The command line
-    /// substitutes the flag the user actually typed.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Feature(feature) => feature.name(),
-            Self::CompressionLevel => "a compression level",
-            Self::CompressionMethod => "an alternative compression method",
-            Self::DictionarySize => "a dictionary size",
-            Self::Filter => "a data filter",
-            Self::RecoveryRecord => "a recovery record",
-            Self::VolumeSize => "splitting into volumes",
-            Self::ArchiveComment => "an archive comment",
-            Self::FileComment => "a per-file comment",
-            Self::ArchiveMetadata => "archive metadata",
-            Self::Password => "encryption",
-            Self::MemoryLimit => "a memory limit",
-            Self::TempDir => "a temporary directory",
-        }
-    }
-}
+pub use crate::writer_option::WriterOption;
 
 /// The features this format can honour for an archive of this shape.
 ///
@@ -185,6 +127,15 @@ pub fn supported_features(target: ArchiveVersion, shape: PlanShape) -> FeatureSe
 /// Whether this format's writer can honour `option` for an archive of this
 /// shape.
 pub fn supports(target: ArchiveVersion, option: WriterOption, shape: PlanShape) -> bool {
+    if !cfg!(feature = "encryption")
+        && matches!(
+            option,
+            WriterOption::Password | WriterOption::Feature(Feature::HeaderEncryption)
+        )
+    {
+        return false;
+    }
+
     let family = target.family();
     match option {
         // Solid means compressing members against each other, so there has to
@@ -225,7 +176,9 @@ pub fn supports(target: ArchiveVersion, option: WriterOption, shape: PlanShape) 
                     | ArchiveVersion::Rar20
             ) && (family == ArchiveFamily::Rar50Plus || !shape.volumes)
         }
-        WriterOption::RecoveryRecord => family == ArchiveFamily::Rar50Plus,
+        WriterOption::RecoveryRecord => {
+            cfg!(feature = "recovery") && family == ArchiveFamily::Rar50Plus
+        }
         WriterOption::VolumeSize => true,
         // No volume writer carries a comment: the legacy one emits the split
         // member and nothing else, and the RAR 5 one refuses comments outright
@@ -271,6 +224,10 @@ pub fn validate_features(
     asked: FeatureSet,
     shape: PlanShape,
 ) -> Result<()> {
+    if asked.header_encryption {
+        crate::crypto::require_encryption()?;
+    }
+
     match asked.first_unsupported(supported_features(target, shape)) {
         Some(feature) => Err(Error::UnsupportedWriterOption {
             target,
@@ -299,6 +256,21 @@ pub fn validate_option(
     option: WriterOption,
     shape: PlanShape,
 ) -> Result<()> {
+    if !cfg!(feature = "encryption")
+        && matches!(
+            option,
+            WriterOption::Password | WriterOption::Feature(Feature::HeaderEncryption)
+        )
+    {
+        return Err(Error::FeatureDisabled {
+            feature: "encryption",
+        });
+    }
+    if !cfg!(feature = "recovery") && matches!(option, WriterOption::RecoveryRecord) {
+        return Err(Error::FeatureDisabled {
+            feature: "recovery",
+        });
+    }
     if supports(target, option, shape) {
         Ok(())
     } else {
@@ -397,11 +369,19 @@ mod tests {
     fn every_option_is_supported_by_some_format() {
         for option in WriterOption::ALL {
             assert!(!option.name().is_empty());
-            assert!(
+            let disabled = match option {
+                WriterOption::Password | WriterOption::Feature(Feature::HeaderEncryption) => {
+                    !cfg!(feature = "encryption")
+                }
+                WriterOption::RecoveryRecord => !cfg!(feature = "recovery"),
+                _ => false,
+            };
+            assert_eq!(
                 PlanShape::all()
                     .into_iter()
                     .any(|shape| !formats_supporting(option, shape).is_empty()),
-                "{option:?} is supported by nothing, so a refusal could not point anywhere"
+                !disabled,
+                "{option:?} must have a supporting format exactly when its capability is enabled"
             );
         }
     }

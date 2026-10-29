@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 #[path = "support/scratch.rs"]
 mod scratch;
 use rars::{ArchiveReader, ArchiveVersion, Builder, ErrorKind, WriterResources};
@@ -149,7 +151,10 @@ fn managed_builder_handles_encrypted_file_comment_and_releases_its_charge() {
     let output = builder.to_output(&resources, None).unwrap();
     assert!(resources.managed_memory_in_use() >= output.as_bytes().len() as u64);
     let archive = ArchiveReader::read(output.as_bytes()).unwrap();
-    assert_eq!(archive.read_member(b"file", None).unwrap().unwrap(), b"payload");
+    assert_eq!(
+        archive.read_member(b"file", None).unwrap().unwrap(),
+        b"payload"
+    );
     drop(archive);
     drop(output);
     assert_eq!(resources.managed_memory_in_use(), 0);

@@ -1,6 +1,8 @@
 use super::*;
 use crate::crc32::Crc32;
-use crate::crypto::rar50::{Rar50Cipher, Rar50Keys};
+#[cfg(feature = "encryption")]
+use crate::crypto::rar50::Rar50Cipher;
+use crate::crypto::rar50::Rar50Keys;
 pub use crate::filter::{FilterKind, FilterPolicy, FilterSpec};
 use crate::write_plan::{PlanShape, WriterOption};
 use crate::write_progress::ProgressReporter;
@@ -760,38 +762,50 @@ fn encrypt_reader_with_allowance<B: crate::codec::workspace::Budget>(
     progress: Option<ProgressReporter<'_>>,
     allowance: &B,
 ) -> Result<()> {
-    crate::write_progress::check_cancelled(progress)?;
-    if input_size == 0 {
-        return Ok(());
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = (
+            reader, input_size, output, keys, iv, block_size, progress, allowance,
+        );
+        Err(Error::FeatureDisabled {
+            feature: "encryption",
+        })
     }
-    let mut cipher = Rar50Cipher::new(keys.key, iv);
-    let chunk_size = block_size.max(16) & !15;
-    let mut buffer = crate::codec::workspace::Buffer::filled(chunk_size, 0u8, allowance)?;
-    let mut remaining = input_size;
-    while remaining >= chunk_size as u64 {
+    #[cfg(feature = "encryption")]
+    {
         crate::write_progress::check_cancelled(progress)?;
-        reader.read_exact(&mut buffer)?;
-        cipher
-            .encrypt_in_place(&mut buffer)
-            .map_err(super::map_rar50_crypto_error)?;
-        output.write_all(&buffer)?;
-        remaining -= chunk_size as u64;
+        if input_size == 0 {
+            return Ok(());
+        }
+        let mut cipher = Rar50Cipher::new(keys.key, iv);
+        let chunk_size = block_size.max(16) & !15;
+        let mut buffer = crate::codec::workspace::Buffer::filled(chunk_size, 0u8, allowance)?;
+        let mut remaining = input_size;
+        while remaining >= chunk_size as u64 {
+            crate::write_progress::check_cancelled(progress)?;
+            reader.read_exact(&mut buffer)?;
+            cipher
+                .encrypt_in_place(&mut buffer)
+                .map_err(super::map_rar50_crypto_error)?;
+            output.write_all(&buffer)?;
+            remaining -= chunk_size as u64;
+        }
+        let final_plain = usize::try_from(remaining)
+            .map_err(|_| Error::InvalidArgument("RAR 5 encrypted data size overflows"))?;
+        let final_padded = final_plain.checked_add(15).ok_or(Error::InvalidArgument(
+            "RAR 5 encrypted data size overflows",
+        ))? & !15;
+        if final_padded != 0 {
+            crate::write_progress::check_cancelled(progress)?;
+            buffer[..final_padded].fill(0);
+            reader.read_exact(&mut buffer[..final_plain])?;
+            cipher
+                .encrypt_in_place(&mut buffer[..final_padded])
+                .map_err(super::map_rar50_crypto_error)?;
+            output.write_all(&buffer[..final_padded])?;
+        }
+        Ok(())
     }
-    let final_plain = usize::try_from(remaining)
-        .map_err(|_| Error::InvalidArgument("RAR 5 encrypted data size overflows"))?;
-    let final_padded = final_plain.checked_add(15).ok_or(Error::InvalidArgument(
-        "RAR 5 encrypted data size overflows",
-    ))? & !15;
-    if final_padded != 0 {
-        crate::write_progress::check_cancelled(progress)?;
-        buffer[..final_padded].fill(0);
-        reader.read_exact(&mut buffer[..final_plain])?;
-        cipher
-            .encrypt_in_place(&mut buffer[..final_padded])
-            .map_err(super::map_rar50_crypto_error)?;
-        output.write_all(&buffer[..final_padded])?;
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -948,6 +962,11 @@ fn validate_plan(options: WriterOptions, shape: PlanShape) -> Result<()> {
 }
 
 fn validate_recovery_percent(percent: u64) -> Result<()> {
+    if !cfg!(feature = "recovery") {
+        return Err(Error::FeatureDisabled {
+            feature: "recovery",
+        });
+    }
     if !(1..=100).contains(&percent) {
         return Err(Error::InvalidArgument(
             "RAR 5 recovery percent must be in 1..=100",
@@ -957,6 +976,8 @@ fn validate_recovery_percent(percent: u64) -> Result<()> {
 }
 
 fn validate_nonempty_password(password: &[u8]) -> Result<()> {
+    crate::crypto::require_encryption()?;
+
     if password.is_empty() {
         return Err(Error::InvalidArgument(
             "RAR 5 encrypted writer needs a non-empty password",
@@ -1059,9 +1080,8 @@ mod tests {
                 true
             }
         }
-        let unopened = crate::EntrySource::from_opener(1, || {
-            panic!("cancelled scan opened the source")
-        });
+        let unopened =
+            crate::EntrySource::from_opener(1, || panic!("cancelled scan opened the source"));
         let allowance = crate::codec::workspace::Allowance::default();
         assert!(matches!(
             super::source_integrity_with_allowance(&unopened, 1, 16, &Cancelled, &allowance),
@@ -1167,7 +1187,10 @@ mod tests {
     }
 
     fn simple_entry(data: &[u8]) -> super::ArchiveEntry {
-        super::ArchiveEntry::new(b"file".to_vec(), crate::EntrySource::from_bytes(data.to_vec()))
+        super::ArchiveEntry::new(
+            b"file".to_vec(),
+            crate::EntrySource::from_bytes(data.to_vec()),
+        )
     }
 
     #[test]
@@ -1225,9 +1248,8 @@ mod tests {
         timestamped.mtime_nanoseconds = Some(1_000_000_000);
         assert!(super::validate_entry(&timestamped).is_err());
         timestamped.mtime_nanoseconds = None;
-        timestamped.file_times = Some(
-            crate::FileTimes::from_unix_nanoseconds(Some(0), None, None).unwrap(),
-        );
+        timestamped.file_times =
+            Some(crate::FileTimes::from_unix_nanoseconds(Some(0), None, None).unwrap());
         assert_eq!(
             super::validate_entry(&timestamped).unwrap_err(),
             crate::Error::InvalidArgument("conflicting file modification timestamps")
@@ -1249,8 +1271,10 @@ mod tests {
         ] {
             assert!(super::validate_entry(&simple_entry(b"").with_service(service)).is_err());
         }
-        super::validate_entry(&simple_entry(b"").with_service(super::ServiceEntry::new(b"CMT", b"")))
-            .unwrap();
+        super::validate_entry(
+            &simple_entry(b"").with_service(super::ServiceEntry::new(b"CMT", b"")),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1291,7 +1315,11 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            reject(std::slice::from_ref(&plain), super::WriterOptions::default(), locked),
+            reject(
+                std::slice::from_ref(&plain),
+                super::WriterOptions::default(),
+                locked
+            ),
             crate::Error::InvalidArgument("archive lock flag is not supported in volume output")
         );
 
@@ -1300,7 +1328,12 @@ mod tests {
             creation_time: Some(1),
         });
         assert_eq!(
-            reject(std::slice::from_ref(&plain), super::WriterOptions::default(), metadata).kind(),
+            reject(
+                std::slice::from_ref(&plain),
+                super::WriterOptions::default(),
+                metadata
+            )
+            .kind(),
             crate::ErrorKind::UnsupportedFeature
         );
 
@@ -1310,12 +1343,16 @@ mod tests {
             target_name: b"target".to_vec(),
         }));
         assert_eq!(
-            reject(&[link], super::WriterOptions::default(), super::ArchiveExtras::default()),
+            reject(
+                &[link],
+                super::WriterOptions::default(),
+                super::ArchiveExtras::default()
+            ),
             crate::Error::InvalidArgument("symbolic links are not supported in volume output")
         );
 
-        let commented = simple_entry(b"")
-            .with_service(super::ServiceEntry::new(b"CMT", b"file comment"));
+        let commented =
+            simple_entry(b"").with_service(super::ServiceEntry::new(b"CMT", b"file comment"));
         assert_eq!(
             reject(
                 &[commented],
@@ -1334,7 +1371,13 @@ mod tests {
                 super::WriterOptions::new(crate::ArchiveVersion::Rar50, features),
                 super::ArchiveExtras::default(),
             ),
-            crate::Error::NeedPassword
+            if cfg!(feature = "encryption") {
+                crate::Error::NeedPassword
+            } else {
+                crate::Error::FeatureDisabled {
+                    feature: "encryption",
+                }
+            }
         );
     }
 
@@ -1345,10 +1388,11 @@ mod tests {
             name: None,
             creation_time: Some(1),
         };
-        let mut extras = super::ArchiveExtras::default().with_metadata(super::ArchiveMetadataEntry {
-            name: None,
-            creation_time: Some(1),
-        });
+        let mut extras =
+            super::ArchiveExtras::default().with_metadata(super::ArchiveMetadataEntry {
+                name: None,
+                creation_time: Some(1),
+            });
         extras.metadata_record = Some(&record);
         let mut output = Vec::new();
         let error = super::write_streaming_archive_to(
@@ -1402,6 +1446,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn volume_header_password_can_encrypt_headers_without_encrypting_member_data() {
         let mut features = crate::FeatureSet::store_only();
         features.header_encryption = true;
@@ -1426,14 +1471,15 @@ mod tests {
                 super::super::Archive::parse(&part),
                 Err(crate::Error::NeedPassword)
             ));
-            let archive = super::super::Archive::parse_with_password(&part, Some(b"password"))
-                .unwrap();
+            let archive =
+                super::super::Archive::parse_with_password(&part, Some(b"password")).unwrap();
             assert!(archive.main.encrypted_headers);
             assert!(archive.files().all(|file| !file.encrypted));
         }
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn header_encryption_rejects_conflicting_member_password_before_output() {
         let mut features = crate::FeatureSet::store_only();
         features.header_encryption = true;
@@ -1472,6 +1518,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn quick_open_with_encrypted_headers_is_rejected_by_plan_validation() {
         let mut features = crate::FeatureSet::store_only();
         features.quick_open = true;
@@ -1511,7 +1558,9 @@ mod tests {
     fn invalid_writer_inputs_and_internal_failures_have_distinct_categories() {
         for error in [
             super::validate_file_entry(b"").unwrap_err(),
+            #[cfg(feature = "encryption")]
             super::validate_nonempty_password(b"").unwrap_err(),
+            #[cfg(feature = "recovery")]
             super::validate_recovery_percent(101).unwrap_err(),
             super::filter_policy::dictionary_size_fields(0, 0).unwrap_err(),
             super::filter_policy::dictionary_size_fields(1, 131073).unwrap_err(),
@@ -1520,6 +1569,20 @@ mod tests {
         ] {
             assert_eq!(error.kind(), crate::ErrorKind::InvalidArgument, "{error}");
         }
+        #[cfg(not(feature = "encryption"))]
+        assert_eq!(
+            super::validate_nonempty_password(b"").unwrap_err(),
+            Error::FeatureDisabled {
+                feature: "encryption"
+            }
+        );
+        #[cfg(not(feature = "recovery"))]
+        assert_eq!(
+            super::validate_recovery_percent(101).unwrap_err(),
+            Error::FeatureDisabled {
+                feature: "recovery"
+            }
+        );
         let mut volumes = super::CollectedVolumes::default();
         let error = super::VolumeSink::start_volume(&mut volumes, 1)
             .err()
@@ -1529,6 +1592,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encryption_allowance_admits_before_reading_and_preserves_cbc_tails() {
         use crate::codec::workspace::Allowance;
         let keys = Rar50Keys::derive(b"test password", [7; 16], 0).unwrap();
@@ -1568,6 +1632,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encryption_allowance_releases_buffers_on_io_failure_and_cancellation() {
         use crate::codec::workspace::Allowance;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1910,7 +1975,7 @@ mod tests {
         let entry = entry(b"payload.bin", &data)
             .with_attributes(0x20)
             .with_host_os(1);
-        let last = std::sync::atomic::AtomicU64::new(0);
+        let last = crate::atomic64::AtomicU64::new(0);
         let advances = AtomicUsize::new(0);
         let intermediate = std::sync::atomic::AtomicBool::new(false);
         let reporter = |event: WriteProgressEvent<'_>| {
@@ -1948,6 +2013,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn recovery_writer_reports_determinate_pass_progress() {
         let entry = entry(b"payload.bin", b"recovery progress payload")
             .with_attributes(0x20)
@@ -2260,6 +2326,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encrypted_streaming_writer_round_trips_across_input_blocks() {
         let data = b"encrypted bounded streaming member data\n".repeat(40_000);
         let entry = ArchiveEntry::new(

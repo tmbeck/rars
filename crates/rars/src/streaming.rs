@@ -3,11 +3,13 @@ use crate::{Error, Result};
 mod memory_spool;
 pub(crate) mod output;
 pub(crate) mod preparation;
+#[cfg(test)]
+use crate::atomic64::AtomicU64;
 use std::fmt;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// Default aggregate compression workspace budget (256 MiB).
@@ -18,6 +20,10 @@ pub trait EntryReader: Read + Seek + Send {}
 impl<T: Read + Seek + Send> EntryReader for T {}
 
 pub(crate) trait SourceFactory: Send + Sync {
+    /// Bound simultaneous preparation when a scoped producer retains plaintext.
+    fn max_preparation_window(&self) -> usize {
+        usize::MAX
+    }
     fn release(&self) {}
     fn len(&self) -> Result<u64>;
     fn open(&self) -> Result<Box<dyn EntryReader>>;
@@ -43,6 +49,10 @@ impl fmt::Debug for EntrySource {
 impl EntrySource {
     pub(crate) fn from_factory(factory: impl SourceFactory + 'static) -> Self {
         Self(Arc::new(factory))
+    }
+
+    pub(crate) fn max_preparation_window(&self) -> usize {
+        self.0.max_preparation_window()
     }
 
     /// Release a session-owned payload once this write will never reopen it.
@@ -734,8 +744,6 @@ pub(crate) struct MemoryPermit {
     bytes: u64,
 }
 
-static SPOOL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 /// Where a spool keeps its bytes.
 ///
 /// A file on every real platform, which is the point: the RAR 5 writer spools
@@ -765,72 +773,39 @@ pub(crate) struct Spool {
 impl Spool {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) fn create(resources: &WriterResources) -> Result<Self> {
-        Self::create_with_sequence(resources, || SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed))
+        Self::create_with_sequence(resources, crate::temp_file::next_sequence)
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     fn create_with_sequence(
         resources: &WriterResources,
-        mut next_sequence: impl FnMut() -> u64,
+        next_sequence: impl FnMut() -> u64,
     ) -> Result<Self> {
         let directory = resources.temp_dir().unwrap_or_else(|| Path::new("."));
-        for _ in 0..128 {
-            let sequence = next_sequence();
-            let mut name = [0u8; 64];
-            let mut name_writer = std::io::Cursor::new(&mut name[..]);
-            write!(
-                name_writer,
-                ".rars-spool-{}-{sequence:016x}",
-                std::process::id()
-            )?;
-            let name_len = name_writer.position() as usize;
-            let name = std::str::from_utf8(&name[..name_len]).expect("ASCII spool name");
-            let capacity = directory
-                .as_os_str()
-                .len()
-                .checked_add(1 + name_len)
-                .ok_or(Error::InvalidArgument("spool path capacity overflows"))?;
-            let mut path_charge = CapacityCharge::new(resources, &None);
-            if let Some(charge) = &mut path_charge {
-                charge.grow_to(capacity as u64)?;
-            }
-            let mut path = PathBuf::with_capacity(capacity);
-            path.push(directory);
-            path.push(name);
-            let mut options = File::options();
-            options.read(true).write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                // Encryption happens after compression; the temporary payload
-                // must not inherit the usual world-readable creation mode.
-                options.mode(0o600);
-            }
-            match options.open(&path) {
-                Ok(file) => {
-                    return Ok(Self {
-                        path,
-                        _path_charge: path_charge,
-                        file: Some(file),
-                        len: 0,
-                        pos: 0,
-                        charge: StorageCharge::new(resources),
-                    })
+        let (path, file, path_charge) = crate::temp_file::create_with_sequence(
+            directory,
+            |capacity| {
+                let mut charge = CapacityCharge::new(resources, &None);
+                if let Some(charge) = &mut charge {
+                    charge.grow_to(capacity as u64)?;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "could not allocate a unique rars spool file",
-        )
-        .into())
+                Ok(charge)
+            },
+            next_sequence,
+        )?;
+        Ok(Self {
+            path,
+            _path_charge: path_charge,
+            file: Some(file),
+            len: 0,
+            pos: 0,
+            charge: StorageCharge::new(resources),
+        })
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     pub(crate) fn create(resources: &WriterResources) -> Result<Self> {
-        SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        crate::temp_file::next_sequence();
         Ok(Self {
             file: Some(memory_spool::MemorySpool::new(resources)),
             len: 0,
@@ -1049,15 +1024,16 @@ mod tests {
         let nonempty = EntrySource::from_bytes(Arc::<[u8]>::from(&b"x"[..]));
         assert!(!nonempty.is_empty().unwrap());
 
-        let missing = EntrySource::from_path(crate::scratch::case("missing-source").join("missing"));
+        let missing =
+            EntrySource::from_path(crate::scratch::case("missing-source").join("missing"));
         assert!(missing.is_empty().is_err());
         assert!(format!("{missing:?}").contains("len: None"));
     }
 
     #[test]
     fn preparation_refusal_is_one_shot_and_releases_the_charge() {
-        use super::*;
         use super::preparation::Bytes;
+        use super::*;
         use std::sync::atomic::Ordering;
 
         let (resources, attempts) = WriterResources::default().refuse_preparation_growth_at(0);
@@ -1066,9 +1042,27 @@ mod tests {
             Error::WriterFailure("injected preparation admission failure")
         );
         assert_eq!(attempts.load(Ordering::Relaxed), 1);
-        assert_eq!(*resources.preparation_budget.as_ref().unwrap().used.lock().unwrap(), 0);
+        assert_eq!(
+            *resources
+                .preparation_budget
+                .as_ref()
+                .unwrap()
+                .used
+                .lock()
+                .unwrap(),
+            0
+        );
         drop(Bytes::zeroed(1, &resources).unwrap());
-        assert_eq!(*resources.preparation_budget.as_ref().unwrap().used.lock().unwrap(), 0);
+        assert_eq!(
+            *resources
+                .preparation_budget
+                .as_ref()
+                .unwrap()
+                .used
+                .lock()
+                .unwrap(),
+            0
+        );
     }
     #[test]
     fn workspace_admission_reports_preexisting_cancellation_before_budget_checks() {
@@ -1395,6 +1389,22 @@ mod tests {
         drop(spool);
         assert!(original.is_dir());
         assert_eq!(std::fs::read(root.join("orphan")).unwrap(), b"abc");
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn spool_creation_accepts_the_maximum_sequence() {
+        let root = crate::scratch::case("spool-max-sequence");
+        let resources = WriterResources::default().with_temp_dir(&*root);
+        let spool = Spool::create_with_sequence(&resources, || u64::MAX).unwrap();
+        let path = root.join(format!(
+            ".rars-spool-{}-ffffffffffffffff",
+            std::process::id()
+        ));
+        assert_eq!(spool.path, path);
+        assert!(path.is_file());
+        drop(spool);
+        assert!(!path.exists());
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]

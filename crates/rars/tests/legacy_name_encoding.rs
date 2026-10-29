@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::{
     filename::{decoded_name, LegacyNameEncoding},
     ArchiveReader, ArchiveVersion, Builder,
@@ -120,7 +122,9 @@ fn rar3_direct_utf8_unicode_name_round_trips_without_a_separator() {
     builder
         .add_bytes(name.to_vec(), b"data".to_vec(), None, None)
         .unwrap();
-    builder.set_legacy_unicode_name(name, name.to_vec()).unwrap();
+    builder
+        .set_legacy_unicode_name(name, name.to_vec())
+        .unwrap();
 
     let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
     let member = archive.members().next().unwrap();

@@ -65,6 +65,7 @@ struct Observation {
 }
 
 impl ReadControl {
+    #[cfg(feature = "recovery")]
     pub(crate) fn cancellation(&self) -> Option<&ReadCancellation> {
         self.0.as_ref().map(|state| &state.token)
     }
@@ -84,14 +85,23 @@ impl ReadControl {
     pub(crate) fn check(&self) -> Result<()> {
         if let Some(state) = &self.0 {
             #[cfg(test)]
-            if state
-                .checks_remaining
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                    (n != usize::MAX).then(|| n.saturating_sub(1))
-                })
-                == Ok(0)
             {
-                state.token.cancel();
+                let mut remaining = state.checks_remaining.load(Ordering::Relaxed);
+                while remaining != usize::MAX {
+                    match state.checks_remaining.compare_exchange_weak(
+                        remaining,
+                        remaining.saturating_sub(1),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(0) => {
+                            state.token.cancel();
+                            break;
+                        }
+                        Ok(_) => break,
+                        Err(actual) => remaining = actual,
+                    }
+                }
             }
             if state.token.is_cancelled() {
                 state.observed.store(true, Ordering::Relaxed);
@@ -191,6 +201,9 @@ pub(crate) struct Poller {
 }
 impl Poller {
     // Bound both no-output symbol work and runs that expand large matches.
+    // Inlined: decoders call this once per symbol, and without a control it
+    // is a single test that should cost no call.
+    #[inline]
     pub(crate) fn check(&mut self, position: usize) -> Result<()> {
         if self.control.0.is_none() {
             return Ok(());
@@ -203,6 +216,7 @@ impl Poller {
         self.steps -= 1;
         Ok(())
     }
+    #[inline]
     pub(crate) fn check_codec(&mut self, position: usize) -> crate::codec::Result<()> {
         self.check(position)
             .map_err(|_| crate::codec::Error::Cancelled)
@@ -314,12 +328,7 @@ mod tests {
         let token = ReadCancellation::new();
         let control = ReadControl::new(Some(&token));
         let mut writer = ScriptedWriter {
-            replies: [
-                Err(io::ErrorKind::Interrupted.into()),
-                Ok(1),
-                Ok(2),
-            ]
-            .into(),
+            replies: [Err(io::ErrorKind::Interrupted.into()), Ok(1), Ok(2)].into(),
             written: Vec::new(),
         };
         control.write_all(&mut writer, b"abc").unwrap();
@@ -328,13 +337,19 @@ mod tests {
 
         for (reply, kind) in [
             (Ok(0), io::ErrorKind::WriteZero),
-            (Err(io::ErrorKind::BrokenPipe.into()), io::ErrorKind::BrokenPipe),
+            (
+                Err(io::ErrorKind::BrokenPipe.into()),
+                io::ErrorKind::BrokenPipe,
+            ),
         ] {
             let mut writer = ScriptedWriter {
                 replies: [reply].into(),
                 written: Vec::new(),
             };
-            assert_eq!(control.write_all(&mut writer, b"x").unwrap_err().kind(), kind);
+            assert_eq!(
+                control.write_all(&mut writer, b"x").unwrap_err().kind(),
+                kind
+            );
             assert!(writer.written.is_empty());
         }
 

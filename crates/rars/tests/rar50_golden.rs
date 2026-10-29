@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 //! Byte-for-byte golden fixtures for structural RAR 5/7 writer output.
 //!
 //! These cover *stored* archives only. Their bytes exercise header layout,
@@ -10,6 +12,9 @@
 //!
 //! Regenerate after an intentional format change with:
 //! `RARS_BLESS_GOLDEN=1 cargo test -p rars --test rar50_golden`
+//! Producer records include the library version, so a version bump also requires
+//! regenerating these fixtures (including their recovery parity). The release
+//! hook does this automatically for rars version bumps.
 
 use rars::rar50::{ArchiveEntry, ArchiveMetadataEntry, Rar50Writer, WriterOptions};
 use rars::{ArchiveVersion, EntrySource, Error, FeatureSet, WriterResources};

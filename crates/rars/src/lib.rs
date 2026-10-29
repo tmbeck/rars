@@ -6,6 +6,16 @@
 //! caller-provided writers without requiring callers to buffer whole archives
 //! in memory. New Rust users should depend on this crate rather than the
 //! lower-level `rars-*` implementation crates, which ended at 0.3.x.
+//!
+//! All capabilities are enabled by default. Set `default-features = false` for
+//! sequential parsing and decoding without encoders, recovery algorithms, crypto
+//! dependencies or Rayon. Select `write`, `recovery`, `encryption` and `parallel`
+//! independently as needed. Encrypted writing needs `write` and `encryption`;
+//! writing recovery records needs `write` and `recovery`. Recovery repair does
+//! not require `write`. Unavailable encrypted or recovery operations report
+//! [`Error::FeatureDisabled`], while metadata remains readable where the format
+//! permits it. Buffered extraction falls back to sequential execution without
+//! `parallel`, and on bare WebAssembly.
 
 /// Where the unit tests write their files. Shared with the integration tests
 /// by path rather than by API.
@@ -14,9 +24,16 @@
 mod scratch;
 
 #[cfg(test)]
+mod test_features;
+
+#[cfg(all(test, feature = "write", feature = "encryption"))]
 #[path = "../tests/support/read_errors.rs"]
 mod read_errors;
 
+// Shared with the CLI and bindings; not part of the supported archive API.
+#[doc(hidden)]
+pub mod atomic64;
+#[cfg(feature = "write")]
 pub mod builder;
 #[doc(hidden)]
 pub mod codec;
@@ -24,21 +41,34 @@ pub mod crc32;
 #[doc(hidden)]
 pub mod crypto;
 pub mod detect;
+#[cfg(any(feature = "write", all(feature = "recovery", feature = "encryption")))]
+mod entropy;
 pub mod error;
-mod fast;
 pub mod features;
 pub mod filename;
 pub mod filter;
+#[cfg(feature = "write")]
 mod filter_search;
 mod io_util;
+mod member;
+pub use member::{ArchiveIndex, ArchiveMemberRef, ArchiveMemberRefs};
+mod member_read;
+pub use member_read::{read_volume_members_at, read_volume_members_at_with_options};
 mod output_limit;
 mod parallel;
 mod parse_budget;
+#[cfg(any(feature = "write", feature = "recovery"))]
+mod pending_archive;
+#[cfg(feature = "write")]
+mod producer;
+#[cfg(any(feature = "write", feature = "recovery"))]
+mod progress;
 mod read_control;
 pub use read_control::ReadCancellation;
 mod read_at;
 pub use read_at::{ReadAt, SeekReader};
 mod extraction_control;
+mod extraction_links;
 mod file_times;
 pub mod rar13;
 pub mod rar15_40;
@@ -46,42 +76,58 @@ pub mod rar50;
 mod reader_scratch;
 #[doc(hidden)]
 pub mod recovery;
+#[cfg(feature = "write")]
 mod rewrite;
+#[cfg(feature = "write")]
 mod rewrite_staging;
+#[cfg(feature = "write")]
 pub use rewrite_staging::RewriteStaging;
 mod source;
+#[cfg(feature = "write")]
 mod streaming;
+mod temp_file;
 pub mod timestamp;
 pub use file_times::{FileTimes, FileTimestamp};
 mod tzif;
 pub mod version;
 mod volume_extract;
+#[cfg(feature = "write")]
 pub mod write_plan;
+#[cfg(feature = "write")]
 mod write_progress;
+mod writer_option;
+pub use writer_option::WriterOption;
+#[cfg(feature = "write")]
 mod write_stream;
+#[cfg(feature = "write")]
 mod x86_filter_scan;
 
-pub use builder::{entry_relative_path, validate_entry_name, Builder};
+#[cfg(feature = "write")]
+pub use builder::Builder;
 pub use detect::{detect_archive_family, find_archive_start, ArchiveSignature, SFX_SCAN_LIMIT};
 pub use error::{Error, ErrorKind, Result};
 pub use extraction_control::{ExtractionDecision, ExtractionErrorAction, ExtractionOutcome};
+pub use extraction_links::{extract_volumes_with_links, ExtractedLink};
 pub use features::{Feature, FeatureSet};
+pub use filename::{entry_relative_path, validate_entry_name};
 pub use filter::{
     formats_supporting_filter, FilterKind, FilterPolicy, FilterSpec, UnsupportedFilterKind,
 };
+#[cfg(any(feature = "write", feature = "recovery"))]
+pub use progress::{WriteOperation, WriteProgress, WriteProgressEvent};
 pub use reader_scratch::Rar50Scratch;
 use std::io::{Read, Write};
 use std::path::Path;
+#[cfg(feature = "write")]
 pub use streaming::output::{WriterOutput, WriterVolumes};
+#[cfg(feature = "write")]
 pub use streaming::{
     EntryReader, EntrySource, WriteCancellation, WriterResources, DEFAULT_WRITER_MEMORY_LIMIT,
 };
 pub use timestamp::StoredTimestamp;
 pub use version::{ArchiveFamily, ArchiveVersion};
-pub use write_plan::{
-    formats_supporting, supported_features, supports, MemberCoding, PlanShape, WriterOption,
-};
-pub use write_progress::{WriteOperation, WriteProgress, WriteProgressEvent};
+#[cfg(feature = "write")]
+pub use write_plan::{formats_supporting, supported_features, supports, MemberCoding, PlanShape};
 
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
@@ -120,10 +166,13 @@ pub struct ArchiveReadOptions<'a> {
     /// Optional RAR 5 whole-member buffered decode limit, including logical
     /// members split across volumes. This does not bound decoder dictionaries.
     ///
-    /// Compressed members above this limit use the streaming path. Without
-    /// `rar50_scratch`, filtered streams return a typed buffered-decode-limit
-    /// error. With scratch enabled, member bytes and filter records live on disk
-    /// and each filter uses the scratch policy's separate workspace limit.
+    /// Compressed members above this limit use the streaming path, which holds
+    /// each filtered block in the reader workspace until it is complete and then
+    /// applies the filter. Without `rar50_scratch`, a filter the stream cannot
+    /// hold (a block over 4 MiB, one starting before the previous one ends, or
+    /// more than 8192 pending) returns a typed buffered-decode-limit error. With
+    /// scratch enabled, member bytes and filter records live on disk and each
+    /// filter uses the scratch policy's separate workspace limit.
     pub rar50_buffered_decode_limit: Option<u64>,
     /// Optional disk-backed decoding above the whole-member buffering threshold.
     /// Uses separate scratch-disk and filter-workspace quotas; it does not bound
@@ -284,7 +333,7 @@ pub enum Archive {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-/// Metadata supplied to streaming extraction callbacks.
+/// Metadata supplied to extraction and verification callbacks.
 pub struct ExtractedEntryMeta {
     /// The format supplied Unicode; legacy encoding overrides must not apply.
     pub name_is_unicode: bool,
@@ -361,6 +410,18 @@ pub struct ArchiveMember {
 }
 
 impl ArchiveMember {
+    /// Whether this member declares a dependency on preceding decoded history.
+    /// RAR 1.3 has no member-level solid flag; consult its archive main header.
+    pub fn is_solid(&self) -> bool {
+        match &self.detail {
+            ArchiveMemberDetail::Rar15To40 { solid, .. } => *solid,
+            ArchiveMemberDetail::Rar50Plus {
+                compression_info, ..
+            } => compression_info & 0x40 != 0,
+            ArchiveMemberDetail::Rar13 { .. } => false,
+        }
+    }
+
     /// Name interpretation for display or destination adapters. Stored bytes and
     /// rewrite identity remain unchanged; Unicode metadata takes precedence.
     pub fn decoded_name(
@@ -561,46 +622,18 @@ pub enum ArchiveMemberHash {
 #[non_exhaustive]
 /// Lazy iterator returned by [`Archive::members`].
 pub struct ArchiveMembers<'a> {
-    inner: ArchiveMembersInner<'a>,
-    index: usize,
-}
-
-#[derive(Debug, Clone)]
-enum ArchiveMembersInner<'a> {
-    Rar13(&'a [rar13::Entry]),
-    Rar15To40(&'a [rar15_40::Block]),
-    Rar50Plus(&'a [rar50::Block]),
+    inner: ArchiveMemberRefs<'a>,
 }
 
 impl Iterator for ArchiveMembers<'_> {
     type Item = ArchiveMember;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.inner {
-            ArchiveMembersInner::Rar13(entries) => {
-                let entry = entries.get(self.index)?;
-                self.index += 1;
-                Some(rar13_member(entry))
-            }
-            ArchiveMembersInner::Rar15To40(blocks) => {
-                while let Some(block) = blocks.get(self.index) {
-                    self.index += 1;
-                    if let rar15_40::Block::File(file) = block {
-                        return Some(rar15_40_member(file));
-                    }
-                }
-                None
-            }
-            ArchiveMembersInner::Rar50Plus(blocks) => {
-                while let Some(block) = blocks.get(self.index) {
-                    self.index += 1;
-                    if let rar50::Block::File(file) = block {
-                        return Some(rar50_member(file));
-                    }
-                }
-                None
-            }
-        }
+        self.inner.next().map(|member| member.to_owned())
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth(n).map(|member| member.to_owned())
     }
 }
 
@@ -610,9 +643,10 @@ struct SharedBuffer(std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>);
 
 impl SharedBuffer {
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<Vec<u8>>> {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        // Only private buffer operations run under this lock. A panic while
+        // appending unwinds extraction before its owner can read the result;
+        // no callback runs with the guard held or can resume that extraction.
+        self.0.lock().expect("member buffer mutex is not poisoned")
     }
 }
 
@@ -650,20 +684,31 @@ impl Archive {
 
     /// Iterates over file-like members using a common cross-version metadata view.
     pub fn members(&self) -> ArchiveMembers<'_> {
-        match self {
-            Self::Rar13(archive) => ArchiveMembers {
-                inner: ArchiveMembersInner::Rar13(&archive.entries),
-                index: 0,
-            },
-            Self::Rar15To40(archive) => ArchiveMembers {
-                inner: ArchiveMembersInner::Rar15To40(&archive.blocks),
-                index: 0,
-            },
-            Self::Rar50Plus(archive) => ArchiveMembers {
-                inner: ArchiveMembersInner::Rar50Plus(&archive.blocks),
-                index: 0,
-            },
+        ArchiveMembers {
+            inner: self.member_refs(),
         }
+    }
+
+    /// Traverses member headers without allocating names or copying metadata.
+    /// The borrow prevents mutation of the archive while these views are in use.
+    pub fn member_refs(&self) -> ArchiveMemberRefs<'_> {
+        ArchiveMemberRefs::new(self)
+    }
+
+    /// Builds an optional zero-copy metadata index for repeated lookup.
+    /// The archive cannot be mutated while this index remains in use.
+    ///
+    /// ```compile_fail
+    /// # fn example(archive: &mut rars::Archive) {
+    /// let index = archive.index();
+    /// if let rars::Archive::Rar13(legacy) = archive {
+    ///     legacy.entries.clear();
+    /// }
+    /// println!("{}", index.len());
+    /// # }
+    /// ```
+    pub fn index(&self) -> ArchiveIndex<'_> {
+        ArchiveIndex::new(self)
     }
 
     /// Streams extracted entries to caller-provided writers.
@@ -856,10 +901,10 @@ impl Archive {
     ) -> Result<Option<Vec<u8>>> {
         options.check_cancelled()?;
         let index = self
-            .members()
+            .member_refs()
             .enumerate()
             .filter(|(_, member)| {
-                member.meta.name == name && !member.meta.is_directory && !member.meta.is_redirection
+                member.name_bytes() == name && !member.is_directory() && !member.is_redirection()
             })
             .map(|(index, _)| index)
             .last();
@@ -890,26 +935,15 @@ impl Archive {
         options: ArchiveReadOptions<'_>,
     ) -> Result<Option<Vec<u8>>> {
         options.check_cancelled()?;
-        let Some(member) = self.members().nth(index) else {
+        let Some(member) = self.member_refs().nth(index) else {
             return Ok(None);
         };
-        if member.meta.is_directory || member.meta.is_redirection {
+        if member.is_directory() || member.is_redirection() {
             return Ok(None);
         }
         // Match controlled extraction's conservative solid admission policy,
         // including member flags in archives without a main solid flag.
-        let solid = match self {
-            Self::Rar13(archive) => archive.main.is_solid(),
-            Self::Rar15To40(archive) => {
-                archive.main.is_solid() || archive.files().any(|file| file.is_solid())
-            }
-            Self::Rar50Plus(archive) => {
-                archive.main.is_solid()
-                    || archive
-                        .files()
-                        .any(|file| file.compression_info & 0x40 != 0)
-            }
-        };
+        let solid = self.is_solid();
         let collected = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
         let mut current = 0usize;
         self.extract_with_control(options, |member| {
@@ -933,7 +967,7 @@ impl Archive {
         })?;
         let taken = collected
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("member buffer mutex is not poisoned")
             .take();
         Ok(taken)
     }
@@ -949,8 +983,35 @@ impl Archive {
     /// Parsing-only limits are not reapplied; comments and recovery are outside
     /// this payload test. Each call starts fresh output budgets.
     pub fn test_with_options(&self, options: ArchiveReadOptions<'_>) -> Result<()> {
+        self.test_with_options_and_callback(options, |_| Ok(()))
+    }
+
+    /// Verifies payloads and reports regular entries and directories once, in
+    /// archive order. Redirections are skipped, as in ordinary extraction.
+    ///
+    /// Callbacks do not receive payload bytes. A callback can precede that
+    /// member's verification; earlier callbacks can have run when the call fails.
+    /// Only successful completion verifies every payload. Cancellation is checked
+    /// around callbacks, and a callback error aborts the operation.
+    ///
+    /// RAR5 verification discards each worker's decoded output rather than
+    /// retaining another buffer for publication. Buffered, streaming and scratch
+    /// decoding retain their extraction routing. All output, dictionary and
+    /// workspace limits also apply to discarded output.
+    pub fn test_with_options_and_callback<F>(
+        &self,
+        options: ArchiveReadOptions<'_>,
+        mut tested: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<()>,
+    {
         options.check_cancelled()?;
-        self.extract_to_parallel_buffered_with_options(options, |_| {
+        if let Self::Rar50Plus(archive) = self {
+            return archive.test_to(options, |meta| tested(&rar50_meta(meta)));
+        }
+        self.extract_to_parallel_buffered_with_options(options, |meta| {
+            tested(meta)?;
             Ok(Box::new(std::io::sink()) as Box<dyn Write>)
         })
     }
@@ -1011,6 +1072,11 @@ impl Archive {
         &self,
         options: ArchiveReadOptions<'_>,
     ) -> Result<RecoveryRepairResult> {
+        if !cfg!(feature = "recovery") {
+            return Err(Error::FeatureDisabled {
+                feature: "recovery",
+            });
+        }
         options.check_cancelled()?;
         match self {
             Self::Rar15To40(archive) => archive.repair_protect_head_with_options(options),
@@ -1034,6 +1100,11 @@ impl Archive {
         writer: &mut dyn Write,
         password: Option<&[u8]>,
     ) -> Result<RecoveryRepairReport> {
+        if !cfg!(feature = "recovery") {
+            return Err(Error::FeatureDisabled {
+                feature: "recovery",
+            });
+        }
         match self {
             Self::Rar15To40(archive) => {
                 let repaired = archive.repair_protect_head_with_report()?;
@@ -1216,6 +1287,7 @@ pub struct RecoveryRepairResult {
     pub report: RecoveryRepairReport,
 }
 
+#[cfg(feature = "recovery")]
 impl RecoveryRepairResult {
     /// Publishes repaired bytes beside the destination, replacing it only after
     /// writing, syncing and a final cancellation check succeed. Cancellation
@@ -1227,8 +1299,16 @@ impl RecoveryRepairResult {
         cancellation: Option<&ReadCancellation>,
     ) -> Result<()> {
         let control = crate::read_control::ReadControl::new(cancellation);
+        self.write_to_path_controlled(path, &control)
+    }
+
+    fn write_to_path_controlled(
+        &self,
+        path: &std::path::Path,
+        control: &crate::read_control::ReadControl,
+    ) -> Result<()> {
         control.check()?;
-        let (mut pending, output) = crate::builder::PendingArchive::create(path)?;
+        let (mut pending, output) = crate::pending_archive::PendingArchive::create(path)?;
         {
             let mut output = output;
             control.finish(
@@ -1343,13 +1423,12 @@ impl ArchiveReader {
         let source = crate::source::ArchiveSource::Reader(reader.clone());
         let len = source.len()?;
         let mut cursor = reader.cursor();
-        let mut scan = vec![0; len.min(SFX_SCAN_LIMIT)];
-        crate::read_control::ReadControl::new(options.cancellation)
-            .reader(&mut cursor)
-            .read_exact(&mut scan)?;
+        let signature = read_archive_signature(
+            &mut crate::read_control::ReadControl::new(options.cancellation).reader(&mut cursor),
+            len.min(SFX_SCAN_LIMIT),
+        )?;
         options.check_cancelled()?;
-        let signature =
-            find_archive_start(&scan, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
+        let signature = signature.ok_or(Error::UnsupportedSignature)?;
         match signature.family {
             ArchiveFamily::Rar13 => Ok(Archive::Rar13(rar13::Archive::parse_seekable(
                 cursor,
@@ -1397,11 +1476,9 @@ impl ArchiveReader {
         let path = path.as_ref();
         let mut file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
-        let mut scan = vec![0; len.min(SFX_SCAN_LIMIT as u64) as usize];
-        file.read_exact(&mut scan)?;
+        let signature = read_archive_signature(&mut file, len.min(SFX_SCAN_LIMIT as u64) as usize)?;
         options.check_cancelled()?;
-        let signature =
-            find_archive_start(&scan, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
+        let signature = signature.ok_or(Error::UnsupportedSignature)?;
         match signature.family {
             ArchiveFamily::Rar13 => Ok(Archive::Rar13(
                 rar13::Archive::parse_path_with_signature_and_options(path, signature, options)?,
@@ -1415,6 +1492,33 @@ impl ArchiveReader {
         }
     }
 }
+
+fn read_archive_signature(
+    reader: &mut impl Read,
+    scan_len: usize,
+) -> Result<Option<ArchiveSignature>> {
+    let mut prefix = [0; 8];
+    let prefix_len = scan_len.min(prefix.len());
+    reader.read_exact(&mut prefix[..prefix_len])?;
+    if let Some(signature) = detect_archive_family(&prefix[..prefix_len])
+        .filter(|signature| signature.family != ArchiveFamily::Rar13)
+    {
+        // The first strong signature wins the full scan too. RAR 1.3 still
+        // scans because a later RAR 1.5/5 signature takes precedence over it.
+        return Ok(Some(signature));
+    }
+    if scan_len <= prefix.len() {
+        return Ok(find_archive_start(&prefix[..prefix_len], SFX_SCAN_LIMIT));
+    }
+    let mut scan = vec![0; scan_len];
+    scan[..prefix_len].copy_from_slice(&prefix[..prefix_len]);
+    reader.read_exact(&mut scan[prefix_len..])?;
+    Ok(find_archive_start(&scan, SFX_SCAN_LIMIT))
+}
+
+#[cfg(test)]
+#[path = "reader_signature_tests.rs"]
+mod reader_signature_tests;
 
 fn read_options(password: Option<&[u8]>) -> ArchiveReadOptions<'_> {
     match password {
@@ -1462,6 +1566,40 @@ where
             rar50::extract_volumes_to(&typed, options, |meta| open(&rar50_meta(meta)))
         }
     }
+}
+
+/// Verifies every logical payload in a volume set and discards decoded output.
+/// Has the resource and cancellation policies of [`Archive::test_with_options`].
+pub fn test_volumes_with_options(
+    archives: &[Archive],
+    options: ArchiveReadOptions<'_>,
+) -> Result<()> {
+    test_volumes_with_options_and_callback(archives, options, |_| Ok(()))
+}
+
+/// Verifies a volume set with metadata callbacks. Split members produce one
+/// callback at their final fragment, in logical archive order. Has the callback
+/// and failure semantics of [`Archive::test_with_options_and_callback`].
+pub fn test_volumes_with_options_and_callback<F>(
+    archives: &[Archive],
+    options: ArchiveReadOptions<'_>,
+    mut tested: F,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<()>,
+{
+    options.check_cancelled()?;
+    let Some(first) = archives.first() else {
+        return Err(Error::InvalidHeader("volume set is empty"));
+    };
+    if first.family() == ArchiveFamily::Rar50Plus {
+        let typed = rar50_volumes(archives)?;
+        return rar50::test_volumes_to(&typed, options, |meta| tested(&rar50_meta(meta)));
+    }
+    extract_volumes_to_with_options(archives, options, |meta| {
+        tested(meta)?;
+        Ok(Box::new(std::io::sink()) as Box<dyn Write>)
+    })
 }
 
 /// Returns the logical members in a volume set in archive order.
@@ -1521,12 +1659,11 @@ pub fn read_volume_member_at_with_options(
     index: usize,
     options: ArchiveReadOptions<'_>,
 ) -> Result<Option<Vec<u8>>> {
+    options.check_cancelled()?;
+    let mut output_indices = member_read::volume_output_indices(archives);
     let collected = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
-    let current = std::cell::Cell::new(0usize);
     extract_volumes_to_with_options(archives, options, |meta| {
-        let this = current.get();
-        current.set(this.saturating_add(1));
-        if this != index || meta.is_directory {
+        if output_indices.next() != Some(index) || meta.is_directory {
             return Ok(Box::new(std::io::sink()) as Box<dyn Write>);
         }
         let sink = SharedBuffer(std::sync::Arc::clone(&collected));
@@ -1535,7 +1672,7 @@ pub fn read_volume_member_at_with_options(
     })?;
     let taken = collected
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .expect("member buffer mutex is not poisoned")
         .take();
     Ok(taken)
 }
@@ -1694,12 +1831,138 @@ fn rar50_volumes(archives: &[Archive]) -> Result<Vec<rar50::Archive>> {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
+
+    #[test]
+    fn facade_buffer_flush_preserves_written_bytes() {
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut writer = SharedBuffer(bytes.clone());
+        writer.flush().unwrap();
+        assert!(bytes.lock().unwrap().is_none());
+        assert_eq!(writer.write(b"").unwrap(), 0);
+        writer.write_all(b"a").unwrap();
+        writer.flush().unwrap();
+        writer.write_all(b"bc").unwrap();
+        writer.flush().unwrap();
+        writer.flush().unwrap();
+        assert_eq!(*bytes.lock().unwrap(), Some(b"abc".to_vec()));
+    }
+
+    #[test]
+    fn facade_family_accessors_and_public_hash_models_preserve_information() {
+        for version in [
+            ArchiveVersion::Rar13,
+            ArchiveVersion::Rar29,
+            ArchiveVersion::Rar50,
+        ] {
+            let mut builder = Builder::new(version).store(true);
+            builder
+                .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+                .unwrap();
+            let mut archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            assert_eq!(
+                archive.as_rar13().is_some(),
+                version == ArchiveVersion::Rar13
+            );
+            assert_eq!(
+                archive.as_rar15_40().is_some(),
+                version == ArchiveVersion::Rar29
+            );
+            assert_eq!(
+                archive.as_rar50().is_some(),
+                version == ArchiveVersion::Rar50
+            );
+            if !matches!(archive, Archive::Rar50Plus(_)) {
+                continue;
+            }
+            for (hash_type, data) in [
+                (0, vec![7; 32]),
+                (0, vec![7; 31]),
+                (0, vec![7; 33]),
+                (1, vec![7; 32]),
+                (u64::MAX, vec![]),
+            ] {
+                let Archive::Rar50Plus(modern) = &mut archive else {
+                    unreachable!()
+                };
+                let file = modern
+                    .blocks
+                    .iter_mut()
+                    .find_map(|block| match block {
+                        rar50::Block::File(file) => Some(file),
+                        _ => None,
+                    })
+                    .unwrap();
+                file.hash = Some(rar50::FileHash {
+                    hash_type,
+                    data: data.clone(),
+                });
+                let member = archive.members().next().unwrap();
+                let ArchiveMemberDetail::Rar50Plus { hash, .. } = member.detail else {
+                    panic!("modern member must retain its family")
+                };
+                let expected = if hash_type == 0 && data.len() == 32 {
+                    ArchiveMemberHash::Blake2sp([7; 32])
+                } else {
+                    ArchiveMemberHash::Other { hash_type, data }
+                };
+                assert_eq!(hash, Some(expected));
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "recovery")]
+    fn recovery_publication_rename_failure_preserves_destination_and_cleans_staging() {
+        let root = crate::scratch::case("recovery-publication-rename-failure");
+        let destination = root.join("destination");
+        std::fs::create_dir(&destination).unwrap();
+        let sentinel = destination.join("existing");
+        std::fs::write(&sentinel, b"keep these bytes").unwrap();
+        let result = RecoveryRepairResult {
+            data: b"repaired bytes".to_vec(),
+            report: RecoveryRepairReport::default(),
+        };
+        let error = result.write_to_path(&destination, None).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Io);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep these bytes");
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "recovery")]
+    fn recovery_publication_cancellation_at_each_checkpoint_preserves_destination() {
+        let root = crate::scratch::case("recovery-publication-checkpoints");
+        let destination = root.join("archive.rar");
+        let result = RecoveryRepairResult {
+            // Three writes, including a partial final chunk.
+            data: vec![7; 2 * 64 * 1024 + 1],
+            report: RecoveryRepairReport::default(),
+        };
+        for successful_checks in 0..=6 {
+            std::fs::write(&destination, b"original archive").unwrap();
+            let token = ReadCancellation::new();
+            let control = crate::read_control::ReadControl::new(Some(&token));
+            control.cancel_after_checks(successful_checks);
+            let published = result.write_to_path_controlled(&destination, &control);
+            if successful_checks < 6 {
+                assert_eq!(published.unwrap_err(), Error::Cancelled);
+                assert!(token.is_cancelled());
+                assert_eq!(std::fs::read(&destination).unwrap(), b"original archive");
+            } else {
+                published.unwrap();
+                assert!(!token.is_cancelled());
+                assert_eq!(std::fs::read(&destination).unwrap(), result.data);
+            }
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        }
+    }
 
     #[test]
     fn member_mtime_matches_rar50_extraction_without_losing_absence() {
@@ -2005,13 +2268,17 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "recovery")]
     fn assert_rar50_volume_recovery_records(archives: &[rar50::Archive], percent: u64) {
         assert!(archives.iter().all(|archive| archive.main.is_volume()));
         assert!(archives
             .iter()
             .all(|archive| archive.main.has_recovery_record()));
         for archive in archives {
-            let service = archive.services().next().unwrap();
+            let service = archive
+                .services()
+                .find(|service| service.name != b"RARS")
+                .unwrap();
             assert_eq!(service.name, b"RR");
             assert_eq!(service.recovery_record().unwrap().unwrap().percent, percent);
             let data = collect_rar50_file(archive, service).unwrap().data;
@@ -2466,6 +2733,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar29_encrypted_e8_filtered_compressed_archive() {
         let payload = b"\xe8\0\0\0\0facade rar29 encrypted e8 payload\n".repeat(12);
         let features = FeatureSet::store_only();
@@ -2498,6 +2766,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar30_header_encrypted_e8_filtered_compressed_archive() {
         let payload = b"\xe8\0\0\0\0facade rar30 header encrypted e8 payload\n".repeat(12);
         let mut features = FeatureSet::store_only();
@@ -3084,7 +3353,7 @@ mod tests {
         let archive = ArchiveReader::read(&bytes).unwrap();
         let raw = archive.as_rar15_40().unwrap();
         assert!(!raw.main.has_archive_comment());
-        let subblock = raw.new_subs().next().unwrap();
+        let subblock = raw.new_subs().find(|sub| sub.file.name == b"CMT").unwrap();
         assert_eq!(subblock.kind, rar15_40::NewSubKind::ArchiveComment);
         assert_eq!(subblock.file.name, b"CMT");
         assert_eq!(
@@ -3129,6 +3398,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar15_encrypted_compressed_archive() {
         let features = FeatureSet::store_only();
         let bytes = rar15_40::write_compressed_archive(
@@ -3241,6 +3511,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar29_encrypted_compressed_volumes() {
         let features = FeatureSet::store_only();
         let parts = rar15_40::write_compressed_volumes(
@@ -3275,6 +3546,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar15_encrypted_compressed_volumes() {
         let features = FeatureSet::store_only();
         let parts = rar15_40::write_compressed_volumes(
@@ -3309,6 +3581,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar30_encrypted_compressed_volumes() {
         let features = FeatureSet::store_only();
         let parts = rar15_40::write_compressed_volumes(
@@ -3343,6 +3616,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar30_header_encrypted_compressed_volumes() {
         let mut features = FeatureSet::store_only();
         features.header_encryption = true;
@@ -3378,6 +3652,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar30_aes_encrypted_compressed_archive() {
         let features = FeatureSet::store_only();
         let bytes = rar15_40::write_compressed_archive(
@@ -3404,6 +3679,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar29_aes_encrypted_compressed_archive() {
         let features = FeatureSet::store_only();
         let bytes = rar15_40::write_compressed_archive(
@@ -3435,6 +3711,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar20_encrypted_compressed_archive() {
         let features = FeatureSet::store_only();
         let bytes = rar15_40::write_compressed_archive(
@@ -3468,6 +3745,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar30_header_encrypted_compressed_archive() {
         let mut features = FeatureSet::store_only();
         features.header_encryption = true;
@@ -3505,6 +3783,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar30_solid_header_encrypted_compressed_archive() {
         let mut features = FeatureSet::store_only();
         features.header_encryption = true;
@@ -3742,7 +4021,10 @@ mod tests {
 
         let archive = ArchiveReader::read(&bytes).unwrap();
         let raw = archive.as_rar50().unwrap();
-        let services: Vec<_> = raw.services().collect();
+        let services: Vec<_> = raw
+            .services()
+            .filter(|service| service.name != b"RARS")
+            .collect();
         assert_eq!(services.len(), 1);
         assert_eq!(services[0].name, b"CMT");
         assert_eq!(
@@ -3774,7 +4056,10 @@ mod tests {
 
         let archive = ArchiveReader::read(&bytes).unwrap();
         let raw = archive.as_rar50().unwrap();
-        let services: Vec<_> = raw.services().collect();
+        let services: Vec<_> = raw
+            .services()
+            .filter(|service| service.name != b"RARS")
+            .collect();
         assert_eq!(services.len(), 1);
         assert_eq!(services[0].name, b"CMT");
         assert_eq!(
@@ -3786,6 +4071,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_encrypted_stored_file_comment_service() {
         let features = FeatureSet::store_only();
         let bytes = rar50::Rar50Writer::new(
@@ -3816,7 +4102,13 @@ mod tests {
         )
         .unwrap();
         let raw = archive.as_rar50().unwrap();
-        let service = collect_rar50_file(raw, raw.services().next().unwrap()).unwrap();
+        let service = collect_rar50_file(
+            raw,
+            raw.services()
+                .find(|service| service.name != b"RARS")
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(service.data, b"facade encrypted rar5 file comment\n");
         let extracted = collect_extract(&archive, Some(b"password")).unwrap();
         assert_eq!(
@@ -3826,6 +4118,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_header_encrypted_stored_file_comment_service() {
         let mut features = FeatureSet::store_only();
         features.header_encryption = true;
@@ -3861,7 +4154,13 @@ mod tests {
         )
         .unwrap();
         let raw = archive.as_rar50().unwrap();
-        let service = collect_rar50_file(raw, raw.services().next().unwrap()).unwrap();
+        let service = collect_rar50_file(
+            raw,
+            raw.services()
+                .find(|service| service.name != b"RARS")
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(service.data, b"facade header encrypted rar5 file comment\n");
         let extracted = collect_extract(&archive, Some(b"password")).unwrap();
         assert_eq!(
@@ -3891,7 +4190,10 @@ mod tests {
         let archive = ArchiveReader::read(&bytes).unwrap();
         let raw = archive.as_rar50().unwrap();
         assert!(raw.main.locator().unwrap().quick_open_offset.unwrap() > 0);
-        let services: Vec<_> = raw.services().collect();
+        let services: Vec<_> = raw
+            .services()
+            .filter(|service| service.name != b"RARS")
+            .collect();
         assert_eq!(services.len(), 1);
         assert_eq!(services[0].name, b"QO");
         assert!(!collect_rar50_file(raw, services[0])
@@ -3927,7 +4229,10 @@ mod tests {
 
         let archive = ArchiveReader::read(&bytes).unwrap();
         let raw = archive.as_rar50().unwrap();
-        let service = raw.services().next().unwrap();
+        let service = raw
+            .services()
+            .find(|service| service.name != b"RARS")
+            .unwrap();
         assert_eq!(service.name, b"QO");
         let payload = collect_rar50_file(raw, service).unwrap().data;
 
@@ -3990,7 +4295,10 @@ mod tests {
 
         let archive = ArchiveReader::read(&bytes).unwrap();
         let raw = archive.as_rar50().unwrap();
-        let services: Vec<_> = raw.services().collect();
+        let services: Vec<_> = raw
+            .services()
+            .filter(|service| service.name != b"RARS")
+            .collect();
         assert_eq!(services.len(), 2);
         assert_eq!(services[0].name, b"ACL");
         assert_eq!(services[1].name, b"STM");
@@ -4007,6 +4315,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn direct_writer_creates_rar50_stored_archive_with_recovery_service() {
         let features = FeatureSet::store_only();
         let bytes = rar50::Rar50Writer::new(
@@ -4027,7 +4336,10 @@ mod tests {
         let archive = ArchiveReader::read(&bytes).unwrap();
         let raw = archive.as_rar50().unwrap();
         assert!(raw.main.has_recovery_record());
-        let service = raw.services().next().unwrap();
+        let service = raw
+            .services()
+            .find(|service| service.name != b"RARS")
+            .unwrap();
         assert_eq!(service.name, b"RR");
         let recovery = service.recovery_record().unwrap().unwrap();
         assert_eq!(recovery.percent, 9);
@@ -4036,6 +4348,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn archive_facade_repairs_rar50_inline_recovery_damage() {
         let features = FeatureSet::store_only();
         let payload = b"facade rar5 repair payload\n".repeat(64);
@@ -4078,6 +4391,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn archive_facade_reports_rar13_family_for_unsupported_recovery_repair() {
         let bytes = rar13::write_stored_archive(
             &[rar13::StoredEntry {
@@ -4105,6 +4419,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn archive_facade_repairs_rar15_40_recovery_as_full_archive_bytes() {
         let bytes = std::fs::read(rar15_40_fixture("rar250_protect_head_rr5.rar")).unwrap();
         let mut damaged = bytes.clone();
@@ -4124,6 +4439,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn archive_facade_repairs_rar3_newsub_recovery_as_full_archive_bytes() {
         let bytes = std::fs::read(rar15_40_fixture("rar300/with_recovery_rar300.rar")).unwrap();
         let mut damaged = bytes.clone();
@@ -4143,6 +4459,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn direct_writer_creates_rar50_compressed_archive_with_recovery_service() {
         let features = FeatureSet::store_only();
         let payload = b"facade rar5 compressed recovery payload repeated repeated\n".repeat(8);
@@ -4161,7 +4478,10 @@ mod tests {
         let archive = ArchiveReader::read(&bytes).unwrap();
         let raw = archive.as_rar50().unwrap();
         assert!(raw.main.has_recovery_record());
-        let service = raw.services().next().unwrap();
+        let service = raw
+            .services()
+            .find(|service| service.name != b"RARS")
+            .unwrap();
         assert_eq!(service.name, b"RR");
         assert_eq!(service.recovery_record().unwrap().unwrap().percent, 9);
         let extracted = collect_extract(&archive, None).unwrap();
@@ -4242,13 +4562,20 @@ mod tests {
 
         let archive = ArchiveReader::read(&bytes).unwrap();
         let raw = archive.as_rar50().unwrap();
-        let comment = collect_rar50_file(raw, raw.services().next().unwrap()).unwrap();
+        let comment = collect_rar50_file(
+            raw,
+            raw.services()
+                .find(|service| service.name != b"RARS")
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(comment.data, b"facade compressed comment\n");
         let extracted = collect_extract(&archive, None).unwrap();
         assert_eq!(extracted[0].data, payload);
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar70_encrypted_stored_archive_with_metadata() {
         let features = FeatureSet::store_only();
         let bytes = rar50::Rar50Writer::new(
@@ -4285,6 +4612,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar70_encrypted_compressed_archive_with_metadata() {
         let features = FeatureSet::store_only();
         let payload = b"facade rar7 encrypted compressed metadata payload repeated\n".repeat(8);
@@ -4317,6 +4645,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar70_header_encrypted_stored_archive_with_metadata() {
         let mut features = FeatureSet::store_only();
         features.header_encryption = true;
@@ -4362,6 +4691,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar70_header_encrypted_compressed_archive_with_metadata() {
         let mut features = FeatureSet::store_only();
         features.header_encryption = true;
@@ -4404,6 +4734,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_encrypted_stored_archive() {
         let features = FeatureSet::store_only();
         let bytes = rar50::Rar50Writer::new(
@@ -4438,6 +4769,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_encrypted_compressed_archive() {
         let features = FeatureSet::store_only();
         let payload = b"facade rar5 encrypted compressed\n".repeat(16);
@@ -4463,6 +4795,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_encrypted_solid_compressed_archive() {
         let mut features = FeatureSet::store_only();
         features.solid = true;
@@ -4500,6 +4833,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_header_encrypted_compressed_archive() {
         let mut features = FeatureSet::store_only();
         features.header_encryption = true;
@@ -4529,6 +4863,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_header_encrypted_solid_compressed_archive() {
         let mut features = FeatureSet::store_only();
         features.header_encryption = true;
@@ -4577,6 +4912,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_encrypted_stored_archive_with_comment() {
         let features = FeatureSet::store_only();
         let bytes = rar50::Rar50Writer::new(
@@ -4603,13 +4939,20 @@ mod tests {
         )
         .unwrap();
         let raw = archive.as_rar50().unwrap();
-        let comment = collect_rar50_file(raw, raw.services().next().unwrap()).unwrap();
+        let comment = collect_rar50_file(
+            raw,
+            raw.services()
+                .find(|service| service.name != b"RARS")
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(comment.data, b"facade encrypted comment\n");
         let extracted = collect_extract(&archive, Some(b"password")).unwrap();
         assert_eq!(extracted[0].data, b"facade rar5 encrypted stored payload\n");
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_encrypted_compressed_archive_with_comment() {
         let payload = b"facade rar5 encrypted compressed comment payload\n".repeat(8);
         let features = FeatureSet::store_only();
@@ -4635,13 +4978,20 @@ mod tests {
         )
         .unwrap();
         let raw = archive.as_rar50().unwrap();
-        let comment = collect_rar50_file(raw, raw.services().next().unwrap()).unwrap();
+        let comment = collect_rar50_file(
+            raw,
+            raw.services()
+                .find(|service| service.name != b"RARS")
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(comment.data, b"facade encrypted compressed comment\n");
         let extracted = collect_extract(&archive, Some(b"password")).unwrap();
         assert_eq!(extracted[0].data, payload);
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_header_encrypted_stored_archive() {
         let mut features = FeatureSet::store_only();
         features.header_encryption = true;
@@ -4683,6 +5033,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_header_encrypted_stored_archive_with_comment() {
         let mut features = FeatureSet::store_only();
         features.header_encryption = true;
@@ -4710,7 +5061,13 @@ mod tests {
         )
         .unwrap();
         let raw = archive.as_rar50().unwrap();
-        let comment = collect_rar50_file(raw, raw.services().next().unwrap()).unwrap();
+        let comment = collect_rar50_file(
+            raw,
+            raw.services()
+                .find(|service| service.name != b"RARS")
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(comment.data, b"facade header encrypted comment\n");
         let extracted = collect_extract(&archive, Some(b"password")).unwrap();
         assert_eq!(
@@ -4720,6 +5077,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_header_encrypted_compressed_archive_with_comment() {
         let payload = b"facade rar5 header encrypted compressed comment payload\n".repeat(8);
         let mut features = FeatureSet::store_only();
@@ -4749,7 +5107,13 @@ mod tests {
         )
         .unwrap();
         let raw = archive.as_rar50().unwrap();
-        let comment = collect_rar50_file(raw, raw.services().next().unwrap()).unwrap();
+        let comment = collect_rar50_file(
+            raw,
+            raw.services()
+                .find(|service| service.name != b"RARS")
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             comment.data,
             b"facade header encrypted compressed comment\n"
@@ -4759,6 +5123,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_encrypted_stored_archive_with_recovery() {
         let features = FeatureSet::store_only();
         let bytes = rar50::Rar50Writer::new(
@@ -4785,7 +5151,10 @@ mod tests {
         .unwrap();
         let raw = archive.as_rar50().unwrap();
         assert!(raw.main.has_recovery_record());
-        let service = raw.services().next().unwrap();
+        let service = raw
+            .services()
+            .find(|service| service.name != b"RARS")
+            .unwrap();
         assert_eq!(service.name, b"RR");
         assert_eq!(service.recovery_record().unwrap().unwrap().percent, 6);
         let recovery_data = collect_rar50_file(raw, service).unwrap().data;
@@ -4802,6 +5171,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_encrypted_compressed_archive_with_recovery() {
         let features = FeatureSet::store_only();
         let payload = b"facade rar5 encrypted compressed recovery payload repeated\n".repeat(8);
@@ -4827,7 +5198,10 @@ mod tests {
         .unwrap();
         let raw = archive.as_rar50().unwrap();
         assert!(raw.main.has_recovery_record());
-        let service = raw.services().next().unwrap();
+        let service = raw
+            .services()
+            .find(|service| service.name != b"RARS")
+            .unwrap();
         assert_eq!(service.name, b"RR");
         assert_eq!(service.recovery_record().unwrap().unwrap().percent, 6);
         let extracted = collect_extract(&archive, None).unwrap();
@@ -4835,6 +5209,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_header_encrypted_stored_archive_with_recovery() {
         let mut features = FeatureSet::store_only();
         features.header_encryption = true;
@@ -4866,7 +5242,10 @@ mod tests {
         .unwrap();
         let raw = archive.as_rar50().unwrap();
         assert!(raw.main.has_recovery_record());
-        let service = raw.services().next().unwrap();
+        let service = raw
+            .services()
+            .find(|service| service.name != b"RARS")
+            .unwrap();
         assert_eq!(service.name, b"RR");
         assert!(!service.encrypted);
         assert_eq!(service.recovery_record().unwrap().unwrap().percent, 4);
@@ -4884,6 +5263,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_header_encrypted_compressed_archive_with_recovery() {
         let mut features = FeatureSet::store_only();
         features.header_encryption = true;
@@ -4915,7 +5296,10 @@ mod tests {
         .unwrap();
         let raw = archive.as_rar50().unwrap();
         assert!(raw.main.has_recovery_record());
-        let service = raw.services().next().unwrap();
+        let service = raw
+            .services()
+            .find(|service| service.name != b"RARS")
+            .unwrap();
         assert_eq!(service.name, b"RR");
         assert!(!service.encrypted);
         assert_eq!(service.recovery_record().unwrap().unwrap().percent, 4);
@@ -4924,6 +5308,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_encrypted_stored_volumes() {
         let features = FeatureSet::store_only();
         let payload = b"facade rar5 encrypted split payload\n".repeat(12);
@@ -4947,6 +5332,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
+    #[cfg(feature = "recovery")]
     fn direct_writer_creates_rar50_encrypted_stored_volumes_with_recovery() {
         let features = FeatureSet::store_only();
         let payload = b"facade rar5 encrypted recovery split payload\n".repeat(12);
@@ -4971,6 +5358,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
+    #[cfg(feature = "recovery")]
     fn direct_writer_creates_rar50_header_encrypted_stored_volumes_with_recovery() {
         let mut features = FeatureSet::store_only();
         features.header_encryption = true;
@@ -5000,6 +5389,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_header_encrypted_stored_volumes() {
         let mut features = FeatureSet::store_only();
         features.header_encryption = true;
@@ -5028,6 +5418,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_encrypted_compressed_volumes() {
         let features = FeatureSet::store_only();
         let payload = b"facade rar5 encrypted compressed split payload\n".repeat(12);
@@ -5051,6 +5442,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
+    #[cfg(feature = "recovery")]
     fn direct_writer_creates_rar50_encrypted_compressed_volumes_with_recovery() {
         let features = FeatureSet::store_only();
         let payload = b"facade rar5 encrypted compressed recovery split payload\n".repeat(12);
@@ -5076,6 +5469,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
+    #[cfg(feature = "recovery")]
     fn direct_writer_creates_rar50_header_encrypted_compressed_volumes_with_recovery() {
         let mut features = FeatureSet::store_only();
         features.header_encryption = true;
@@ -5112,6 +5507,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_encrypted_solid_compressed_volumes() {
         let mut features = FeatureSet::store_only();
         features.solid = true;
@@ -5139,6 +5535,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_header_encrypted_compressed_volumes() {
         let mut features = FeatureSet::store_only();
         features.header_encryption = true;
@@ -5169,6 +5566,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn direct_writer_creates_rar50_header_encrypted_solid_compressed_volumes() {
         let mut features = FeatureSet::store_only();
         features.header_encryption = true;
@@ -5225,6 +5623,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn direct_writer_creates_rar50_stored_volumes_with_recovery() {
         let features = FeatureSet::store_only();
         let payload = b"facade rar5 stored recovery split payload\n".repeat(20);
@@ -5269,6 +5668,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn direct_writer_creates_rar50_compressed_volumes_with_recovery() {
         let features = FeatureSet::store_only();
         let payload: Vec<u8> = (0..512).map(|index| (index * 53 + 17) as u8).collect();
@@ -5407,6 +5807,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn archive_facade_repair_recovery_returns_full_repaired_archive_bytes() {
         let bytes = std::fs::read(rar15_40_fixture("rar250_protect_head_rr5.rar")).unwrap();
         let mut damaged = bytes.clone();
@@ -5418,6 +5819,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn archive_facade_repair_recovery_rejects_rar13_archives() {
         let bytes = rar13::write_stored_archive(
             &[rar13::StoredEntry {
@@ -5467,6 +5869,82 @@ mod tests {
     }
 
     #[test]
+    fn volume_facade_rejects_empty_and_every_mixed_family_ordering() {
+        let never_open = |_: &ExtractedEntryMeta| -> Result<Box<dyn Write>> {
+            panic!("invalid volume set must be rejected before opening output")
+        };
+        let empty = Error::InvalidHeader("volume set is empty");
+        assert_eq!(volume_members(&[]).unwrap_err(), empty);
+        assert_eq!(read_volume_members_at(&[], &[], None).unwrap_err(), empty);
+        assert_eq!(
+            extract_volumes_to(&[], None, never_open).unwrap_err(),
+            empty
+        );
+        let cancellation = ReadCancellation::new();
+        cancellation.cancel();
+        assert_eq!(
+            extract_volumes_to_with_options(
+                &[],
+                ArchiveReadOptions::new().with_cancellation(&cancellation),
+                never_open,
+            )
+            .unwrap_err(),
+            Error::Cancelled
+        );
+
+        let archives: Vec<_> = [
+            ArchiveVersion::Rar13,
+            ArchiveVersion::Rar29,
+            ArchiveVersion::Rar50,
+        ]
+        .into_iter()
+        .map(|version| {
+            let mut builder = Builder::new(version).store(true);
+            builder
+                .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+                .unwrap();
+            ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap()
+        })
+        .collect();
+        for first in 0..archives.len() {
+            for second in 0..archives.len() {
+                if first == second {
+                    continue;
+                }
+                let mixed = [archives[first].clone(), archives[second].clone()];
+                let error = Error::InvalidHeader("mixed archive families in volume set");
+                assert_eq!(volume_members(&mixed).unwrap_err(), error);
+                assert_eq!(
+                    extract_volumes_to(&mixed, None, never_open).unwrap_err(),
+                    error
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn volume_index_reads_skip_directories_and_absent_indices_in_each_family() {
+        for version in [
+            ArchiveVersion::Rar13,
+            ArchiveVersion::Rar29,
+            ArchiveVersion::Rar50,
+        ] {
+            let mut builder = Builder::new(version).store(true);
+            builder.add_directory(b"dir".to_vec(), None, None).unwrap();
+            builder
+                .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+                .unwrap();
+            let archives = [ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap()];
+            assert_eq!(read_volume_member_at(&archives, 0, None).unwrap(), None);
+            assert_eq!(
+                read_volume_member_at(&archives, 1, None).unwrap(),
+                Some(b"payload".to_vec())
+            );
+            assert_eq!(read_volume_member_at(&archives, 2, None).unwrap(), None);
+        }
+    }
+
+    #[test]
     fn volume_members_and_index_reads_fold_split_fragments() {
         let payload = vec![7; 200_000];
         let mut builder = Builder::new(ArchiveVersion::Rar50)
@@ -5483,11 +5961,19 @@ mod tests {
             .collect();
 
         let members = volume_members(&archives).unwrap();
+        assert_eq!(
+            volume_members(&archives[1..]).unwrap_err(),
+            Error::InvalidHeader("volume set starts with a continuation")
+        );
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].meta.name, b"big.bin");
         assert_eq!(
             read_volume_member_at(&archives, 0, None).unwrap().unwrap(),
             payload
+        );
+        assert_eq!(
+            read_volume_members_at(&archives, &[0, 0, usize::MAX], None).unwrap(),
+            vec![Some(payload.clone()), Some(payload), None]
         );
     }
 }

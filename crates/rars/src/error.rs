@@ -98,6 +98,10 @@ pub enum Error {
         source: Box<Error>,
     },
     UnsupportedVersion(ArchiveVersion),
+    /// The requested implementation was omitted at compile time.
+    FeatureDisabled {
+        feature: &'static str,
+    },
     /// Skipping payload decoding would leave solid history unavailable.
     CannotSkipSolidMember,
     UnsupportedFeature {
@@ -108,7 +112,7 @@ pub enum Error {
     /// honour it.
     UnsupportedWriterOption {
         target: ArchiveVersion,
-        option: crate::write_plan::WriterOption,
+        option: crate::WriterOption,
         /// Why, when the format alone is not the reason: "in a compressed
         /// archive", "levels run from 0 to 5". Rendered after the format.
         because: Option<&'static str>,
@@ -250,6 +254,7 @@ impl std::fmt::Display for Error {
                 )
             }
             Self::UnsupportedVersion(version) => write!(f, "unsupported version: {version}"),
+            Self::FeatureDisabled { feature } => write!(f, "Cargo feature {feature} is disabled"),
             Self::CannotSkipSolidMember => write!(f, "cannot skip file data in a solid archive"),
             Self::UnsupportedFeature { version, feature } => {
                 write!(f, "feature {feature} is not supported by {version}")
@@ -422,7 +427,9 @@ impl Error {
             Self::UnsupportedSignature | Self::UnsupportedVersion(_) => {
                 ErrorKind::UnsupportedFormat
             }
-            Self::CannotSkipSolidMember
+            Self::FeatureDisabled { .. }
+            | Self::Rar50Crypto(crate::crypto::rar50::Error::FeatureDisabled)
+            | Self::CannotSkipSolidMember
             | Self::UnsupportedFeature { .. }
             | Self::UnsupportedFamilyFeature { .. }
             | Self::UnsupportedCompression { .. }
@@ -450,9 +457,10 @@ impl Error {
             | Self::TotalOutputLimitExceeded { .. }
             | Self::Rar50DictionaryLimitExceeded { .. }
             | Self::Rar50BufferedDecodeLimitExceeded { .. }
-            | Self::Rar5Recovery(crate::recovery::rar5::Error::RebuildTooLarge) => {
-                ErrorKind::ResourceLimit
-            }
+            | Self::Rar5Recovery(crate::recovery::rar5::Error::RebuildTooLarge)
+            | Self::Rar5Recovery(crate::recovery::rar5::Error::RepairWorkspaceLimitExceeded {
+                ..
+            }) => ErrorKind::ResourceLimit,
             Self::Codec(crate::codec::Error::Io(error)) => error.kind(),
             Self::Codec(crate::codec::Error::WorkspaceLimitExceeded(_)) => ErrorKind::ResourceLimit,
             Self::Cancelled | Self::Codec(crate::codec::Error::Cancelled) => ErrorKind::Cancelled,
@@ -529,12 +537,87 @@ impl From<crate::crypto::rar30::Error> for Error {
 
 impl From<crate::crypto::rar50::Error> for Error {
     fn from(error: crate::crypto::rar50::Error) -> Self {
+        if error == crate::crypto::rar50::Error::FeatureDisabled {
+            return Self::FeatureDisabled {
+                feature: "encryption",
+            };
+        }
         Self::Rar50Crypto(error)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn machine_readable_codes_remain_stable_and_distinct() {
+        let cases = [
+            (ErrorKind::InvalidArchive, "INVALID_ARCHIVE"),
+            (ErrorKind::InvalidArgument, "INVALID_OPTION"),
+            (ErrorKind::UnsupportedFormat, "UNSUPPORTED_FORMAT"),
+            (ErrorKind::UnsupportedFeature, "UNSUPPORTED_FEATURE"),
+            (ErrorKind::PasswordRequired, "PASSWORD_REQUIRED"),
+            (ErrorKind::BadPassword, "BAD_PASSWORD"),
+            (ErrorKind::ChecksumMismatch, "CHECKSUM_MISMATCH"),
+            (ErrorKind::EntryNotFound, "ENTRY_NOT_FOUND"),
+            (ErrorKind::DuplicateEntry, "DUPLICATE_ENTRY"),
+            (ErrorKind::UnsafePath, "UNSAFE_ENTRY_NAME"),
+            (ErrorKind::Io, "IO"),
+            (ErrorKind::ResourceLimit, "RESOURCE_LIMIT"),
+            (ErrorKind::Cancelled, "CANCELLED"),
+            (ErrorKind::SourceChanged, "SOURCE_CHANGED"),
+            (ErrorKind::WriterFailure, "WRITE_FAILED"),
+        ];
+        let mut codes = std::collections::HashSet::new();
+        for (kind, expected) in cases {
+            assert_eq!(kind.code(), expected);
+            assert!(codes.insert(kind.code()), "duplicate error code {expected}");
+        }
+    }
+
+    #[test]
+    fn resource_diagnostics_retain_required_used_and_limit_values() {
+        let cases = [
+            (
+                Error::Rar50ScratchLimitExceeded { limit: 11, required: 23 },
+                "RAR 5 scratch limit 11 bytes exceeded (requires 23)",
+            ),
+            (
+                Error::Rar50FilterMemoryLimitExceeded { limit: 11, required: 23 },
+                "RAR 5 filter workspace limit 11 bytes exceeded (requires 23)",
+            ),
+            (
+                Error::WriterSpoolLimitExceeded { limit: 11, required: 23, used: 7 },
+                "writer spool limit 11 bytes exceeded (requires 23; 7 bytes already retained or reserved)",
+            ),
+            (
+                Error::WriterPreparationLimitExceeded { limit: 11, required: 23, used: 7 },
+                "writer preparation limit 11 bytes exceeded (requires 23; 7 bytes already retained or reserved)",
+            ),
+            (
+                Error::WriterPreparedHeaderLimitExceeded { limit: 11, required: 23, used: 7 },
+                "writer prepared header limit 11 bytes exceeded (requires 23; 7 bytes already retained or reserved)",
+            ),
+            (
+                Error::WriterSpoolMemoryLimitExceeded { limit: 11, required: 23, used: 7 },
+                "writer spool memory limit 11 bytes exceeded (requires 23; 7 bytes already retained or reserved)",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.kind(), ErrorKind::ResourceLimit);
+            assert_eq!(error.to_string(), expected);
+            assert!(std::error::Error::source(&error).is_none());
+        }
+        assert_eq!(
+            Error::CannotSkipSolidMember.to_string(),
+            "cannot skip file data in a solid archive"
+        );
+        assert_eq!(
+            Error::CannotSkipSolidMember.kind(),
+            ErrorKind::UnsupportedFeature
+        );
+        assert!(Error::CannotSkipSolidMember.entry_context().is_none());
+    }
+
     #[test]
     fn codec_io_transport_retains_library_error_types() {
         for cause in [

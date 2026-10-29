@@ -10,19 +10,31 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$ROOT/npm"
 CRATE="rars-wasm"
-WASM="$ROOT/target/wasm32-unknown-unknown/release-wasm/rars_wasm.wasm"
+RARS_NPM_PROFILE="release-wasm"
+RARS_NPM_PROFILE_DIR="release-wasm"
+if [[ "$#" -gt 1 || ( "$#" -eq 1 && "$1" != "--debug" ) ]]; then
+    echo "usage: $0 [--debug]" >&2
+    exit 1
+fi
+if [[ "${1:-}" == "--debug" ]]; then
+    RARS_NPM_PROFILE="dev"
+    RARS_NPM_PROFILE_DIR="debug"
+fi
+WASM="$ROOT/target/wasm32-unknown-unknown/$RARS_NPM_PROFILE_DIR/rars_wasm.wasm"
 
 VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT/crates/rars-wasm/Cargo.toml" | head -1)"
 echo "building @bitplane/rars@$VERSION for npm"
 
-if ! command -v wasm-bindgen >/dev/null 2>&1; then
-    echo "wasm-bindgen not found. Install it with:" >&2
-    echo "  cargo install wasm-bindgen-cli --version 0.2.126 --locked" >&2
+WASM_BINDGEN_VERSION="$(python3 "$ROOT/scripts/wasm-bindgen-version.py")"
+if ! command -v wasm-bindgen >/dev/null 2>&1 \
+    || [[ "$(wasm-bindgen --version)" != "wasm-bindgen $WASM_BINDGEN_VERSION" ]]; then
+    echo "wasm-bindgen $WASM_BINDGEN_VERSION is required to match Cargo.lock. Install it with:" >&2
+    echo "  cargo install wasm-bindgen-cli --version $WASM_BINDGEN_VERSION --locked" >&2
     exit 1
 fi
 
 rustup target add wasm32-unknown-unknown >/dev/null 2>&1 || true
-cargo build --profile release-wasm --locked -p "$CRATE" --target wasm32-unknown-unknown
+cargo build --profile "$RARS_NPM_PROFILE" --locked -p "$CRATE" --target wasm32-unknown-unknown
 
 rm -rf "$OUT"
 mkdir -p "$OUT/browser/wasm" "$OUT/node/wasm"
@@ -33,7 +45,9 @@ rm -f "$OUT/browser/wasm/"*.d.ts "$OUT/node/wasm/"*.d.ts
 
 # wasm-opt is optional: it costs about a third of the module size, and a build
 # without it is correct, just larger. Say which happened rather than failing.
-if command -v wasm-opt >/dev/null 2>&1; then
+if [[ "$RARS_NPM_PROFILE" == "dev" ]]; then
+    echo "debug build; skipping wasm-opt"
+elif command -v wasm-opt >/dev/null 2>&1; then
     for dir in browser/wasm node/wasm; do
         # Exactly the features Rust's wasm32-unknown-unknown target emits.
         # Without them binaryen refuses to validate the module; with `-all`

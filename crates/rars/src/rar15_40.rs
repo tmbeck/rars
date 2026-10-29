@@ -2,15 +2,18 @@ use crate::codec::rar13::Reader15State;
 use crate::codec::rar20::Reader20State;
 use crate::codec::workspace::{Allowance, Budget, Buffer};
 use crate::crc32::{crc32, Crc32};
+#[cfg(feature = "encryption")]
 use crate::crypto::rar15::Rar15Cipher;
+#[cfg(feature = "encryption")]
 use crate::crypto::rar20::Rar20Cipher;
+#[cfg(feature = "encryption")]
 use crate::crypto::rar30::{Error as Rar30Error, Rar30Cipher};
 use crate::detect::{find_archive_start, ArchiveSignature, RAR15_SIGNATURE, SFX_SCAN_LIMIT};
 use crate::error::{Error, Result};
-use crate::features::FeatureSet;
-use crate::io_util::{align16 as checked_align16, read_exact_at, read_u16, read_u32};
+use crate::io_util::{read_exact_at, read_u32};
 pub(crate) use crate::source::ArchiveSource;
 use crate::version::ArchiveFamily;
+#[cfg(any(feature = "write", feature = "recovery"))]
 use crate::ArchiveVersion;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -18,23 +21,36 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
+pub use crate::filter::{FilterKind, FilterPolicy, FilterSpec};
+#[cfg(feature = "write")]
+pub use write::{FileEntry, Rar29Method, StoredEntry, StreamingEntry, WriterOptions};
+
 mod extract;
+#[cfg(feature = "write")]
+mod producer;
+#[cfg(feature = "write")]
 mod write;
+use crate::extraction_links::{check_legacy_size, emit_legacy_link, legacy_output, LegacyLink};
+#[cfg(feature = "write")]
 pub use crate::streaming::{EntrySource, WriterResources};
+#[cfg(feature = "write")]
 pub use crate::write_plan::MemberCoding;
 pub use extract::extract_volumes_to;
+pub(crate) use extract::extract_volumes_with_links;
 use extract::{DecoderSession, DecryptingReader, PackedReader};
+#[cfg(feature = "write")]
 pub(crate) use write::write_stored_volumes_with_progress;
+#[cfg(feature = "write")]
 pub(crate) use write::{
     write_archive_with_retained_metadata, RetainedFileEntry, RetainedMemberMetadata,
 };
+#[cfg(feature = "write")]
 pub use write::{
     write_compressed_archive, write_compressed_archive_with_comment,
     write_compressed_archive_with_comment_and_progress, write_compressed_volumes,
     write_compressed_volumes_with_progress, write_rar29_compressed_archive_with_filter_policy,
     write_rar29_compressed_archive_with_filter_policy_and_progress, write_stored_archive,
     write_stored_archive_with_comment, write_stored_volumes, write_streaming_archive_to,
-    FilterKind, FilterPolicy, FilterSpec,
 };
 
 const MARK_HEAD: u8 = 0x72;
@@ -204,157 +220,6 @@ pub enum NewSubKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct WriterOptions {
-    pub target: ArchiveVersion,
-    pub features: FeatureSet,
-    pub compression_level: Option<u8>,
-    pub dictionary_size: Option<usize>,
-    /// Which engine compresses a member. Only the RAR 2.9 family has more than
-    /// one, so the other targets ignore anything but the default.
-    pub method: Rar29Method,
-    /// Retained NewSub comment DOS timestamp and host ID.
-    pub(crate) archive_comment_metadata: Option<(u32, u8)>,
-}
-
-/// Which compression engine the RAR 2.9 family writer uses for a member.
-///
-/// PPMd is an alternative to LZ, not a filter, even though the writer used to
-/// carry it as one. Keeping the two apart is what lets a filter be chosen
-/// without also deciding the engine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[non_exhaustive]
-pub enum Rar29Method {
-    /// Let the content decide. Text-shaped members are measured against PPMd;
-    /// anything else goes straight to LZ, so a binary member never pays for a
-    /// PPMd encode it was always going to lose. Compression levels 1 to 4 skip
-    /// the trial entirely, since those settings are asking for speed.
-    #[default]
-    Auto,
-    Lz,
-    Ppmd,
-}
-
-impl WriterOptions {
-    pub const fn new(target: ArchiveVersion, features: FeatureSet) -> Self {
-        Self {
-            target,
-            features,
-            compression_level: None,
-            dictionary_size: None,
-            method: Rar29Method::Auto,
-            archive_comment_metadata: None,
-        }
-    }
-
-    pub const fn with_method(mut self, method: Rar29Method) -> Self {
-        self.method = method;
-        self
-    }
-
-    pub const fn with_compression_level(mut self, level: u8) -> Self {
-        self.compression_level = Some(level);
-        self
-    }
-
-    pub const fn with_dictionary_size(mut self, size: usize) -> Self {
-        self.dictionary_size = Some(size);
-        self
-    }
-}
-
-impl Default for WriterOptions {
-    fn default() -> Self {
-        Self {
-            target: ArchiveVersion::Rar15,
-            features: FeatureSet::store_only(),
-            compression_level: None,
-            dictionary_size: None,
-            method: Rar29Method::Auto,
-            archive_comment_metadata: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StoredEntry<'a> {
-    pub name: &'a [u8],
-    pub data: &'a [u8],
-    pub file_time: u32,
-    pub file_attr: u32,
-    pub host_os: u8,
-    pub password: Option<&'a [u8]>,
-    pub file_comment: Option<&'a [u8]>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileEntry<'a> {
-    pub name: &'a [u8],
-    pub data: &'a [u8],
-    pub file_time: u32,
-    pub file_attr: u32,
-    pub host_os: u8,
-    pub password: Option<&'a [u8]>,
-    pub file_comment: Option<&'a [u8]>,
-}
-
-/// One member of an archive written a member at a time.
-///
-/// The bytes are opened when the member is coded and dropped once it is
-/// written, so an archive of many files never holds more than the members
-/// being worked on. A stored member is copied straight from its source and
-/// never lands on the heap at all.
-#[derive(Debug, Clone)]
-pub struct StreamingEntry {
-    pub name: Vec<u8>,
-    pub source: EntrySource,
-    pub file_time: u32,
-    pub file_attr: u32,
-    pub host_os: u8,
-    pub password: Option<Vec<u8>>,
-    pub file_comment: Option<Vec<u8>>,
-}
-
-impl StreamingEntry {
-    pub fn new(name: impl Into<Vec<u8>>, source: EntrySource) -> Self {
-        Self {
-            name: name.into(),
-            source,
-            file_time: 0,
-            file_attr: 0,
-            host_os: 3,
-            password: None,
-            file_comment: None,
-        }
-    }
-
-    pub fn with_file_time(mut self, file_time: u32) -> Self {
-        self.file_time = file_time;
-        self
-    }
-
-    pub fn with_file_attr(mut self, file_attr: u32) -> Self {
-        self.file_attr = file_attr;
-        self
-    }
-
-    pub fn with_host_os(mut self, host_os: u8) -> Self {
-        self.host_os = host_os;
-        self
-    }
-
-    pub fn with_password(mut self, password: impl Into<Vec<u8>>) -> Self {
-        self.password = Some(password.into());
-        self
-    }
-
-    pub fn with_file_comment(mut self, comment: impl Into<Vec<u8>>) -> Self {
-        self.file_comment = Some(comment.into());
-        self
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DosTime {
     pub dos: u32,
     pub refinement: crate::TimeRefinement,
@@ -377,12 +242,16 @@ pub(crate) fn ext_times(ext_time: &[u8], file_time: u32) -> [Option<DosTime>; 4]
         let dos = if i == 0 {
             file_time
         } else {
-            let Some(bytes) = ext_time.get(pos..pos + 4) else { break };
+            let Some(bytes) = ext_time.get(pos..pos + 4) else {
+                break;
+            };
             pos += 4;
             u32::from_le_bytes(bytes.try_into().ok().unwrap())
         };
         let count = usize::from(rmode & 0x3);
-        let Some(fraction) = ext_time.get(pos..pos + count) else { break };
+        let Some(fraction) = ext_time.get(pos..pos + count) else {
+            break;
+        };
         pos += count;
         let mut ticks = 0u32;
         for &byte in fraction {
@@ -398,7 +267,6 @@ pub(crate) fn ext_times(ext_time: &[u8], file_time: u32) -> [Option<DosTime>; 4]
     }
     out
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ExtractedEntryMeta {
@@ -476,10 +344,8 @@ impl FileHeader {
         }
         let head_size = block.head_size as usize;
         let header = parse_comment_header(&self.file_comment, block)?;
-        let packed = self
-            .file_comment
-            .get(COMMENT_HEADER_SIZE..head_size)
-            .ok_or(Error::TooShort)?;
+        // Block admission bounded head_size; comment admission requires >=13.
+        let packed = &self.file_comment[COMMENT_HEADER_SIZE..head_size];
         header.decode(packed).map(Some)
     }
 
@@ -505,6 +371,7 @@ impl FileHeader {
         if !self.is_encrypted() {
             return Ok(PackedReader::Plain(reader));
         }
+        crate::crypto::require_encryption()?;
         let Some(password) = password else {
             return Err(Error::NeedPassword);
         };
@@ -567,7 +434,8 @@ impl FileHeader {
         const ADD_SECOND: u8 = 0x4;
         const TICK_NANOSECONDS: u32 = 100;
 
-        let flags = u16::from_le_bytes(self.ext_time.get(..2)?.try_into().ok()?);
+        let flag_bytes = self.ext_time.get(..2)?;
+        let flags = u16::from_le_bytes([flag_bytes[0], flag_bytes[1]]);
         let rmode = ((flags >> 12) & 0xf) as u8;
         if rmode & PRESENT == 0 {
             return None;
@@ -687,7 +555,8 @@ impl FileHeader {
             return error;
         }
         match error {
-            Error::NeedPassword
+            Error::FeatureDisabled { .. }
+            | Error::NeedPassword
             | Error::UnsupportedSignature
             | Error::UnsupportedVersion(_)
             | Error::UnsupportedFeature { .. }
@@ -760,7 +629,6 @@ impl FileHeader {
             ))
         }
     }
-
 }
 
 impl NewSubHeader {
@@ -777,6 +645,7 @@ impl NewSubHeader {
 }
 
 impl CommentHeader {
+    #[cfg(feature = "write")]
     fn supports_rewrite(&self) -> bool {
         self.block.head_type == COMM_HEAD
             && self.block.flags == 0
@@ -975,10 +844,9 @@ impl Archive {
         let archive = &input[sig.offset..];
         // find_archive_start matched these exact marker bytes, including the
         // fixed MARK_HEAD type and seven-byte header length.
-        let marker = parse_block_header(archive, 0)?;
-
-        admit_plain_header(archive, marker.head_size as usize, &mut budget)?;
-        let main_block = parse_block_header(archive, marker.head_size as usize)?;
+        let marker_size = RAR15_SIGNATURE.len();
+        admit_plain_header(archive, marker_size, &mut budget)?;
+        let main_block = parse_block_header(archive, marker_size)?;
         if main_block.head_type != MAIN_HEAD {
             return Err(Error::InvalidHeader("RAR 1.5 main header is missing"));
         }
@@ -999,6 +867,7 @@ impl Archive {
                 break;
             }
             let (block, header, total) = if main.has_encrypted_headers() {
+                crate::crypto::require_encryption()?;
                 let password = password.ok_or(Error::NeedPassword)?;
                 let encrypted = decrypt_encrypted_header_at(
                     archive,
@@ -1021,8 +890,7 @@ impl Archive {
                     let total = file_block_total_size(&block, total, file.pack_size)?;
                     let next = checked_block_next(&block, total, archive.len())?;
                     file.block.offset = block.offset;
-                    file.packed_range =
-                        packed_range(sig.offset, block.offset, total, file.pack_size)?;
+                    file.packed_range = packed_range(sig.offset, next, file.pack_size);
                     blocks.push(Block::File(file));
                     pos = next;
                 }
@@ -1031,8 +899,7 @@ impl Archive {
                     let total = file_block_total_size(&block, total, file.pack_size)?;
                     let next = checked_block_next(&block, total, archive.len())?;
                     file.block.offset = block.offset;
-                    file.packed_range =
-                        packed_range(sig.offset, block.offset, total, file.pack_size)?;
+                    file.packed_range = packed_range(sig.offset, next, file.pack_size);
                     let kind = classify_new_sub(&file.name);
                     blocks.push(Block::NewSub(NewSubHeader { file, kind }));
                     pos = next;
@@ -1101,13 +968,19 @@ impl Archive {
         if main_block.head_type != MAIN_HEAD {
             return Err(Error::InvalidHeader("RAR 1.5 main header is missing"));
         }
+        // File lengths are u64, so even a complete header can cross usize on 32-bit hosts.
+        let mut pos = checked_file_block_next(
+            sfx_offset,
+            &main_block,
+            usize::from(main_block.head_size),
+            file_len,
+        )?;
         let main_header = read_exact_at(
             &mut file,
             sfx_offset + main_block.offset,
             main_block.head_size as usize,
         )?;
         let main = parse_main_header(&main_header, &relative_block(&main_block))?;
-        let mut pos = main_block.offset + main_block.head_size as usize;
         let mut blocks = Vec::new();
         if let Some(comment) =
             nested_main_comment(&main_header, &main_block, sfx_offset + main_block.offset)?
@@ -1118,6 +991,7 @@ impl Archive {
 
         while file_len.saturating_sub((sfx_offset + pos) as u64) >= 7 {
             let (block, header, total) = if main.has_encrypted_headers() {
+                crate::crypto::require_encryption()?;
                 let password = password.ok_or(Error::NeedPassword)?;
                 let encrypted = read_encrypted_header_at(
                     &mut file,
@@ -1144,7 +1018,7 @@ impl Archive {
                     let next = checked_file_block_next(sfx_offset, &block, total, file_len)?;
                     file_header.block.offset = block.offset;
                     file_header.packed_range =
-                        packed_range(sfx_offset, block.offset, total, file_header.pack_size)?;
+                        packed_range(sfx_offset, next, file_header.pack_size);
                     blocks.push(Block::File(file_header));
                     pos = next;
                 }
@@ -1155,7 +1029,7 @@ impl Archive {
                     let next = checked_file_block_next(sfx_offset, &block, total, file_len)?;
                     file_header.block.offset = block.offset;
                     file_header.packed_range =
-                        packed_range(sfx_offset, block.offset, total, file_header.pack_size)?;
+                        packed_range(sfx_offset, next, file_header.pack_size);
                     let kind = classify_new_sub(&file_header.name);
                     blocks.push(Block::NewSub(NewSubHeader {
                         file: file_header,
@@ -1202,7 +1076,9 @@ impl Archive {
     }
 
     /// The highest format requirement present in this container, not its creator release.
+    #[cfg(feature = "write")]
     pub(crate) fn preservation_version(&self) -> ArchiveVersion {
+        // Producer records declare their own minimum unpacker version.
         if self.main.has_encrypted_headers()
             || self
                 .new_subs()
@@ -1210,7 +1086,19 @@ impl Archive {
         {
             ArchiveVersion::Rar30
         } else {
-            match self.files().map(|file| file.unp_ver).max().unwrap_or(15) {
+            let producer_version = self
+                .new_subs()
+                .filter(|sub| sub.file.name == crate::producer::NAME)
+                .map(|sub| sub.file.unp_ver)
+                .max()
+                .unwrap_or(15);
+            match self
+                .files()
+                .map(|file| file.unp_ver)
+                .max()
+                .unwrap_or(15)
+                .max(producer_version)
+            {
                 29.. => ArchiveVersion::Rar29,
                 20..=28 => ArchiveVersion::Rar20,
                 _ => ArchiveVersion::Rar15,
@@ -1219,6 +1107,7 @@ impl Archive {
     }
 
     /// Native metadata checks for the supported RAR 1.5–4.x rewrite subsets.
+    #[cfg(feature = "write")]
     pub(crate) fn rewrite_preservation_issues(&self) -> Vec<String> {
         let mut issues = Vec::new();
         if self.main.is_volume() {
@@ -1297,8 +1186,9 @@ impl Archive {
                     ));
                 }
             }
-            if file.is_directory() && (file.pack_size != 0 || file.unp_size != 0 || file.is_solid())
-            {
+            // FHD_SOLID on a directory only says the run goes on past it, as
+            // RAR itself writes it; a directory with data cannot be kept.
+            if file.is_directory() && (file.pack_size != 0 || file.unp_size != 0) {
                 issues.push(format!(
                     "{label}: unsupported legacy directory payload or compression"
                 ));
@@ -1347,6 +1237,7 @@ impl Archive {
         }
         let mut archive_comments = 0;
         let mut seen_file = false;
+        let mut producer_seen = false;
         for block in &self.blocks {
             match block {
                 Block::File(_) => seen_file = true,
@@ -1358,6 +1249,16 @@ impl Archive {
                             "legacy archive comment location or metadata is unsupported".into(),
                         );
                     }
+                }
+                Block::NewSub(sub) if sub.file.name == crate::producer::NAME => {
+                    if producer_seen
+                        || seen_file
+                        || !matches!(&sub.kind, NewSubKind::Unknown(name) if name == crate::producer::NAME)
+                        || !producer::is_replaceable(&sub.file, self)
+                    {
+                        issues.push("unsupported legacy producer service".into());
+                    }
+                    producer_seen = true;
                 }
                 Block::NewSub(sub) if sub.kind == NewSubKind::ArchiveComment => {
                     archive_comments += 1;
@@ -1448,6 +1349,7 @@ impl Archive {
         })
     }
 
+    #[cfg(feature = "recovery")]
     fn source_bytes(&self) -> Result<Vec<u8>> {
         self.source.bytes()
     }
@@ -1466,34 +1368,49 @@ impl Archive {
         &self,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<crate::RecoveryRepairResult> {
-        options.check_cancelled()?;
-        let control = crate::read_control::ReadControl::new(options.cancellation);
-        let (data, data_repaired) = if let Some(recovery) = self
-            .new_subs()
-            .find(|sub| sub.kind == NewSubKind::RecoveryRecord)
+        #[cfg(not(feature = "recovery"))]
         {
-            repair_newsub_recovery_bytes(
-                &self.source_bytes()?,
-                self.sfx_offset,
-                self,
-                recovery,
-                &control,
-            )?
-        } else {
-            let protect = self.protect_records().next().ok_or(Error::InvalidHeader(
-                "RAR 2.x archive does not contain a PROTECT_HEAD recovery record",
-            ))?;
-            repair_protect_head_bytes(&self.source_bytes()?, self.sfx_offset, protect, &control)?
-        };
-        control.check()?;
-        Ok(crate::RecoveryRepairResult {
-            data,
-            report: crate::RecoveryRepairReport {
-                changed: data_repaired,
-                data_repaired,
-                ..Default::default()
-            },
-        })
+            let _ = (self, options);
+            Err(Error::FeatureDisabled {
+                feature: "recovery",
+            })
+        }
+        #[cfg(feature = "recovery")]
+        {
+            options.check_cancelled()?;
+            let control = crate::read_control::ReadControl::new(options.cancellation);
+            let (data, data_repaired) = if let Some(recovery) = self
+                .new_subs()
+                .find(|sub| sub.kind == NewSubKind::RecoveryRecord)
+            {
+                repair_newsub_recovery_bytes(
+                    &self.source_bytes()?,
+                    self.sfx_offset,
+                    self,
+                    recovery,
+                    &control,
+                )?
+            } else {
+                let protect = self.protect_records().next().ok_or(Error::InvalidHeader(
+                    "RAR 2.x archive does not contain a PROTECT_HEAD recovery record",
+                ))?;
+                repair_protect_head_bytes(
+                    &self.source_bytes()?,
+                    self.sfx_offset,
+                    protect,
+                    &control,
+                )?
+            };
+            control.check()?;
+            Ok(crate::RecoveryRepairResult {
+                data,
+                report: crate::RecoveryRepairReport {
+                    changed: data_repaired,
+                    data_repaired,
+                    ..Default::default()
+                },
+            })
+        }
     }
 
     /// Streams extracted entries to caller-provided writers.
@@ -1501,7 +1418,7 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
-        self.extract_impl(options, &mut open, None, None)
+        self.extract_impl(options, &mut open, None, None, None)
             .map(|_| ())
     }
 
@@ -1516,6 +1433,7 @@ impl Archive {
             &mut |_| unreachable!("controlled selection supplies writer"),
             Some(selector),
             on_error,
+            None,
         )
     }
 
@@ -1525,6 +1443,7 @@ impl Archive {
         open: &mut F,
         selector: Option<&mut crate::extraction_control::Selector<'_>>,
         on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
+        links: Option<&mut LegacyLink<'_>>,
     ) -> Result<crate::ExtractionOutcome>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -1535,6 +1454,7 @@ impl Archive {
                 open,
                 selector,
                 on_error,
+                links,
                 &crate::codec::workspace::Allowance::limited(limit),
             );
         }
@@ -1543,6 +1463,7 @@ impl Archive {
             open,
             selector,
             on_error,
+            links,
             &crate::codec::workspace::Allowance::default(),
         )
     }
@@ -1553,11 +1474,13 @@ impl Archive {
         open: &mut F,
         mut selector: Option<&mut crate::extraction_control::Selector<'_>>,
         mut on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
+        mut links: Option<&mut LegacyLink<'_>>,
         allowance: &B,
     ) -> Result<crate::ExtractionOutcome>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        debug_assert!(links.is_none() || selector.is_none());
         options.check_cancelled()?;
         let password = options.password;
         let mut budget = crate::output_limit::OutputBudget::new(options);
@@ -1599,22 +1522,36 @@ impl Archive {
                 }
                 budget.check(file.unp_size, &file.name)?;
                 options.check_cancelled()?;
-                let mut writer = match selected_writer.take() {
-                    Some(writer) => writer,
-                    None => open(&meta)?,
-                };
-                options.check_cancelled()?;
-                budget.run(&file.name, &mut writer, |mut writer| {
-                    if file.is_stored() {
-                        file.write_stored_with_allowance(self, password, &mut writer, allowance)
-                            .map_err(|error| file.entry_error("extracting", error))?;
-                    } else {
-                        session
-                            .write_file_to(self, file, &mut writer)
-                            .map_err(|error| file.entry_error("extracting", error))?;
-                    }
-                    Ok(())
-                })?;
+                check_legacy_size(&meta, file.unp_size, links.is_some())?;
+                let control = budget.control.clone();
+                legacy_output(
+                    &meta,
+                    allowance,
+                    &control,
+                    &mut links,
+                    || match selected_writer.take() {
+                        Some(writer) => Ok(writer),
+                        None => open(&meta),
+                    },
+                    |writer| {
+                        budget.run(&file.name, writer, |mut writer| {
+                            if file.is_stored() {
+                                file.write_stored_with_allowance(
+                                    self,
+                                    password,
+                                    &mut writer,
+                                    allowance,
+                                )
+                                .map_err(|error| file.entry_error("extracting", error))?;
+                            } else {
+                                session
+                                    .write_file_to(self, file, &mut writer)
+                                    .map_err(|error| file.entry_error("extracting", error))?;
+                            }
+                            Ok(())
+                        })
+                    },
+                )?;
                 Ok(())
             })();
             if crate::extraction_control::finish_member(
@@ -1640,7 +1577,19 @@ impl Archive {
     pub fn extract_to_parallel_buffered<F>(
         &self,
         options: crate::ArchiveReadOptions<'_>,
+        open: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    {
+        self.extract_parallel_with_links(options, open, None)
+    }
+
+    pub(crate) fn extract_parallel_with_links<F>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
         mut open: F,
+        mut links: Option<&mut LegacyLink<'_>>,
     ) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -1653,9 +1602,12 @@ impl Archive {
                 .files()
                 .any(|file| file.is_solid() || file.is_split_before() || file.is_split_after())
         {
-            return self.extract_to(options, open);
+            return self
+                .extract_impl(options, &mut open, None, None, links)
+                .map(|_| ());
         }
 
+        let emit_links = links.is_some();
         if let Some(limit) = options.max_reader_workspace_bytes {
             let ledger = Allowance::limited(limit);
             let publication = crate::read_control::ReadControl::new(options.cancellation);
@@ -1676,9 +1628,9 @@ impl Archive {
                 },
                 |file, local| {
                     options.check_cancelled()?;
-                    decode_parallel_entry_with_allowance(self, file, options, local)
+                    decode_parallel_entry_with_allowance(self, file, options, local, emit_links)
                 },
-                |entry| write_parallel_entry(entry, &mut open, &publication),
+                |entry| write_parallel_entry(entry, &mut open, &publication, &mut links),
             );
         }
 
@@ -1688,11 +1640,15 @@ impl Archive {
         while files.peek().is_some() {
             options.check_cancelled()?;
             let batch = files.by_ref().take(window).collect();
-            let entries = crate::parallel::map_collect(batch, |file| {
-                decode_parallel_entry(self, file, options)
-            })?;
+            // Write the verified members ahead of a failure before reporting it.
+            let (entries, failure) = crate::parallel::map_prefix(batch, |file| {
+                decode_parallel_entry(self, file, options, emit_links)
+            });
             for entry in entries {
-                write_parallel_entry(entry, &mut open, &publication)?;
+                write_parallel_entry(entry, &mut open, &publication, &mut links)?;
+            }
+            if let Some(error) = failure {
+                return Err(error);
             }
         }
         options.check_cancelled()?;
@@ -1771,8 +1727,9 @@ fn decode_parallel_entry(
     archive: &Archive,
     file: &FileHeader,
     options: crate::ArchiveReadOptions<'_>,
+    links: bool,
 ) -> Result<ParallelExtractedEntry> {
-    decode_parallel_entry_with_allowance(archive, file, options, &Allowance::default())
+    decode_parallel_entry_with_allowance(archive, file, options, &Allowance::default(), links)
 }
 
 enum ParallelExtractedEntry<B: Budget = Allowance> {
@@ -1788,6 +1745,7 @@ fn decode_parallel_entry_with_allowance<B: Budget>(
     file: &FileHeader,
     options: crate::ArchiveReadOptions<'_>,
     allowance: &B,
+    links: bool,
 ) -> Result<ParallelExtractedEntry<B>> {
     options.check_cancelled()?;
     let password = options.password;
@@ -1798,6 +1756,7 @@ fn decode_parallel_entry_with_allowance<B: Budget>(
         return Ok(ParallelExtractedEntry::Directory(meta));
     }
     budget.check(file.unp_size, &file.name)?;
+    check_legacy_size(&meta, file.unp_size, links)?;
     let mut data = Buffer::new(allowance);
     let control = budget.control.clone();
     budget.run(&file.name, &mut data, |mut data| {
@@ -1821,6 +1780,7 @@ fn write_parallel_entry<F, B: Budget>(
     entry: ParallelExtractedEntry<B>,
     open: &mut F,
     control: &crate::read_control::ReadControl,
+    links: &mut Option<&mut LegacyLink<'_>>,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -1831,6 +1791,9 @@ where
             let _ = open(&meta)?;
         }
         ParallelExtractedEntry::File { meta, data } => {
+            if emit_legacy_link(&meta, &data, links, control)? {
+                return Ok(());
+            }
             let mut writer = open(&meta)?;
             control.check()?;
             control
@@ -1855,7 +1818,9 @@ fn link_owners(blocks: &mut [Block]) {
     for index in 0..blocks.len() {
         match &blocks[index] {
             Block::File(_) => last_file = Some(index),
-            Block::NewSub(sub) if matches!(sub.kind, NewSubKind::Unknown(_)) && sub.file.name == b"UOW" => {
+            Block::NewSub(sub)
+                if matches!(sub.kind, NewSubKind::Unknown(_)) && sub.file.name == b"UOW" =>
+            {
                 let Some(nul) = sub.file.sub_data.iter().position(|&b| b == 0) else {
                     continue;
                 };
@@ -1883,6 +1848,7 @@ fn parse_main_header(input: &[u8], block: &BlockHeader) -> Result<MainHeader> {
     let start = block.offset;
     let head_end = start + block.head_size as usize;
     // Both callers have already read and validated this entire block.
+    let fixed = &input[start + 7..start + 13];
 
     let encrypt_version = if block.flags & MHD_ENCRYPTVER != 0 {
         Some(
@@ -1899,8 +1865,8 @@ fn parse_main_header(input: &[u8], block: &BlockHeader) -> Result<MainHeader> {
         head_crc: block.head_crc,
         flags: block.flags,
         head_size: block.head_size,
-        reserved1: read_u16(input, start + 7)?,
-        reserved2: read_u32(input, start + 9)?,
+        reserved1: u16::from_le_bytes([fixed[0], fixed[1]]),
+        reserved2: u32::from_le_bytes([fixed[2], fixed[3], fixed[4], fixed[5]]),
         encrypt_version,
     })
 }
@@ -1910,12 +1876,14 @@ fn parse_comment_header(input: &[u8], block: BlockHeader) -> Result<CommentHeade
         return Err(Error::InvalidHeader("RAR 1.5 comment header is too short"));
     }
     let start = block.offset;
+    // Callers admitted the complete block before its fixed fields are decoded.
+    let fixed = &input[start + 7..start + 13];
     Ok(CommentHeader {
         block,
-        unp_size: read_u16(input, start + 7)?,
-        unp_ver: *input.get(start + 9).ok_or(Error::TooShort)?,
-        method: *input.get(start + 10).ok_or(Error::TooShort)?,
-        comment_crc: read_u16(input, start + 11)?,
+        unp_size: u16::from_le_bytes([fixed[0], fixed[1]]),
+        unp_ver: fixed[2],
+        method: fixed[3],
+        comment_crc: u16::from_le_bytes([fixed[4], fixed[5]]),
         packed_range: 0..0,
     })
 }
@@ -1929,11 +1897,10 @@ fn comment_block_end(input: &[u8], start: usize, head_end: usize) -> Option<usiz
     if start + COMMENT_HEADER_SIZE > head_end {
         return None;
     }
-    let head_size = read_u16(input, start + 5).ok()? as usize;
-    let end = start.checked_add(head_size)?;
-    (input.get(start + 2) == Some(&COMM_HEAD)
-        && head_size >= COMMENT_HEADER_SIZE
-        && end <= head_end)
+    // Callers supply a complete u16-sized header and an in-header position.
+    let head_size = u16::from_le_bytes([input[start + 5], input[start + 6]]) as usize;
+    let end = start + head_size;
+    (input[start + 2] == COMM_HEAD && head_size >= COMMENT_HEADER_SIZE && end <= head_end)
         .then_some(end)
 }
 
@@ -1977,8 +1944,10 @@ fn parse_protect_header(
     let add_size = block.add_size.ok_or(Error::InvalidHeader(
         "RAR 2.x recovery header is missing data size",
     ))?;
-    let rec_sectors = read_u16(input, 12)?;
-    let total_blocks = read_u32(input, 14)?;
+    // The parser admitted the complete 26-byte block before dispatching here.
+    let fixed = &input[..26];
+    let rec_sectors = u16::from_le_bytes([fixed[12], fixed[13]]);
+    let total_blocks = u32::from_le_bytes([fixed[14], fixed[15], fixed[16], fixed[17]]);
     // These wire fields are u32 and u16; their maximum sum fits in u64.
     let expected_add_size = u64::from(total_blocks) * 2 + u64::from(rec_sectors) * 512;
     if add_size != expected_add_size {
@@ -1986,26 +1955,13 @@ fn parse_protect_header(
             "RAR 2.x recovery data size does not match header",
         ));
     }
-    let mark: [u8; 8] = input
-        .get(18..26)
-        .ok_or(Error::TooShort)?
-        .try_into()
-        .expect("RAR protect mark size");
-    let data_start = archive_offset
-        .checked_add(block.offset)
-        .and_then(|offset| offset.checked_add(block.head_size as usize))
-        .ok_or(Error::InvalidHeader(
-            "RAR 2.x recovery data range overflows",
-        ))?;
-    let data_end = archive_offset
-        .checked_add(block.offset)
-        .and_then(|offset| offset.checked_add(total_size))
-        .ok_or(Error::InvalidHeader(
-            "RAR 2.x recovery data range overflows",
-        ))?;
+    let mark: [u8; 8] = fixed[18..26].try_into().expect("RAR protect mark size");
+    // Both parser callers admitted this entire block's absolute next offset.
+    let data_start = archive_offset + block.offset + usize::from(block.head_size);
+    let data_end = archive_offset + block.offset + total_size;
     Ok(ProtectHeader {
         block: block.clone(),
-        version: *input.get(11).ok_or(Error::TooShort)?,
+        version: fixed[11],
         rec_sectors,
         total_blocks,
         mark,
@@ -2014,6 +1970,7 @@ fn parse_protect_header(
 }
 
 /// Repaired bytes plus whether any sector was actually rebuilt.
+#[cfg(feature = "recovery")]
 fn repair_protect_head_bytes(
     source: &[u8],
     sfx_offset: usize,
@@ -2030,8 +1987,8 @@ fn repair_protect_head_bytes(
         return Err(Error::InvalidHeader("RAR 2.x recovery mark is invalid"));
     }
     let protected_start = sfx_offset;
-    let declared_blocks = usize::try_from(protect.total_blocks)
-        .map_err(|_| Error::InvalidHeader("RAR 2.x protected sector size overflows"))?;
+    // A u32 count fits the supported 32/64-bit host address sizes.
+    let declared_blocks = protect.total_blocks as usize;
     let protected_len = declared_blocks
         .checked_mul(512)
         .ok_or(Error::InvalidHeader(
@@ -2052,12 +2009,8 @@ fn repair_protect_head_bytes(
         .ok_or(Error::TooShort)?;
     // The successful 512-byte sector calculation also bounds two-byte tags.
     let tag_len = declared_blocks * 2;
-    let parity_len =
-        usize::from(protect.rec_sectors)
-            .checked_mul(512)
-            .ok_or(Error::InvalidHeader(
-                "RAR 2.x recovery parity size overflows",
-            ))?;
+    // A u16 sector count needs at most 33553920 parity bytes on either host.
+    let parity_len = usize::from(protect.rec_sectors) * 512;
     if recovery_data.len() != tag_len + parity_len {
         return Err(Error::InvalidHeader(
             "RAR 2.x recovery data size is invalid",
@@ -2076,7 +2029,7 @@ fn repair_protect_head_bytes(
         let sector_start = protected_start + index * 512;
         let sector = &source[sector_start..sector_start + 512];
         let actual = (!crc32(sector) & 0xffff) as u16;
-        let expected = read_u16(tags, index * 2)?;
+        let expected = u16::from_le_bytes([tags[index * 2], tags[index * 2 + 1]]);
         if actual != expected {
             damaged.push(index);
         }
@@ -2136,6 +2089,7 @@ fn repair_protect_head_bytes(
 }
 
 /// Repaired bytes plus whether any sector was actually rebuilt.
+#[cfg(feature = "recovery")]
 fn repair_newsub_recovery_bytes(
     source: &[u8],
     sfx_offset: usize,
@@ -2159,7 +2113,7 @@ fn repair_newsub_recovery_bytes(
             .ok_or(Error::InvalidHeader(
                 "RAR 3.x recovery protected range overflows",
             ))?;
-    if protected_end > source.len() || protected_start > protected_end {
+    if protected_end > source.len() {
         return Err(Error::InvalidHeader(
             "RAR 3.x recovery protected range is invalid",
         ));
@@ -2171,9 +2125,8 @@ fn repair_newsub_recovery_bytes(
             "RAR 3.x recovery record has no protected sectors",
         ));
     }
-    let tag_len = protected_sectors
-        .checked_mul(2)
-        .ok_or(Error::InvalidHeader("RAR 3.x recovery tag size overflows"))?;
+    // Sector count is ceil(an already-admitted physical extent / 512).
+    let tag_len = protected_sectors * 2;
     if recovery_data.len() <= tag_len || !(recovery_data.len() - tag_len).is_multiple_of(512) {
         return Err(Error::InvalidHeader(
             "RAR 3.x recovery data size is invalid",
@@ -2188,7 +2141,7 @@ fn repair_newsub_recovery_bytes(
         control.check()?;
         let sector = protected_sector(source, protected_start, protected_len, index);
         let actual = (!crc32(&sector) & 0xffff) as u16;
-        let expected = read_u16(tags, index * 2)?;
+        let expected = u16::from_le_bytes([tags[index * 2], tags[index * 2 + 1]]);
         if actual != expected {
             damaged.push(index);
         }
@@ -2247,6 +2200,7 @@ fn repair_newsub_recovery_bytes(
     Ok((repaired, true))
 }
 
+#[cfg(feature = "recovery")]
 fn newsub_recovery_data(
     archive: &Archive,
     recovery: &NewSubHeader,
@@ -2271,6 +2225,7 @@ fn newsub_recovery_data(
     control.finish(session.decode_file_data(archive, &recovery.file))
 }
 
+#[cfg(feature = "recovery")]
 fn protected_sector(
     source: &[u8],
     protected_start: usize,
@@ -2297,42 +2252,49 @@ pub fn repair_rev3_volumes_to<F>(
 where
     F: FnMut(usize, &[u8]) -> Result<()>,
 {
-    for (index, bytes) in crate::recovery::rar3::reconstruct_data_volumes(
-        data_volumes,
-        recovery_count,
-        recovery_volumes,
-    )
-    .map_err(Error::from)?
-    .into_iter()
-    .enumerate()
+    #[cfg(not(feature = "recovery"))]
     {
-        let bytes = truncate_repaired_rev3_volume(bytes)?;
-        write(index, &bytes)?;
+        let _ = (data_volumes, recovery_volumes, recovery_count, &mut write);
+        Err(Error::FeatureDisabled {
+            feature: "recovery",
+        })
     }
-    Ok(())
+    #[cfg(feature = "recovery")]
+    {
+        for (index, bytes) in crate::recovery::rar3::reconstruct_data_volumes(
+            data_volumes,
+            recovery_count,
+            recovery_volumes,
+        )
+        .map_err(Error::from)?
+        .into_iter()
+        .enumerate()
+        {
+            let bytes = truncate_repaired_rev3_volume(bytes);
+            write(index, &bytes)?;
+        }
+        Ok(())
+    }
 }
 
-fn truncate_repaired_rev3_volume(mut bytes: Vec<u8>) -> Result<Vec<u8>> {
+#[cfg(feature = "recovery")]
+fn truncate_repaired_rev3_volume(mut bytes: Vec<u8>) -> Vec<u8> {
     let Ok(archive) = Archive::parse(&bytes) else {
-        return Ok(bytes);
+        return bytes;
     };
     let Some(end) = archive.blocks.iter().find_map(|block| match block {
         Block::End(end) => Some(end),
         _ => None,
     }) else {
-        return Ok(bytes);
+        return bytes;
     };
-    let end_pos = archive
-        .sfx_offset
-        .checked_add(end.offset)
-        .and_then(|offset| offset.checked_add(block_total_size(end).ok()?))
-        .ok_or(Error::InvalidHeader(
-            "RAR 3 repaired volume end offset overflows",
-        ))?;
+    // Successful parsing admitted this end block and its full physical extent.
+    let end_size = (u64::from(end.head_size) + end.add_size.unwrap_or(0)) as usize;
+    let end_pos = archive.sfx_offset + end.offset + end_size;
     if end_pos < bytes.len() && bytes[end_pos..].iter().all(|&byte| byte == 0) {
         bytes.truncate(end_pos);
     }
-    Ok(bytes)
+    bytes
 }
 
 struct EncryptedHeader {
@@ -2343,10 +2305,13 @@ struct EncryptedHeader {
 
 #[derive(Default)]
 struct EncryptedHeaderCipherCache {
+    #[cfg(feature = "encryption")]
     salt: Option<[u8; 8]>,
+    #[cfg(feature = "encryption")]
     cipher: Option<Rar30Cipher>,
 }
 
+#[cfg(feature = "encryption")]
 impl EncryptedHeaderCipherCache {
     fn cipher(&mut self, password: &[u8], salt: [u8; 8]) -> Result<Rar30Cipher> {
         if self.salt != Some(salt) {
@@ -2362,6 +2327,7 @@ impl EncryptedHeaderCipherCache {
     }
 }
 
+#[cfg(feature = "encryption")]
 fn map_rar30_crypto_error(error: Rar30Error) -> Error {
     Error::from(error)
 }
@@ -2373,56 +2339,62 @@ fn decrypt_encrypted_header_at(
     cipher_cache: &mut EncryptedHeaderCipherCache,
     budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<EncryptedHeader> {
-    let salt = read_header_salt(archive, offset)?;
-    let first_ciphertext = archive
-        .get(offset + 8..offset + 24)
-        .ok_or(Error::TooShort)?;
-    budget.check_count(offset)?;
-    let mut cipher = cipher_cache.cipher(password, salt)?;
-    let mut first_block = [0u8; 16];
-    first_block.copy_from_slice(first_ciphertext);
-    cipher
-        .decrypt_in_place(&mut first_block)
-        .map_err(map_rar30_crypto_error)?;
-    let head_size = read_u16(&first_block, 5)? as usize;
-    if head_size < 7 {
-        return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = (archive, offset, password, cipher_cache, budget);
+        Err(Error::FeatureDisabled {
+            feature: "encryption",
+        })
     }
-    let encrypted_header_size = checked_align16(head_size, "RAR 1.5 block size overflows usize")?;
-    let encrypted_start = offset
-        .checked_add(8)
-        .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
-    let encrypted_end = encrypted_start
-        .checked_add(encrypted_header_size)
-        .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
-    if encrypted_end > archive.len() {
-        return Err(Error::TooShort);
-    }
-    budget.admit(head_size, offset)?;
-    let encrypted_rest = archive
-        .get(offset + 24..encrypted_end)
-        .ok_or(Error::TooShort)?;
-    let mut header = Vec::with_capacity(encrypted_header_size);
-    header.extend_from_slice(&first_block);
-    header.extend_from_slice(encrypted_rest);
-    cipher
-        .decrypt_in_place(&mut header[16..])
-        .map_err(map_rar30_crypto_error)?;
-    header.truncate(head_size);
+    #[cfg(feature = "encryption")]
+    {
+        let salt = read_header_salt(archive, offset)?;
+        let first_ciphertext = archive
+            .get(offset + 8..offset + 24)
+            .ok_or(Error::TooShort)?;
+        budget.check_count(offset)?;
+        let mut cipher = cipher_cache.cipher(password, salt)?;
+        let mut first_block = [0u8; 16];
+        first_block.copy_from_slice(first_ciphertext);
+        cipher.decrypt_block(&mut first_block);
+        let head_size = u16::from_le_bytes([first_block[5], first_block[6]]) as usize;
+        if head_size < 7 {
+            return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
+        }
+        // A u16 wire length rounds to at most 65536, including on 32-bit hosts.
+        let encrypted_header_size = head_size.next_multiple_of(16);
+        // offset is within a physical slice (at most isize::MAX); this u16 wire
+        // length adds at most 65544, which fits usize on both supported widths.
+        let encrypted_end = offset + 8 + encrypted_header_size;
+        if encrypted_end > archive.len() {
+            return Err(Error::TooShort);
+        }
+        budget.admit(head_size, offset)?;
+        // The first 24 bytes and the rounded header end were admitted above.
+        let encrypted_rest = &archive[offset + 24..encrypted_end];
+        let mut header = Vec::with_capacity(encrypted_header_size);
+        header.extend_from_slice(&first_block);
+        header.extend_from_slice(encrypted_rest);
+        // The rounded header minus its first block is a whole number of AES blocks.
+        for block in header[16..].as_chunks_mut::<16>().0.iter_mut() {
+            cipher.decrypt_block(block);
+        }
+        header.truncate(head_size);
 
-    let mut block = parse_block_header(&header, 0)?;
-    block.offset = offset;
-    let payload_size = usize::try_from(block.add_size.unwrap_or(0))
-        .map_err(|_| Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
-    let total_size = 8usize
-        .checked_add(encrypted_header_size)
-        .and_then(|size| size.checked_add(payload_size))
-        .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
-    Ok(EncryptedHeader {
-        block,
-        header,
-        total_size,
-    })
+        let mut block = parse_block_header(&header, 0)?;
+        block.offset = offset;
+        // Parsed add_size is a widened wire u32 and fits both supported widths.
+        let payload_size = block.add_size.unwrap_or(0) as usize;
+        let total_size = 8usize
+            .checked_add(encrypted_header_size)
+            .and_then(|size| size.checked_add(payload_size))
+            .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
+        Ok(EncryptedHeader {
+            block,
+            header,
+            total_size,
+        })
+    }
 }
 
 fn read_encrypted_header_at(
@@ -2434,60 +2406,82 @@ fn read_encrypted_header_at(
     cipher_cache: &mut EncryptedHeaderCipherCache,
     budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<EncryptedHeader> {
-    let absolute = archive_offset
-        .checked_add(offset)
-        .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
-    let remaining = file_len
-        .checked_sub(absolute as u64)
-        .ok_or(Error::TooShort)?;
-    if remaining < 24 {
-        return Err(Error::TooShort);
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = (
+            file,
+            file_len,
+            archive_offset,
+            offset,
+            password,
+            cipher_cache,
+            budget,
+        );
+        Err(Error::FeatureDisabled {
+            feature: "encryption",
+        })
     }
-    let first = read_exact_at(file, absolute, 24)?;
-    let salt = read_header_salt(&first, 0)?;
-    budget.check_count(offset)?;
-    let mut cipher = cipher_cache.cipher(password, salt)?;
-    let mut first_block = [0u8; 16];
-    first_block.copy_from_slice(&first[8..24]);
-    cipher
-        .decrypt_in_place(&mut first_block)
-        .map_err(map_rar30_crypto_error)?;
-    let head_size = read_u16(&first_block, 5)? as usize;
-    if head_size < 7 {
-        return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
-    }
-    let encrypted_header_size = checked_align16(head_size, "RAR 1.5 block size overflows usize")?;
-    let encrypted_start = absolute
-        .checked_add(8)
-        .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
-    if encrypted_header_size as u64 > remaining - 8 {
-        return Err(Error::TooShort);
-    }
-    budget.admit(head_size, offset)?;
-    let encrypted_rest = read_exact_at(file, encrypted_start + 16, encrypted_header_size - 16)?;
-    let mut header = Vec::with_capacity(encrypted_header_size);
-    header.extend_from_slice(&first_block);
-    header.extend_from_slice(&encrypted_rest);
-    cipher
-        .decrypt_in_place(&mut header[16..])
-        .map_err(map_rar30_crypto_error)?;
-    header.truncate(head_size);
+    #[cfg(feature = "encryption")]
+    {
+        let absolute = archive_offset
+            .checked_add(offset)
+            .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
+        let remaining = file_len
+            .checked_sub(absolute as u64)
+            .ok_or(Error::TooShort)?;
+        if remaining < 24 {
+            return Err(Error::TooShort);
+        }
+        let first = read_exact_at(file, absolute, 24)?;
+        let salt = read_header_salt(&first, 0)?;
+        budget.check_count(offset)?;
+        let mut cipher = cipher_cache.cipher(password, salt)?;
+        let mut first_block = [0u8; 16];
+        first_block.copy_from_slice(&first[8..24]);
+        cipher.decrypt_block(&mut first_block);
+        let head_size = u16::from_le_bytes([first_block[5], first_block[6]]) as usize;
+        if head_size < 7 {
+            return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
+        }
+        // A u16 wire length rounds to at most 65536, including on 32-bit hosts.
+        let encrypted_header_size = head_size.next_multiple_of(16);
+        let encrypted_start = absolute
+            .checked_add(8)
+            .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
+        if encrypted_header_size as u64 > remaining - 8 {
+            return Err(Error::TooShort);
+        }
+        budget.admit(head_size, offset)?;
+        let encrypted_rest_start = encrypted_start
+            .checked_add(16)
+            .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
+        let encrypted_rest = read_exact_at(file, encrypted_rest_start, encrypted_header_size - 16)?;
+        let mut header = Vec::with_capacity(encrypted_header_size);
+        header.extend_from_slice(&first_block);
+        header.extend_from_slice(&encrypted_rest);
+        // The rounded header minus its first block is a whole number of AES blocks.
+        for block in header[16..].as_chunks_mut::<16>().0.iter_mut() {
+            cipher.decrypt_block(block);
+        }
+        header.truncate(head_size);
 
-    let mut block = parse_block_header(&header, 0)?;
-    block.offset = offset;
-    let payload_size = usize::try_from(block.add_size.unwrap_or(0))
-        .map_err(|_| Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
-    let total_size = 8usize
-        .checked_add(encrypted_header_size)
-        .and_then(|size| size.checked_add(payload_size))
-        .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
-    Ok(EncryptedHeader {
-        block,
-        header,
-        total_size,
-    })
+        let mut block = parse_block_header(&header, 0)?;
+        block.offset = offset;
+        // Parsed add_size is a widened wire u32 and fits both supported widths.
+        let payload_size = block.add_size.unwrap_or(0) as usize;
+        let total_size = 8usize
+            .checked_add(encrypted_header_size)
+            .and_then(|size| size.checked_add(payload_size))
+            .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
+        Ok(EncryptedHeader {
+            block,
+            header,
+            total_size,
+        })
+    }
 }
 
+#[cfg(feature = "encryption")]
 fn read_header_salt(input: &[u8], offset: usize) -> Result<[u8; 8]> {
     input
         .get(offset..offset + 8)
@@ -2512,15 +2506,17 @@ fn parse_file_like_header(
     let start = block.offset;
     let head_end = start + block.head_size as usize;
 
-    let pack_low = read_u32(input, start + 7)? as u64;
-    let unp_low = read_u32(input, start + 11)? as u64;
-    let host_os = input[start + 15];
-    let file_crc = read_u32(input, start + 16)?;
-    let file_time = read_u32(input, start + 20)?;
-    let unp_ver = input[start + 24];
-    let method = input[start + 25];
-    let name_size = read_u16(input, start + 26)? as usize;
-    let attr = read_u32(input, start + 28)?;
+    // Complete block admission plus the minimum-size guard bounds base fields.
+    let fixed = &input[start..start + 32];
+    let pack_low = u32::from_le_bytes([fixed[7], fixed[8], fixed[9], fixed[10]]) as u64;
+    let unp_low = u32::from_le_bytes([fixed[11], fixed[12], fixed[13], fixed[14]]) as u64;
+    let host_os = fixed[15];
+    let file_crc = u32::from_le_bytes([fixed[16], fixed[17], fixed[18], fixed[19]]);
+    let file_time = u32::from_le_bytes([fixed[20], fixed[21], fixed[22], fixed[23]]);
+    let unp_ver = fixed[24];
+    let method = fixed[25];
+    let name_size = u16::from_le_bytes([fixed[26], fixed[27]]) as usize;
+    let attr = u32::from_le_bytes([fixed[28], fixed[29], fixed[30], fixed[31]]);
     let mut pos = start + 32;
 
     let (pack_size, unp_size) = if block.flags & FHD_LARGE != 0 {
@@ -2532,9 +2528,8 @@ fn parse_file_like_header(
         (pack_low, unp_low)
     };
 
-    let name_end = pos
-        .checked_add(name_size)
-        .ok_or(Error::InvalidHeader("RAR 1.5 file name size overflows"))?;
+    // Relative headers start at zero: base+LARGE prefix <=40, name is a u16.
+    let name_end = pos + name_size;
     if name_end > head_end {
         return Err(Error::InvalidHeader(
             "RAR 1.5 file name extends beyond header",
@@ -2555,15 +2550,14 @@ fn parse_file_like_header(
     };
 
     let salt = if block.flags & FHD_SALT != 0 {
-        let salt_end = pos
-            .checked_add(8)
-            .ok_or(Error::InvalidHeader("RAR 1.5 salt size overflows"))?;
+        // name_end was bounded by the complete u16-sized header above.
+        let salt_end = pos + 8;
         if salt_end > head_end {
             return Err(Error::InvalidHeader(
                 "RAR 1.5 salt extends beyond file header",
             ));
         }
-        let salt_bytes = input.get(pos..salt_end).ok_or(Error::TooShort)?;
+        let salt_bytes = &input[pos..salt_end];
         pos = salt_end;
         Some(
             salt_bytes
@@ -2621,6 +2615,7 @@ fn parse_file_like_header(
     })
 }
 
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn validate_unicode_name(raw: &[u8], decoded: &[u8]) -> Result<()> {
     if decode_file_name(raw, FHD_UNICODE) != decoded || std::str::from_utf8(decoded).is_err() {
         return Err(Error::InvalidArgument("invalid legacy Unicode filename"));
@@ -2732,11 +2727,12 @@ fn admit_plain_header(
     if !budget.is_limited() {
         return Ok(());
     }
-    let prefix = input.get(offset..).ok_or(Error::TooShort)?;
+    // Both parser call sites bound offset by the physical archive extent.
+    let prefix = &input[offset..];
     if prefix.len() < 7 {
         return Err(Error::TooShort);
     }
-    let size = read_u16(prefix, 5)? as usize;
+    let size = u16::from_le_bytes([prefix[5], prefix[6]]) as usize;
     if size < 7 {
         return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
     }
@@ -2763,7 +2759,8 @@ fn read_block_header_at(
         return Err(Error::TooShort);
     }
     let base = read_exact_at(file, absolute, 7)?;
-    let head_size = read_u16(&base, 5)? as usize;
+    // A successful exact read has admitted the entire fixed prefix.
+    let head_size = u16::from_le_bytes([base[5], base[6]]) as usize;
     if head_size < 7 {
         return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
     }
@@ -2810,10 +2807,11 @@ fn parse_block_header(input: &[u8], offset: usize) -> Result<BlockHeader> {
     if input.len() < offset + 7 {
         return Err(Error::TooShort);
     }
-    let head_crc = read_u16(input, offset)?;
-    let head_type = input[offset + 2];
-    let flags = read_u16(input, offset + 3)?;
-    let head_size = read_u16(input, offset + 5)?;
+    let prefix = &input[offset..offset + 7];
+    let head_crc = u16::from_le_bytes([prefix[0], prefix[1]]);
+    let head_type = prefix[2];
+    let flags = u16::from_le_bytes([prefix[3], prefix[4]]);
+    let head_size = u16::from_le_bytes([prefix[5], prefix[6]]);
     if head_size < 7 {
         return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
     }
@@ -2868,8 +2866,9 @@ fn file_header_comment_crc_end(input: &[u8], offset: usize) -> Result<usize> {
     if input.len() < offset + 32 {
         return Err(Error::TooShort);
     }
-    let flags = read_u16(input, offset + 3)?;
-    let name_size = read_u16(input, offset + 26)? as usize;
+    let fixed = &input[offset..offset + 32];
+    let flags = u16::from_le_bytes([fixed[3], fixed[4]]);
+    let name_size = u16::from_le_bytes([fixed[26], fixed[27]]) as usize;
     let mut end = offset + 32;
     // Offset is within a physical slice; the remaining fields add at most
     // a u16 name length plus two eight-byte fields, so usize cannot overflow.
@@ -2913,13 +2912,12 @@ fn file_block_total_size(
     default_total: usize,
     pack_size: u64,
 ) -> Result<usize> {
-    let low_payload_size = usize::try_from(block.add_size.unwrap_or(0))
-        .map_err(|_| Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
-    let header_prefix = default_total
-        .checked_sub(low_payload_size)
-        .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
-    let pack_size = usize::try_from(pack_size)
-        .map_err(|_| Error::InvalidHeader("RAR 1.5 packed file size overflows usize"))?;
+    // Parsed add_size is a widened u32, and default_total already includes it.
+    let low_payload_size = block.add_size.unwrap_or(0) as usize;
+    let header_prefix = default_total - low_payload_size;
+    // Every caller obtained pack_size from parse_file_like_header, which
+    // admitted its conversion and relative payload end before returning.
+    let pack_size = pack_size as usize;
     header_prefix
         .checked_add(pack_size)
         .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))
@@ -2955,26 +2953,16 @@ fn checked_file_block_next(
     Ok(next)
 }
 
-fn packed_range(
-    archive_offset: usize,
-    block_offset: usize,
-    total: usize,
-    pack_size: u64,
-) -> Result<Range<usize>> {
-    let pack_size = usize::try_from(pack_size)
-        .map_err(|_| Error::InvalidHeader("RAR 1.5 packed file size overflows usize"))?;
-    let block_end = archive_offset
-        .checked_add(block_offset)
-        .and_then(|start| start.checked_add(total))
-        .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
-    let block_start = block_end
-        .checked_sub(pack_size)
-        .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
-    Ok(block_start..block_end)
+/// Called only after full packed-size conversion and the next block extent have
+/// been admitted. The checked total includes the payload, so subtraction fits.
+fn packed_range(archive_offset: usize, next: usize, pack_size: u64) -> Range<usize> {
+    let block_end = archive_offset + next;
+    block_end - pack_size as usize..block_end
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 mod tests {
+    use crate::FeatureSet;
     #[test]
     fn header_budget_refuses_full_reads_after_plain_and_encrypted_prefixes() {
         use crate::parse_budget::{ParseBudget, PrefixReader};
@@ -2993,29 +2981,961 @@ mod tests {
         ));
         assert_eq!(reader.reads, [7]);
 
-        let mut cipher = crate::crypto::rar30::Rar30Cipher::new(b"secret", Some([0; 8])).unwrap();
-        cipher.encrypt_in_place(&mut plain).unwrap();
-        let mut prefix = vec![0; 8];
-        prefix.extend_from_slice(&plain);
-        let mut reader = PrefixReader::new(prefix);
-        let e = super::read_encrypted_header_at(
-            &mut reader,
-            128,
-            0,
-            0,
-            b"secret",
-            &mut super::EncryptedHeaderCipherCache::default(),
-            &mut ParseBudget::new(options),
-        )
-        .map(|_| ())
-        .expect_err("header budget must refuse");
-        assert!(matches!(
-            e.root_cause(),
-            crate::Error::HeaderBytesLimitExceeded { required: 64, .. }
-        ));
-        assert_eq!(reader.reads, [24]);
+        #[cfg(feature = "encryption")]
+        {
+            let mut cipher =
+                crate::crypto::rar30::Rar30Cipher::new(b"secret", Some([0; 8])).unwrap();
+            cipher.encrypt_in_place(&mut plain).unwrap();
+            let mut prefix = vec![0; 8];
+            prefix.extend_from_slice(&plain);
+            let mut reader = PrefixReader::new(prefix);
+            let e = super::read_encrypted_header_at(
+                &mut reader,
+                128,
+                0,
+                0,
+                b"secret",
+                &mut super::EncryptedHeaderCipherCache::default(),
+                &mut ParseBudget::new(options),
+            )
+            .map(|_| ())
+            .expect_err("header budget must refuse");
+            assert!(matches!(
+                e.root_cause(),
+                crate::Error::HeaderBytesLimitExceeded { required: 64, .. }
+            ));
+            assert_eq!(reader.reads, [24]);
+        }
     }
     use super::*;
+    use crate::io_util::read_u16;
+
+    #[test]
+    fn declared_payload_extents_are_checked_for_each_block_kind() {
+        for head_type in [
+            FILE_HEAD,
+            NEWSUB_HEAD,
+            COMM_HEAD,
+            PROTECT_HEAD,
+            ENDARC_HEAD,
+            0x7e,
+        ] {
+            let size: u16 = match head_type {
+                FILE_HEAD | NEWSUB_HEAD => 33,
+                PROTECT_HEAD => 26,
+                COMM_HEAD => 13,
+                _ => 11,
+            };
+            let mut header = vec![0; usize::from(size)];
+            header[2] = head_type;
+            header[3..5].copy_from_slice(&LONG_BLOCK.to_le_bytes());
+            header[5..7].copy_from_slice(&size.to_le_bytes());
+            header[7..11].copy_from_slice(&4u32.to_le_bytes());
+            if matches!(head_type, FILE_HEAD | NEWSUB_HEAD) {
+                header[24] = 29;
+                header[25] = 0x30;
+                header[26..28].copy_from_slice(&1u16.to_le_bytes());
+                header[32] = b'x';
+            } else if head_type == PROTECT_HEAD {
+                header[14..18].copy_from_slice(&2u32.to_le_bytes());
+                header[18..26].copy_from_slice(b"Protect!");
+            }
+            test_write_header_crc(&mut header, 0);
+            for available in 0..=4 {
+                let mut bytes = RAR15_SIGNATURE.to_vec();
+                test_write_main_header(&mut bytes, 0);
+                bytes.extend_from_slice(&header);
+                bytes.resize(bytes.len() + available, 0);
+                for result in [
+                    Archive::parse(&bytes),
+                    Archive::parse_seekable(
+                        std::io::Cursor::new(&bytes),
+                        bytes.len() as u64,
+                        0,
+                        ArchiveSource::Memory(Arc::from(bytes.clone())),
+                        crate::ArchiveReadOptions::new(),
+                    ),
+                ] {
+                    if available < 4 {
+                        assert!(
+                            matches!(result, Err(Error::TooShort)),
+                            "type {head_type:x}, extent {available}: {result:?}"
+                        );
+                    } else {
+                        assert_eq!(result.unwrap().blocks.len(), 1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_file_totals_refuse_relative_and_encrypted_prefix_overflow() {
+        for head_type in [FILE_HEAD, NEWSUB_HEAD] {
+            for encrypted in crate::test_features::encryption_cases() {
+                let pack_size = u64::MAX - 41;
+                let mut header = vec![0; 41];
+                header[2] = head_type;
+                header[3..5].copy_from_slice(&(LONG_BLOCK | FHD_LARGE).to_le_bytes());
+                header[5..7].copy_from_slice(&41u16.to_le_bytes());
+                header[7..11].copy_from_slice(&(pack_size as u32).to_le_bytes());
+                header[24] = 29;
+                header[25] = 0x30;
+                header[26..28].copy_from_slice(&1u16.to_le_bytes());
+                header[32..36].copy_from_slice(&((pack_size >> 32) as u32).to_le_bytes());
+                header[40] = b'x';
+                test_write_header_crc(&mut header, 0);
+                let mut bytes = RAR15_SIGNATURE.to_vec();
+                test_write_main_header(&mut bytes, if encrypted { MHD_PASSWORD } else { 0 });
+                if encrypted {
+                    #[cfg(feature = "encryption")]
+                    {
+                        header.resize(48, 0);
+                        crate::crypto::rar30::Rar30Cipher::new(b"pw", Some([0; 8]))
+                            .unwrap()
+                            .encrypt_in_place(&mut header)
+                            .unwrap();
+                        bytes.extend_from_slice(&[0; 8]);
+                    }
+                }
+                bytes.extend_from_slice(&header);
+                let options = crate::ArchiveReadOptions::with_password(b"pw");
+                for result in [
+                    Archive::parse_with_options(&bytes, options),
+                    Archive::parse_seekable(
+                        std::io::Cursor::new(&bytes),
+                        bytes.len() as u64,
+                        0,
+                        ArchiveSource::Memory(Arc::from(bytes.clone())),
+                        options,
+                    ),
+                ] {
+                    // On 64-bit, plain relative FILE size fits exactly, but the
+                    // containing archive offset (or encrypted physical prefix) does not.
+                    let expected = if usize::BITS == 32 && !encrypted {
+                        "RAR 1.5 packed file size overflows usize"
+                    } else {
+                        "RAR 1.5 block size overflows usize"
+                    };
+                    assert!(
+                        matches!(result, Err(Error::InvalidHeader(message)) if message == expected),
+                        "{result:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "recovery")]
+    fn recovery_source_failures_are_preserved_after_successful_parsing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct FailingSource {
+            bytes: std::io::Cursor<Vec<u8>>,
+            fail: Arc<AtomicBool>,
+        }
+        impl Read for FailingSource {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                if self.fail.load(Ordering::Relaxed) {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "recovery source denied",
+                    ))
+                } else {
+                    self.bytes.read(bytes)
+                }
+            }
+        }
+        impl std::io::Seek for FailingSource {
+            fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.bytes.seek(from)
+            }
+        }
+        for bytes in [
+            &include_bytes!("../tests/fixtures/rar15_40/rar250_protect_head_rr1.rar")[..],
+            &include_bytes!("../tests/fixtures/rar15_40/rar300/with_recovery_rar300.rar")[..],
+        ] {
+            let fail = Arc::new(AtomicBool::new(false));
+            let source = crate::source::ReaderSource::new(FailingSource {
+                bytes: std::io::Cursor::new(bytes.to_vec()),
+                fail: fail.clone(),
+            })
+            .unwrap();
+            let archive = Archive::parse_seekable(
+                source.cursor(),
+                bytes.len() as u64,
+                0,
+                ArchiveSource::Reader(source),
+                crate::ArchiveReadOptions::new(),
+            )
+            .unwrap();
+            fail.store(true, Ordering::Relaxed);
+            assert!(
+                matches!(archive.repair_protect_head(), Err(Error::Io(error))
+                if error.kind == std::io::ErrorKind::PermissionDenied && error.message == "recovery source denied")
+            );
+        }
+        let archive = preservation_seed(ArchiveVersion::Rar29);
+        assert!(matches!(
+            archive.repair_protect_head(),
+            Err(Error::InvalidHeader(
+                "RAR 2.x archive does not contain a PROTECT_HEAD recovery record"
+            ))
+        ));
+    }
+
+    #[test]
+    fn complete_header_crc_failures_survive_plain_and_encrypted_adapters() {
+        for encrypted in crate::test_features::encryption_cases() {
+            for corrupt in [false, true] {
+                let mut bytes = RAR15_SIGNATURE.to_vec();
+                test_write_main_header(&mut bytes, if encrypted { MHD_PASSWORD } else { 0 });
+                let mut header = vec![0; 7];
+                header[2] = ENDARC_HEAD;
+                header[5..7].copy_from_slice(&7u16.to_le_bytes());
+                test_write_header_crc(&mut header, 0);
+                if corrupt {
+                    header[0] ^= 1;
+                }
+                if encrypted {
+                    #[cfg(feature = "encryption")]
+                    {
+                        header.resize(16, 0);
+                        crate::crypto::rar30::Rar30Cipher::new(b"pw", Some([0; 8]))
+                            .unwrap()
+                            .encrypt_in_place(&mut header)
+                            .unwrap();
+                        bytes.extend_from_slice(&[0; 8]);
+                    }
+                }
+                bytes.extend_from_slice(&header);
+                let options = crate::ArchiveReadOptions::with_password(b"pw");
+                for result in [
+                    Archive::parse_with_options(&bytes, options),
+                    Archive::parse_seekable(
+                        std::io::Cursor::new(&bytes),
+                        bytes.len() as u64,
+                        0,
+                        ArchiveSource::Memory(Arc::from(bytes.clone())),
+                        options,
+                    ),
+                ] {
+                    if corrupt {
+                        assert!(
+                            matches!(result, Err(Error::CrcMismatch { .. })),
+                            "{result:?}"
+                        );
+                    } else {
+                        assert!(matches!(result.unwrap().blocks.last(), Some(Block::End(_))));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "recovery")]
+    fn rev3_repair_preserves_reconstruction_and_publication_failures() {
+        let mut calls = 0;
+        let error = repair_rev3_volumes_to(&[], 1, &[(0, b"data")], |_, _| {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Rar3Recovery(crate::recovery::rar3::Error::InvalidCodewordSize)
+        ));
+        assert_eq!(calls, 0);
+
+        let volumes: &[Option<&[u8]>] = &[Some(b"data"), Some(b"next")];
+        let error = repair_rev3_volumes_to(volumes, 1, &[(0, b"0000")], |index, bytes| {
+            calls += 1;
+            assert_eq!(index, 0);
+            assert_eq!(bytes, b"data");
+            Err(
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "publication denied")
+                    .into(),
+            )
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::Io(ref source) if source.kind == std::io::ErrorKind::PermissionDenied && source.message == "publication denied")
+        );
+        assert_eq!(calls, 1, "publication stops at the failing volume");
+        let mut published = Vec::new();
+        repair_rev3_volumes_to(volumes, 1, &[(0, b"0000")], |index, bytes| {
+            published.push((index, bytes.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(published, [(0, b"data".to_vec()), (1, b"next".to_vec())]);
+    }
+
+    #[test]
+    fn preservation_refuses_unsafe_unicode_names_and_independent_fallbacks() {
+        for unsafe_decoded in [false, true] {
+            let mut archive = preservation_seed(ArchiveVersion::Rar29);
+            let file = preservation_file(&mut archive);
+            if unsafe_decoded {
+                file.name = b"../entry".to_vec();
+                file.unicode_name = Some(b"../entry\0".to_vec());
+            } else {
+                let mut raw = crate::filename::encode_legacy_unicode(b"entry").unwrap();
+                // Full UTF-16 commands leave the decoded name independent of this fallback.
+                raw[..5].copy_from_slice(b"/evil");
+                assert_eq!(decode_file_name(&raw, FHD_UNICODE), b"entry");
+                file.unicode_name = Some(raw);
+            }
+            assert!(archive
+                .rewrite_preservation_issues()
+                .iter()
+                .any(|issue| issue.contains("malformed or unsupported legacy Unicode name")));
+        }
+    }
+
+    #[test]
+    fn nested_comment_crc_failure_survives_both_parser_adapters() {
+        let mut bytes = RAR15_SIGNATURE.to_vec();
+        test_write_main_header(&mut bytes, MHD_COMMENT);
+        let nested = bytes.len();
+        bytes.extend_from_slice(&comment_block(b"note"));
+        let main = RAR15_SIGNATURE.len();
+        let size = (bytes.len() - main) as u16;
+        bytes[main + 5..main + 7].copy_from_slice(&size.to_le_bytes());
+        test_write_header_crc(&mut bytes[..main + MAIN_HEADER_SIZE], main);
+        for corrupt in [false, true] {
+            let mut input = bytes.clone();
+            if corrupt {
+                input[nested] ^= 1;
+            }
+            let memory = Archive::parse(&input);
+            let seekable = Archive::parse_seekable(
+                std::io::Cursor::new(&input),
+                input.len() as u64,
+                0,
+                ArchiveSource::Memory(Arc::from(input.clone())),
+                crate::ArchiveReadOptions::new(),
+            );
+            if corrupt {
+                assert!(matches!(memory, Err(Error::CrcMismatch { .. })));
+                assert!(matches!(seekable, Err(Error::CrcMismatch { .. })));
+            } else {
+                for archive in [memory.unwrap(), seekable.unwrap()] {
+                    assert_eq!(
+                        archive.archive_comment().unwrap().as_deref(),
+                        Some(&b"note"[..])
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn edited_archive_comment_range_preserves_source_refusal() {
+        let mut builder = crate::Builder::new(ArchiveVersion::Rar15)
+            .store(true)
+            .comment(Some(b"note".to_vec()));
+        builder
+            .add_bytes(b"entry".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        let mut archive = Archive::parse_owned(builder.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            archive.archive_comment().unwrap().as_deref(),
+            Some(&b"note"[..])
+        );
+        let comment = archive
+            .blocks
+            .iter_mut()
+            .find_map(|block| match block {
+                Block::Comment(comment) => Some(comment),
+                _ => None,
+            })
+            .unwrap();
+        comment.packed_range = usize::MAX..usize::MAX;
+        assert!(matches!(archive.archive_comment(), Err(Error::TooShort)));
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn seekable_offsets_above_native_address_size_are_refused() {
+        use std::io::{self, Read, Seek, SeekFrom};
+        struct HighInput<'a> {
+            start: u64,
+            position: u64,
+            bytes: &'a [u8],
+        }
+        impl Read for HighInput<'_> {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                if !(self.start..self.start + self.bytes.len() as u64).contains(&self.position) {
+                    return Ok(0);
+                }
+                let offset = (self.position - self.start) as usize;
+                let length = output.len().min(self.bytes.len() - offset);
+                output[..length].copy_from_slice(&self.bytes[offset..offset + length]);
+                self.position += length as u64;
+                Ok(length)
+            }
+        }
+        impl Seek for HighInput<'_> {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                match position {
+                    SeekFrom::Start(position) => {
+                        self.position = position;
+                        Ok(position)
+                    }
+                    _ => Err(io::ErrorKind::Unsupported.into()),
+                }
+            }
+        }
+        let mut main = RAR15_SIGNATURE.to_vec();
+        test_write_main_header(&mut main, 0);
+        for (start, bytes, expected) in [
+            (
+                u64::from(u32::MAX) - 3,
+                &RAR15_SIGNATURE[..],
+                "RAR 1.5 block offset overflows usize",
+            ),
+            (
+                u64::from(u32::MAX) - 17,
+                &main[..],
+                "RAR 1.5 block size overflows usize",
+            ),
+        ] {
+            let result = Archive::parse_seekable(
+                HighInput {
+                    start,
+                    position: 0,
+                    bytes,
+                },
+                start + bytes.len() as u64,
+                start as usize,
+                ArchiveSource::Memory(Arc::from(&[][..])),
+                crate::ArchiveReadOptions::new(),
+            );
+            assert!(
+                matches!(result, Err(Error::InvalidHeader(message)) if message == expected),
+                "{result:?}"
+            );
+        }
+        // A complete salt/first AES block may fit the u64 file but leave the
+        // address of its (possibly empty) tail beyond native usize.
+        let mut header = vec![0; 16];
+        header[2] = ENDARC_HEAD;
+        header[5..7].copy_from_slice(&7u16.to_le_bytes());
+        test_write_header_crc(&mut header[..7], 0);
+        Rar30Cipher::new(b"pw", Some([0; 8]))
+            .unwrap()
+            .encrypt_in_place(&mut header)
+            .unwrap();
+        let mut bytes = vec![0; 8];
+        bytes.extend_from_slice(&header);
+        let start = u64::from(u32::MAX) - 10;
+        let result = read_encrypted_header_at(
+            &mut HighInput {
+                start,
+                position: 0,
+                bytes: &bytes,
+            },
+            start + bytes.len() as u64,
+            start as usize,
+            0,
+            b"pw",
+            &mut EncryptedHeaderCipherCache::default(),
+            &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
+        );
+        assert!(matches!(
+            result,
+            Err(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))
+        ));
+    }
+
+    #[test]
+    fn protection_header_requires_a_declared_data_size() {
+        let mut bytes = RAR15_SIGNATURE.to_vec();
+        test_write_main_header(&mut bytes, 0);
+        let start = bytes.len();
+        let mut header = vec![0; 26];
+        header[2] = PROTECT_HEAD;
+        header[5..7].copy_from_slice(&26u16.to_le_bytes());
+        bytes.extend_from_slice(&header);
+        test_write_header_crc(&mut bytes, start);
+        for result in [
+            Archive::parse(&bytes),
+            Archive::parse_seekable(
+                std::io::Cursor::new(&bytes),
+                bytes.len() as u64,
+                0,
+                ArchiveSource::Memory(Arc::from(bytes.clone())),
+                crate::ArchiveReadOptions::new(),
+            ),
+        ] {
+            assert!(matches!(
+                result,
+                Err(Error::InvalidHeader(
+                    "RAR 2.x recovery header is missing data size"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn maximum_large_packed_size_is_refused_before_payload_access() {
+        let mut bytes = RAR15_SIGNATURE.to_vec();
+        test_write_main_header(&mut bytes, 0);
+        let start = bytes.len();
+        let mut header = vec![0; 41];
+        header[2] = FILE_HEAD;
+        header[3..5].copy_from_slice(&(LONG_BLOCK | FHD_LARGE).to_le_bytes());
+        header[5..7].copy_from_slice(&41u16.to_le_bytes());
+        header[7..11].copy_from_slice(&u32::MAX.to_le_bytes());
+        header[24] = 29;
+        header[25] = 0x30;
+        header[26..28].copy_from_slice(&1u16.to_le_bytes());
+        header[32..36].copy_from_slice(&u32::MAX.to_le_bytes());
+        header[40] = b'x';
+        bytes.extend_from_slice(&header);
+        test_write_header_crc(&mut bytes, start);
+        for result in [
+            Archive::parse(&bytes),
+            Archive::parse_seekable(
+                std::io::Cursor::new(&bytes),
+                bytes.len() as u64,
+                0,
+                ArchiveSource::Memory(Arc::from(bytes.clone())),
+                crate::ArchiveReadOptions::new(),
+            ),
+        ] {
+            let expected = if usize::BITS == 32 {
+                // The low u32 payload plus its header already exceeds usize.
+                "RAR 1.5 block size overflows usize"
+            } else {
+                "RAR 1.5 packed file size overflows usize"
+            };
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::InvalidHeader(message)) if message == expected
+                ),
+                "expected {expected}, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sfx_payload_ranges_agree_for_plain_and_encrypted_headers() {
+        for encrypted in crate::test_features::encryption_cases() {
+            let mut builder = crate::Builder::new(if encrypted {
+                ArchiveVersion::Rar30
+            } else {
+                ArchiveVersion::Rar29
+            })
+            .store(true)
+            .password(encrypted.then(|| b"secret".to_vec()))
+            .header_encryption(encrypted);
+            builder
+                .add_bytes(
+                    b"payload".to_vec(),
+                    b"sfx payload bytes".to_vec(),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let mut bytes = vec![0; 19];
+            bytes.extend_from_slice(&builder.to_bytes().unwrap());
+            let options = crate::ArchiveReadOptions::with_optional_password(
+                encrypted.then_some(&b"secret"[..]),
+            );
+            let memory = Archive::parse_with_options(&bytes, options).unwrap();
+            let seekable = Archive::parse_seekable(
+                std::io::Cursor::new(&bytes),
+                bytes.len() as u64,
+                19,
+                ArchiveSource::Memory(Arc::from(bytes.clone())),
+                options,
+            )
+            .unwrap();
+            assert_eq!(memory.sfx_offset, 19);
+            assert_eq!(memory.blocks, seekable.blocks);
+            for archive in [&memory, &seekable] {
+                let mut output = Vec::new();
+                archive
+                    .files()
+                    .next()
+                    .unwrap()
+                    .write_stored_to(archive, options.password, &mut output)
+                    .unwrap();
+                assert_eq!(output, b"sfx payload bytes");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "recovery")]
+    fn edited_public_recovery_ranges_keep_typed_refusals() {
+        let old = Archive::parse(include_bytes!(
+            "../tests/fixtures/rar15_40/rar250_protect_head_rr1.rar"
+        ))
+        .unwrap();
+        let mut out_of_source = old.clone();
+        let protect = out_of_source
+            .blocks
+            .iter_mut()
+            .find_map(|block| match block {
+                Block::Protect(protect) => Some(protect),
+                _ => None,
+            })
+            .unwrap();
+        protect.data_range = usize::MAX..usize::MAX;
+        assert!(matches!(
+            out_of_source.repair_protect_head(),
+            Err(Error::TooShort)
+        ));
+        let mut overflow = old;
+        overflow.sfx_offset = usize::MAX;
+        assert!(matches!(
+            overflow.repair_protect_head(),
+            Err(Error::InvalidHeader(
+                "RAR 2.x protected sector range overflows"
+            ))
+        ));
+
+        let mut modern = Archive::parse(include_bytes!(
+            "../tests/fixtures/rar15_40/rar300/with_recovery_rar300.rar"
+        ))
+        .unwrap();
+        modern.sfx_offset = 1;
+        let recovery = modern
+            .blocks
+            .iter_mut()
+            .find_map(|block| match block {
+                Block::NewSub(sub) if sub.kind == NewSubKind::RecoveryRecord => Some(sub),
+                _ => None,
+            })
+            .unwrap();
+        recovery.file.block.offset = usize::MAX;
+        assert!(matches!(
+            modern.repair_protect_head(),
+            Err(Error::InvalidHeader(
+                "RAR 3.x recovery protected range overflows"
+            ))
+        ));
+    }
+
+    #[test]
+    fn comment_decoders_preserve_limits_and_each_cancellation_checkpoint() {
+        let text = b"checkpoint comment";
+        for (version, method, packed) in [
+            (15, 0x30, text.to_vec()),
+            (
+                15,
+                0x31,
+                crate::codec::rar13::unpack15_encode(text).unwrap(),
+            ),
+            (
+                20,
+                0x31,
+                crate::codec::rar20::unpack20_encode_literals(text).unwrap(),
+            ),
+            (
+                26,
+                0x31,
+                crate::codec::rar20::unpack20_encode_literals(text).unwrap(),
+            ),
+        ] {
+            let mut block = block_header_with(0);
+            block.head_type = COMM_HEAD;
+            block.head_size = COMMENT_HEADER_SIZE as u16;
+            let comment = CommentHeader {
+                block,
+                unp_size: text.len() as u16,
+                unp_ver: version,
+                method,
+                comment_crc: (crc32(text) & 0xffff) as u16,
+                packed_range: 0..packed.len(),
+            };
+            assert_eq!(comment.decode(&packed).unwrap(), text);
+            let mut limited = crate::output_limit::OutputBudget::new(
+                crate::ArchiveReadOptions::new().with_max_member_output_bytes(0),
+            );
+            assert!(matches!(
+                comment
+                    .decode_with_budget(&packed, &mut limited)
+                    .unwrap_err()
+                    .root_cause(),
+                Error::MemberOutputLimitExceeded { .. }
+            ));
+            let mut completed = false;
+            for checks in 0..128 {
+                let token = crate::ReadCancellation::new();
+                let mut budget = crate::output_limit::OutputBudget::new(
+                    crate::ArchiveReadOptions::new().with_cancellation(&token),
+                );
+                budget.control.cancel_after_checks(checks);
+                match comment.decode_with_budget(&packed, &mut budget) {
+                    Ok(output) => {
+                        assert_eq!(output, text);
+                        assert!(checks > 2);
+                        completed = true;
+                        break;
+                    }
+                    Err(error) => assert!(
+                        matches!(error.root_cause(), Error::Cancelled),
+                        "version {version}, check {checks}: {error:?}"
+                    ),
+                }
+            }
+            assert!(
+                completed,
+                "version {version}: checkpoint sweep did not finish"
+            );
+        }
+    }
+
+    #[test]
+    fn file_comment_rejects_a_complete_but_undersized_comment_header() {
+        let mut file = file_header_with(FHD_COMMENT);
+        file.file_comment = comment_block(b"note");
+        file.file_comment[5..7].copy_from_slice(&12u16.to_le_bytes());
+        test_write_header_crc(&mut file.file_comment[..12], 0);
+        assert!(matches!(
+            file.file_comment(),
+            Err(Error::InvalidHeader("RAR 1.5 comment header is too short"))
+        ));
+    }
+
+    #[test]
+    fn directory_callbacks_preserve_failure_and_cancellation_in_both_extractors() {
+        let mut builder = crate::Builder::new(ArchiveVersion::Rar29);
+        builder
+            .add_directory(b"directory".to_vec(), None, None)
+            .unwrap();
+        let archive = Archive::parse_owned(builder.to_bytes().unwrap()).unwrap();
+        for parallel in [false, true] {
+            for cancel in [false, true] {
+                let token = crate::ReadCancellation::new();
+                let mut calls = 0;
+                let open = |meta: &ExtractedEntryMeta| -> Result<Box<dyn Write>> {
+                    calls += 1;
+                    assert!(meta.is_directory);
+                    assert_eq!(meta.name, b"directory");
+                    if cancel {
+                        token.cancel();
+                        Ok(Box::new(std::io::sink()))
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "directory refused",
+                        )
+                        .into())
+                    }
+                };
+                let options = crate::ArchiveReadOptions::new().with_cancellation(&token);
+                let error = if parallel {
+                    archive.extract_to_parallel_buffered(options, open)
+                } else {
+                    archive.extract_to(options, open)
+                }
+                .unwrap_err();
+                if cancel {
+                    assert!(matches!(error.root_cause(), Error::Cancelled));
+                } else {
+                    assert!(
+                        matches!(error.root_cause(), Error::Io(error) if error.kind == std::io::ErrorKind::PermissionDenied && error.message == "directory refused")
+                    );
+                }
+                assert_eq!(calls, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn block_prefix_truncation_returns_too_short_before_field_decoding() {
+        let bytes = stored_archive_bytes(b"member", b"payload");
+        let file = Archive::parse(&bytes)
+            .unwrap()
+            .files()
+            .next()
+            .unwrap()
+            .clone();
+        let header =
+            &bytes[file.block.offset..file.block.offset + usize::from(file.block.head_size)];
+        for prefix in 0..header.len() {
+            assert!(matches!(
+                parse_block_header(&header[..prefix], 0),
+                Err(Error::TooShort)
+            ));
+        }
+        assert_eq!(
+            parse_block_header(header, 0).unwrap().head_size,
+            file.block.head_size
+        );
+    }
+
+    #[test]
+    fn incomplete_large_size_fields_have_matching_parser_refusals() {
+        for head_type in [FILE_HEAD, NEWSUB_HEAD] {
+            for size in 32u16..=40 {
+                let mut bytes = RAR15_SIGNATURE.to_vec();
+                test_write_main_header(&mut bytes, 0);
+                let start = bytes.len();
+                let mut header = vec![0; usize::from(size)];
+                header[2] = head_type;
+                header[3..5].copy_from_slice(&(LONG_BLOCK | FHD_LARGE).to_le_bytes());
+                header[5..7].copy_from_slice(&size.to_le_bytes());
+                header[24] = 29;
+                header[25] = 0x30;
+                bytes.extend_from_slice(&header);
+                test_write_header_crc(&mut bytes, start);
+                let memory = Archive::parse(&bytes);
+                let seekable = Archive::parse_seekable(
+                    std::io::Cursor::new(&bytes),
+                    bytes.len() as u64,
+                    0,
+                    ArchiveSource::Memory(Arc::from(bytes.clone())),
+                    crate::ArchiveReadOptions::new(),
+                );
+                if size < 40 {
+                    assert!(matches!(memory, Err(Error::TooShort)), "memory size {size}");
+                    assert!(
+                        matches!(seekable, Err(Error::TooShort)),
+                        "seekable size {size}"
+                    );
+                } else {
+                    assert_eq!(memory.unwrap().blocks, seekable.unwrap().blocks);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn seekable_parser_preserves_failures_at_each_input_operation() {
+        use std::io::{self, Cursor, Read, Seek, SeekFrom};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        struct FaultReader {
+            input: Cursor<Vec<u8>>,
+            operations: Arc<AtomicUsize>,
+            fail_at: usize,
+            cancellation: Option<crate::ReadCancellation>,
+        }
+        impl FaultReader {
+            fn check(&self) -> io::Result<()> {
+                let operation = self.operations.fetch_add(1, Ordering::Relaxed);
+                if operation == self.fail_at {
+                    if let Some(token) = &self.cancellation {
+                        token.cancel();
+                        return Ok(());
+                    }
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "input fault",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        impl Read for FaultReader {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                self.check()?;
+                self.input.read(output)
+            }
+        }
+        impl Seek for FaultReader {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                self.check()?;
+                self.input.seek(position)
+            }
+        }
+
+        let mut cases = Vec::new();
+        for (target, encrypted) in [
+            (ArchiveVersion::Rar15, false),
+            (ArchiveVersion::Rar20, false),
+            (ArchiveVersion::Rar29, false),
+            #[cfg(feature = "encryption")]
+            (ArchiveVersion::Rar30, true),
+            #[cfg(feature = "encryption")]
+            (ArchiveVersion::Rar40, true),
+        ] {
+            let mut builder = crate::Builder::new(target)
+                .store(true)
+                .comment(Some(b"archive comment".to_vec()))
+                .password(encrypted.then(|| b"secret".to_vec()))
+                .header_encryption(encrypted);
+            builder
+                .add_bytes(b"member".to_vec(), b"payload".to_vec(), None, None)
+                .unwrap();
+            cases.push((builder.to_bytes().unwrap(), encrypted));
+        }
+        // Historical recovery records cannot be produced by the legacy writer.
+        for bytes in [
+            &include_bytes!("../tests/fixtures/rar15_40/rar250_protect_head_rr1.rar")[..],
+            &include_bytes!("../tests/fixtures/rar15_40/rar300/with_recovery_rar300.rar")[..],
+        ] {
+            cases.push((bytes.to_vec(), false));
+        }
+        for (bytes, encrypted) in cases {
+            let options = if encrypted {
+                crate::ArchiveReadOptions::with_password(b"secret")
+            } else {
+                crate::ArchiveReadOptions::new()
+            };
+            let expected = Archive::parse_with_options(&bytes, options).unwrap();
+            let operations = Arc::new(AtomicUsize::new(0));
+            let parse = |fail_at, cancellation: Option<&crate::ReadCancellation>| {
+                operations.store(0, Ordering::Relaxed);
+                Archive::parse_seekable(
+                    FaultReader {
+                        input: Cursor::new(bytes.clone()),
+                        operations: operations.clone(),
+                        fail_at,
+                        cancellation: cancellation.cloned(),
+                    },
+                    bytes.len() as u64,
+                    0,
+                    ArchiveSource::Memory(Arc::from(bytes.clone())),
+                    cancellation.map_or_else(|| options, |token| options.with_cancellation(token)),
+                )
+            };
+            let archive = parse(usize::MAX, None).unwrap();
+            assert_eq!(archive.blocks, expected.blocks);
+            assert_eq!(
+                archive.archive_comment().unwrap(),
+                expected.archive_comment().unwrap()
+            );
+            let count = operations.load(Ordering::Relaxed);
+            let cancelled = crate::ReadCancellation::new();
+            cancelled.cancel();
+            assert!(matches!(
+                parse(usize::MAX, Some(&cancelled))
+                    .unwrap_err()
+                    .root_cause(),
+                Error::Cancelled
+            ));
+            assert_eq!(operations.load(Ordering::Relaxed), 0);
+            assert!(count > 0);
+            for operation in 0..count {
+                let error = parse(operation, None).unwrap_err();
+                match error.root_cause() {
+                    Error::Io(error) => {
+                        assert_eq!(error.kind, io::ErrorKind::PermissionDenied);
+                        assert_eq!(error.message, "input fault");
+                    }
+                    error => panic!("operation {operation}: {error:?}"),
+                }
+                assert_eq!(operations.load(Ordering::Relaxed), operation + 1);
+                let token = crate::ReadCancellation::new();
+                let error = parse(operation, Some(&token)).unwrap_err();
+                assert!(matches!(error.root_cause(), Error::Cancelled));
+                assert_eq!(operations.load(Ordering::Relaxed), operation + 1);
+            }
+        }
+    }
 
     #[test]
     fn audit_nested_comments_and_time_fields_preserve_legacy_admission() {
@@ -3261,7 +4181,20 @@ mod tests {
         archive.extend_from_slice(name);
         test_write_header_crc(&mut archive, start);
 
-        assert!(matches!(Archive::parse(&archive), Err(Error::TooShort)));
+        let result = Archive::parse(&archive);
+        if usize::BITS == 32 {
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::InvalidHeader(
+                        "RAR 1.5 packed file size overflows usize"
+                    ))
+                ),
+                "{result:?}"
+            );
+        } else {
+            assert!(matches!(result, Err(Error::TooShort)), "{result:?}");
+        }
     }
 
     fn block_header_with(flags: u16) -> BlockHeader {
@@ -3542,6 +4475,446 @@ mod tests {
         .unwrap()
     }
 
+    fn preservation_seed(target: ArchiveVersion) -> Archive {
+        let mut builder = crate::Builder::new(target).store(true);
+        builder
+            .add_bytes(b"entry".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        let archive = Archive::parse_owned(builder.to_bytes().unwrap()).unwrap();
+        assert!(archive.rewrite_preservation_issues().is_empty());
+        archive
+    }
+
+    fn preservation_file(archive: &mut Archive) -> &mut FileHeader {
+        archive
+            .blocks
+            .iter_mut()
+            .find_map(|block| match block {
+                Block::File(file) => Some(file),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn preservation_comment_seed(target: ArchiveVersion) -> Archive {
+        let mut builder = crate::Builder::new(target)
+            .store(true)
+            .comment(Some(b"archive note".to_vec()));
+        builder
+            .add_bytes(b"entry".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        builder
+            .set_file_comment(b"entry", Some(b"member note".to_vec()))
+            .unwrap();
+        let archive = Archive::parse_owned(builder.to_bytes().unwrap()).unwrap();
+        assert!(archive.rewrite_preservation_issues().is_empty());
+        archive
+    }
+
+    #[test]
+    fn preservation_old_comment_envelopes_refuse_unsupported_metadata() {
+        let seed = preservation_comment_seed(ArchiveVersion::Rar20);
+        let comment = seed
+            .blocks
+            .iter()
+            .find_map(|block| match block {
+                Block::Comment(comment) => Some(comment),
+                _ => None,
+            })
+            .unwrap();
+        assert!(comment.supports_rewrite());
+        type Edit = fn(&mut CommentHeader);
+        let edits: &[Edit] = &[
+            |c| c.block.head_type = FILE_HEAD,
+            |c| c.block.flags = 1,
+            |c| c.block.add_size = Some(0),
+            |c| c.block.head_size = 12,
+            |c| c.unp_size = u16::MAX,
+            |c| c.method = 0x36,
+            |c| {
+                c.method = 0x31;
+                c.unp_ver = 29;
+            },
+        ];
+        for edit in edits {
+            let mut edited = comment.clone();
+            edit(&mut edited);
+            assert!(!edited.supports_rewrite(), "{edited:?}");
+        }
+        for version in [15, 20, 26] {
+            let mut supported = comment.clone();
+            supported.method = 0x35;
+            supported.unp_ver = version;
+            assert!(supported.supports_rewrite());
+        }
+    }
+
+    #[test]
+    fn preservation_archive_and_member_comments_report_layout_and_envelope_refusals() {
+        let standalone = preservation_comment_seed(ArchiveVersion::Rar20);
+        // Standalone comments remain preservable even without MHD_COMMENT.
+        let mut unflagged = standalone.clone();
+        unflagged.main.flags &= !MHD_COMMENT;
+        assert!(unflagged.rewrite_preservation_issues().is_empty());
+        let Block::Comment(comment) = &standalone.blocks[0] else {
+            unreachable!()
+        };
+        let mut bytes = standalone
+            .source
+            .read_range(0..standalone.source.len().unwrap())
+            .unwrap();
+        let start = RAR15_SIGNATURE.len();
+        let size = MAIN_HEADER_SIZE as u16 + comment.block.head_size;
+        bytes[start + 3..start + 5]
+            .copy_from_slice(&(standalone.main.flags | MHD_COMMENT).to_le_bytes());
+        bytes[start + 5..start + 7].copy_from_slice(&size.to_le_bytes());
+        test_write_header_crc(&mut bytes[start..start + MAIN_HEADER_SIZE], 0);
+        let seed = Archive::parse_owned(bytes).unwrap();
+        assert!(seed.rewrite_preservation_issues().is_empty());
+        type Edit = fn(&mut Archive);
+        let cases: &[(&str, Edit)] = &[
+            ("legacy main header settings", |a| {
+                a.main.flags &= !MHD_COMMENT
+            }),
+            ("legacy main header settings", |a| {
+                a.main.head_size = MAIN_HEADER_SIZE as u16 + 1
+            }),
+            ("legacy main header settings", |a| {
+                if let Block::Comment(c) = &mut a.blocks[0] {
+                    c.block.offset += 1;
+                }
+            }),
+            ("archive comment location", |a| {
+                let comment = a.blocks.remove(0);
+                a.blocks.push(comment);
+            }),
+            ("archive comment location", |a| {
+                if let Block::Comment(c) = &mut a.blocks[0] {
+                    c.method = 0x36;
+                }
+            }),
+            ("duplicate legacy archive comments", |a| {
+                a.blocks.insert(1, a.blocks[0].clone())
+            }),
+            ("file comments have unsupported", |a| {
+                preservation_file(a).file_comment.clear()
+            }),
+            ("file comments have unsupported", |a| {
+                let c = &mut preservation_file(a).file_comment;
+                c[10] = 0x36;
+                test_write_header_crc(&mut c[..COMMENT_HEADER_SIZE], 0);
+            }),
+            ("file comments have unsupported", |a| {
+                preservation_file(a).file_comment.push(0)
+            }),
+            (
+                "embedded legacy file comments with encrypted headers",
+                |a| a.main.flags |= MHD_PASSWORD,
+            ),
+        ];
+        for &(expected, edit) in cases {
+            let mut archive = seed.clone();
+            edit(&mut archive);
+            let issues = archive.rewrite_preservation_issues();
+            assert!(
+                issues.iter().any(|issue| issue.contains(expected)),
+                "{expected}: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preservation_cmt_services_refuse_every_unsupported_metadata_field() {
+        let seed = preservation_comment_seed(ArchiveVersion::Rar30);
+        let index = seed
+            .blocks
+            .iter()
+            .position(|block| {
+                matches!(block,
+            Block::NewSub(sub) if sub.kind == NewSubKind::ArchiveComment)
+            })
+            .unwrap();
+        type Edit = fn(&mut FileHeader);
+        let edits: &[Edit] = &[
+            |f| f.block.flags |= FHD_DIRECTORY_MASK,
+            |f| f.block.flags |= FHD_PASSWORD,
+            |f| f.block.flags |= 0x0800,
+            |f| f.block.head_size += 1,
+            |f| f.unp_ver = 20,
+            |f| f.method = 0x36,
+            |f| f.attr = 1,
+            |f| f.host_os = 4,
+            |f| f.unp_size = u64::from(u32::MAX) + 1,
+        ];
+        for edit in edits {
+            let mut archive = seed.clone();
+            let Block::NewSub(sub) = &mut archive.blocks[index] else {
+                unreachable!()
+            };
+            edit(&mut sub.file);
+            assert!(archive
+                .rewrite_preservation_issues()
+                .iter()
+                .any(|issue| issue.contains("legacy CMT service metadata or encryption")));
+        }
+        let mut late = seed.clone();
+        let comment = late.blocks.remove(index);
+        late.blocks.push(comment);
+        assert!(late
+            .rewrite_preservation_issues()
+            .iter()
+            .any(|issue| issue.contains("legacy CMT service metadata")));
+        let mut duplicate = seed.clone();
+        duplicate
+            .blocks
+            .insert(index, duplicate.blocks[index].clone());
+        assert!(duplicate
+            .rewrite_preservation_issues()
+            .iter()
+            .any(|issue| issue.contains("duplicate legacy archive comments")));
+        let mut unknown = seed;
+        let Block::NewSub(sub) = &mut unknown.blocks[index] else {
+            unreachable!()
+        };
+        sub.kind = NewSubKind::Unknown(b"future".to_vec());
+        assert!(unknown
+            .rewrite_preservation_issues()
+            .iter()
+            .any(|issue| issue.contains("legacy recovery or other service records")));
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn preservation_accepts_encrypted_cmt_with_its_declared_salt() {
+        let mut builder = crate::Builder::new(ArchiveVersion::Rar30)
+            .store(true)
+            .comment(Some(b"archive note".to_vec()))
+            .archive_comment_password(Some(b"secret".to_vec()));
+        builder
+            .add_bytes(b"entry".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        let archive = Archive::parse_owned(builder.to_bytes().unwrap()).unwrap();
+        let comment = archive
+            .new_subs()
+            .find(|sub| sub.kind == NewSubKind::ArchiveComment)
+            .unwrap();
+        assert!(comment.file.is_encrypted());
+        assert!(comment.file.salt.is_some());
+        assert!(archive.rewrite_preservation_issues().is_empty());
+    }
+
+    #[test]
+    fn preservation_accepts_unicode_names_and_consistent_compressed_solid_members() {
+        let mut builder = crate::Builder::new(ArchiveVersion::Rar29)
+            .solid(true)
+            .compression_level(Some(1));
+        for name in [b"entry".as_slice(), b"second"] {
+            builder
+                .add_bytes(name.to_vec(), b"payload".repeat(50), None, None)
+                .unwrap();
+        }
+        builder
+            .set_legacy_unicode_name(
+                b"entry",
+                crate::filename::encode_legacy_unicode(b"entry").unwrap(),
+            )
+            .unwrap();
+        let archive = Archive::parse_owned(builder.to_bytes().unwrap()).unwrap();
+        assert!(archive.main.is_solid());
+        assert!(archive.files().next().unwrap().unicode_name.is_some());
+        assert!(archive.files().nth(1).unwrap().is_solid());
+        assert!(archive.rewrite_preservation_issues().is_empty());
+    }
+
+    #[test]
+    fn preservation_end_records_require_complete_supported_layout() {
+        let seed = preservation_seed(ArchiveVersion::Rar29);
+        let mut bytes = seed
+            .source
+            .read_range(0..seed.source.len().unwrap())
+            .unwrap();
+        let start = bytes.len();
+        bytes.extend([0, 0, ENDARC_HEAD, 0, 0, 7, 0]);
+        test_write_header_crc(&mut bytes[start..], 0);
+        let seed = Archive::parse_owned(bytes).unwrap();
+        assert!(seed.rewrite_preservation_issues().is_empty());
+        type Edit = fn(&mut BlockHeader);
+        let edits: &[Edit] = &[
+            |e| e.flags = 1,
+            |e| e.head_size = 8,
+            |e| e.add_size = Some(0),
+            |e| e.offset += 1,
+            |e| e.offset = usize::MAX,
+        ];
+        for edit in edits {
+            let mut archive = seed.clone();
+            let Some(Block::End(end)) = archive.blocks.last_mut() else {
+                unreachable!()
+            };
+            edit(end);
+            assert!(archive
+                .rewrite_preservation_issues()
+                .iter()
+                .any(|issue| issue.contains("legacy end header metadata or trailing bytes")));
+        }
+        let mut encrypted_header = seed.clone();
+        encrypted_header.main.flags |= MHD_PASSWORD;
+        let Some(Block::End(end)) = encrypted_header.blocks.last_mut() else {
+            unreachable!()
+        };
+        // Header encryption requires salt plus a padded AES header block.
+        assert_eq!(end.offset + 7, encrypted_header.source.len().unwrap());
+        assert!(encrypted_header
+            .rewrite_preservation_issues()
+            .iter()
+            .any(|issue| issue.contains("legacy end header metadata or trailing bytes")));
+        let mut overflow = seed;
+        overflow.sfx_offset = usize::MAX;
+        assert!(overflow
+            .rewrite_preservation_issues()
+            .iter()
+            .any(|issue| issue.contains("legacy end header metadata or trailing bytes")));
+    }
+
+    #[test]
+    fn preservation_accepts_empty_non_solid_directories() {
+        for target in [
+            ArchiveVersion::Rar15,
+            ArchiveVersion::Rar20,
+            ArchiveVersion::Rar29,
+            ArchiveVersion::Rar30,
+            ArchiveVersion::Rar40,
+        ] {
+            let mut builder = crate::Builder::new(target);
+            builder
+                .add_directory(b"empty".to_vec(), None, None)
+                .unwrap();
+            let archive = Archive::parse_owned(builder.to_bytes().unwrap()).unwrap();
+            let file = archive.files().next().unwrap();
+            assert!(file.is_directory());
+            assert_eq!((file.pack_size, file.unp_size), (0, 0));
+            assert!(!file.is_solid());
+            let issues = archive.rewrite_preservation_issues();
+            assert!(issues.is_empty(), "{target:?}: {issues:?}");
+        }
+    }
+
+    #[test]
+    fn preservation_preflight_reports_public_main_header_inconsistencies() {
+        let seed = preservation_seed(ArchiveVersion::Rar29);
+        type Edit = fn(&mut Archive);
+        let cases: &[(&str, Edit)] = &[
+            ("legacy volume layout", |a| a.main.flags |= MHD_VOLUME),
+            ("legacy recovery records", |a| a.main.flags |= MHD_PROTECT),
+            ("legacy main header settings", |a| {
+                a.main.flags |= MHD_NEWNUMBERING
+            }),
+            ("legacy main header settings", |a| a.main.head_size += 1),
+            ("legacy main header settings", |a| a.main.reserved1 = 1),
+            ("legacy main header settings", |a| a.main.reserved2 = 1),
+            ("empty legacy archive", |a| {
+                a.blocks.retain(|b| !matches!(b, Block::File(_)))
+            }),
+            ("missing or malformed legacy archive comment", |a| {
+                a.main.flags |= MHD_COMMENT
+            }),
+        ];
+        // These fields are public: a caller can edit a parsed archive before
+        // preflight. Every such refusal must remain observable and specific.
+        for &(expected, edit) in cases {
+            let mut archive = seed.clone();
+            edit(&mut archive);
+            let issues = archive.rewrite_preservation_issues();
+            assert!(
+                issues.iter().any(|issue| issue.contains(expected)),
+                "{expected}: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preservation_preflight_reports_public_member_metadata_inconsistencies() {
+        let mut seed = preservation_seed(ArchiveVersion::Rar29);
+        // These mutations infer the archive requirement from member metadata;
+        // a producer with unpacker 29 would independently impose that minimum.
+        seed.blocks.retain(
+            |block| !matches!(block, Block::NewSub(sub) if sub.file.name == crate::producer::NAME),
+        );
+        type Edit = fn(&mut FileHeader);
+        let cases: &[(&str, Edit)] = &[
+            ("requires unpacker 21", |f| f.unp_ver = 21),
+            ("encryption salt settings", |f| {
+                f.unp_ver = 20;
+                f.salt = Some([0; 8]);
+            }),
+            ("encryption salt settings", |f| {
+                f.block.flags |= FHD_PASSWORD
+            }),
+            ("Pre-RAR2.9 extended timestamps", |f| {
+                f.unp_ver = 20;
+                f.block.flags |= FHD_EXTTIME;
+                f.ext_time = vec![0, 0];
+            }),
+            ("extended timestamps are incomplete", |f| {
+                f.block.flags |= FHD_EXTTIME;
+                f.ext_time = vec![0];
+            }),
+            ("legacy host metadata", |f| f.host_os = 4),
+            ("solid dependency without archive solid flag", |f| {
+                f.block.flags |= FHD_SOLID
+            }),
+            ("legacy file flags or extra metadata", |f| {
+                f.block.flags |= 0x0800
+            }),
+            ("legacy file flags or extra metadata", |f| {
+                f.block.head_size += 1
+            }),
+            ("unsupported legacy method or size", |f| f.method = 0x36),
+            ("unsupported legacy method or size", |f| {
+                f.unp_size = u64::from(u32::MAX) + 1
+            }),
+            ("unsupported legacy directory payload", |f| {
+                f.block.flags |= FHD_DIRECTORY_MASK
+            }),
+            ("unsupported legacy directory payload", |f| {
+                f.block.flags |= FHD_DIRECTORY_MASK;
+                f.pack_size = 0;
+            }),
+            // In a solid archive FHD_SOLID on a directory is what RAR writes;
+            // this archive is not solid, so it is still refused.
+            ("solid dependency without archive solid flag", |f| {
+                f.block.flags |= FHD_DIRECTORY_MASK | FHD_SOLID;
+                f.pack_size = 0;
+                f.unp_size = 0;
+            }),
+            ("malformed or unsupported legacy Unicode name", |f| {
+                f.unicode_name = Some(b"bad".to_vec())
+            }),
+        ];
+        for &(expected, edit) in cases {
+            let mut archive = seed.clone();
+            edit(preservation_file(&mut archive));
+            let issues = archive.rewrite_preservation_issues();
+            assert!(
+                issues.iter().any(|issue| issue.contains(expected)),
+                "{expected}: {issues:?}"
+            );
+        }
+        let mut rar15 = preservation_seed(ArchiveVersion::Rar15);
+        preservation_file(&mut rar15).host_os = 3;
+        assert!(rar15
+            .rewrite_preservation_issues()
+            .iter()
+            .any(|issue| issue.contains("RAR1.5 Unix metadata")));
+        let mut rar15 = preservation_seed(ArchiveVersion::Rar15);
+        preservation_file(&mut rar15).unicode_name =
+            Some(crate::filename::encode_legacy_unicode(b"entry").unwrap());
+        assert!(rar15
+            .rewrite_preservation_issues()
+            .iter()
+            .any(|issue| issue.contains("malformed or unsupported legacy Unicode name")));
+    }
+
     #[test]
     fn flagged_but_missing_file_comment_does_not_hide_the_member() {
         let mut bytes = stored_archive_bytes(b"entry", b"payload");
@@ -3549,9 +4922,8 @@ mod tests {
         let head_size = usize::from(u16::from_le_bytes(
             bytes[file_start + 5..file_start + 7].try_into().unwrap(),
         ));
-        let flags = u16::from_le_bytes(
-            bytes[file_start + 3..file_start + 5].try_into().unwrap(),
-        ) | FHD_COMMENT;
+        let flags = u16::from_le_bytes(bytes[file_start + 3..file_start + 5].try_into().unwrap())
+            | FHD_COMMENT;
         bytes[file_start + 3..file_start + 5].copy_from_slice(&flags.to_le_bytes());
         test_write_header_crc(&mut bytes[file_start..file_start + head_size], 0);
 
@@ -3563,6 +4935,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "recovery")]
     fn repaired_legacy_volume_keeps_missing_end_block_and_nonzero_trailer() {
         let mut bytes = stored_archive_bytes(b"entry", b"payload");
         let end_start = bytes.len();
@@ -3578,21 +4951,26 @@ mod tests {
             })
             .unwrap();
         let mut without_end = bytes[..end.offset].to_vec();
-        assert!(Archive::parse(&without_end).unwrap().files().next().is_some());
+        assert!(Archive::parse(&without_end)
+            .unwrap()
+            .files()
+            .next()
+            .is_some());
         assert_eq!(
-            truncate_repaired_rev3_volume(without_end.clone()).unwrap(),
+            truncate_repaired_rev3_volume(without_end.clone()),
             without_end
         );
 
         without_end = bytes;
         without_end.extend_from_slice(b"not padding");
         assert_eq!(
-            truncate_repaired_rev3_volume(without_end.clone()).unwrap(),
+            truncate_repaired_rev3_volume(without_end.clone()),
             without_end
         );
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encrypted_header_readers_reject_short_prefixes_and_declared_headers() {
         let mut cache = EncryptedHeaderCipherCache::default();
         for size in [0u16, 6, 17, 65] {
@@ -3642,6 +5020,16 @@ mod tests {
         }
         for available in [0, 7, 8, 23] {
             let bytes = vec![0; available];
+            assert!(matches!(
+                decrypt_encrypted_header_at(
+                    &bytes,
+                    0,
+                    b"pw",
+                    &mut cache,
+                    &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new())
+                ),
+                Err(Error::TooShort)
+            ));
             assert!(matches!(
                 read_encrypted_header_at(
                     &mut std::io::Cursor::new(&bytes),
@@ -3808,6 +5196,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn archive_parse_owned_with_password_unlocks_encrypted_archive() {
         let features = FeatureSet::store_only();
         let bytes = write_stored_archive(
@@ -3884,6 +5273,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "encryption")]
     fn encrypted_stored_workspace_refusal_keeps_resource_error() {
         let bytes = write_stored_archive(
             &[StoredEntry {

@@ -122,7 +122,7 @@ impl Archive {
         let target = self
             .read_member_at(index, password)?
             .ok_or(crate::Error::EntryNotFound)?;
-        validate_legacy_link_target(&target, &member.meta.name)?;
+        crate::extraction_links::validate_legacy_target(&target, &member.meta.name)?;
         Ok(Some(target))
     }
 
@@ -143,6 +143,9 @@ impl Archive {
         use crate::{ArchiveReadOptions, Error, ExtractionDecision, SharedBuffer};
         use std::sync::{Arc, Mutex};
 
+        let Archive::Rar15To40(legacy) = self else {
+            return Ok(self.members().map(|_| None).collect());
+        };
         let members: Vec<_> = self.members().collect();
         let Some(last) = members
             .iter()
@@ -151,10 +154,7 @@ impl Archive {
             return Ok((0..members.len()).map(|_| None).collect());
         };
         let mut targets: Vec<Option<SharedBuffer>> = (0..members.len()).map(|_| None).collect();
-        let solid = match self {
-            Archive::Rar15To40(archive) => archive.main.is_solid(),
-            _ => false,
-        };
+        let solid = legacy.main.is_solid();
         let mut index = 0;
         self.extract_with_control(
             ArchiveReadOptions::with_optional_password(password),
@@ -190,7 +190,7 @@ impl Archive {
                         .ok_or(Error::InvalidHeader(
                             "legacy link target disappeared while reading",
                         ))?;
-                validate_legacy_link_target(&target, &member.meta.name)?;
+                crate::extraction_links::validate_legacy_target(&target, &member.meta.name)?;
                 Ok(Some(target))
             })
             .collect()
@@ -245,7 +245,7 @@ impl Archive {
                         .then_some(26),
                     )
                     .solid(archive.main.is_solid())
-                    // Preflight accepts only CMT new-sub records, and at most one.
+                    // Preflight accepts one producer and at most one CMT record.
                     .archive_comment_password(
                         archive
                             .new_subs()
@@ -258,7 +258,7 @@ impl Archive {
                     .legacy_archive_comment_metadata(
                         archive
                             .new_subs()
-                            .next()
+                            .find(|sub| sub.kind == crate::rar15_40::NewSubKind::ArchiveComment)
                             .map(|sub| (sub.file.file_time, sub.file.host_os)),
                     ))
             }
@@ -446,6 +446,7 @@ impl Archive {
                 }
                 let mut index = 0;
                 let mut comment_seen = false;
+                let mut producer_seen = false;
                 for block in &archive.blocks {
                     match block {
                         Block::File(file) => {
@@ -478,6 +479,16 @@ impl Archive {
                             index += 1;
                         }
                         Block::Service(service) => {
+                            if service.name == crate::rar50::producer::NAME {
+                                if producer_seen
+                                    || index != 0
+                                    || !crate::rar50::producer::is_replaceable(service, archive)
+                                {
+                                    issues.push("unsupported producer service".into());
+                                }
+                                producer_seen = true;
+                                continue;
+                            }
                             if service.name == b"QO" || service.name == b"RR" {
                                 if !derived_services.insert(service.name.clone())
                                     || !service.rewrite_metadata_complete
@@ -572,19 +583,11 @@ pub(crate) fn special_entry(meta: &ArchiveMemberMeta) -> bool {
         || (meta.attr_source() == AttrSource::Dos && meta.file_attr & 0x400 != 0)
 }
 
-fn validate_legacy_link_target(target: &[u8], name: &[u8]) -> crate::Result<()> {
-    if target.is_empty() || target.contains(&0) {
-        return Err(crate::Error::InvalidArgument(
-            "legacy symbolic link target is empty or contains NUL",
-        )
-        .at_entry(name.to_vec(), "reading link target"));
-    }
-    Ok(())
-}
-
 impl crate::ArchiveMember {
     /// Legacy Unix links store the native target as ordinary member data.
     pub fn is_legacy_unix_symlink(&self) -> bool {
+        // Preserve this inspection API's historical Unix-attribute interpretation,
+        // including BeOS. Filesystem extraction follows the wire host instead.
         self.meta.family == crate::ArchiveFamily::Rar15To40
             && self.meta.attr_source() == AttrSource::Unix
             && self.meta.file_attr & !0o7777 == 0o120000

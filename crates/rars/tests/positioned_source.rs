@@ -18,10 +18,7 @@ struct Positioned {
 impl ReadAt for Positioned {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         if self.fail.load(Ordering::Relaxed) {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "positioned read failed",
-            ));
+            return Err(io::Error::other("positioned read failed"));
         }
         let offset = usize::try_from(offset)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset overflows usize"))?;
@@ -36,10 +33,7 @@ impl ReadAt for Positioned {
 
     fn size(&self) -> io::Result<u64> {
         if self.fail.load(Ordering::Relaxed) {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "positioned size failed",
-            ));
+            return Err(io::Error::other("positioned size failed"));
         }
         Ok(self.bytes.len() as u64)
     }
@@ -118,16 +112,16 @@ fn read_source_handles_short_reads_for_legacy_rar5_and_rar7_and_sfx() {
         let archive = ArchiveReader::read_source(source).unwrap_or_else(|error| {
             panic!("{version:?}: {error:?}");
         });
+        assert_eq!(
+            archive.read_member(b"payload.bin", None).unwrap(),
+            Some(payload)
+        );
         if version != ArchiveVersion::Rar14 {
             assert!(
                 reads.load(Ordering::Relaxed) > 10,
                 "short reads were not exercised"
             );
         }
-        assert_eq!(
-            archive.read_member(b"payload.bin", None).unwrap(),
-            Some(payload)
-        );
     }
 }
 

@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::{rar50, ArchiveVersion, EntrySource, FeatureSet, WriterResources};
 use std::io::Cursor;
 use std::sync::{
@@ -301,7 +303,10 @@ fn volume_compression_source_failure_keeps_member_identity() {
     )
     .unwrap_err();
     assert_eq!(error.kind(), rars::ErrorKind::Io);
-    assert_eq!(error.entry_context(), Some((b"failed-member".as_slice(), "compressing")));
+    assert_eq!(
+        error.entry_context(),
+        Some((b"failed-member".as_slice(), "compressing"))
+    );
     assert!(sink.take().is_empty());
 }
 

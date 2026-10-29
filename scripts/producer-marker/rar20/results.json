@@ -1,0 +1,5259 @@
+{
+  "base_revision": "8d17a44",
+  "schema": 1,
+  "layout": "RARS after main header and any old-style comment, before files, in each volume; unpacker version 20",
+  "writer_source_sha256": "2243d44919c98e6536723b174eeb5a44b4d85f12b9c90c2c13d7b93b84462681",
+  "payload_source_sha256": "cd68b023022a68499526c65bc07b99db3b2178a7916e4f58790df06b978abdda",
+  "prototype_and_integration_marker_bytes_identical": [
+    "archives/rar20/comment/marked/archive.rar",
+    "archives/rar20/compressed/marked/archive.rar",
+    "archives/rar20/compressed-volumes/marked/archive.r00",
+    "archives/rar20/compressed-volumes/marked/archive.r01",
+    "archives/rar20/compressed-volumes/marked/archive.rar",
+    "archives/rar20/empty-file/marked/archive.rar",
+    "archives/rar20/password-compressed/marked/archive.rar",
+    "archives/rar20/password-stored/marked/archive.rar",
+    "archives/rar20/password-volumes/marked/archive.r00",
+    "archives/rar20/password-volumes/marked/archive.r01",
+    "archives/rar20/password-volumes/marked/archive.rar",
+    "archives/rar20/solid/marked/archive.rar",
+    "archives/rar20/solid-volumes/marked/archive.r00",
+    "archives/rar20/solid-volumes/marked/archive.r01",
+    "archives/rar20/solid-volumes/marked/archive.rar",
+    "archives/rar20/stored/marked/archive.rar",
+    "archives/rar20/stored-volumes/marked/archive.r00",
+    "archives/rar20/stored-volumes/marked/archive.r01",
+    "archives/rar20/stored-volumes/marked/archive.rar"
+  ],
+  "reference_distribution_sha256": "3862e775d7b503463608962a96fe7b21b78b643c94f6b98341a2cbc5abad24d3",
+  "reference_technote_sha256": "f8b8f0f7f08fe2be250ff35095fc1e64d33cf29db6224c13160201bb8fe3b5bd",
+  "dosbox_executable_sha256": "99d7460153175d13a21036fb4b0e7524e05b6a1e50cd4e59f2470afad12a0df3",
+  "matrices": {
+    "production-native": {
+      "control_sha256": "8f77ff36533367050e4f1854e71130d4e70097fa5aa518385d6851c805413504",
+      "marked_sha256": "ce64c0ab7dd4cc7135ebe79c368ac9ef359f3416c47fb08f0662658dbeda6991",
+      "engines": [
+        {
+          "name": "unrar-7.20",
+          "family": "rar",
+          "command": [
+            "/usr/bin/unrar"
+          ],
+          "executable_sha256": "b7108a21c3276d0eab35ed1910995c2c5a150ad66582ee99f0800043be564cff"
+        },
+        {
+          "name": "rar-7.12",
+          "family": "rar",
+          "command": [
+            "/home/gaz/src/tmp/rar/_refs/rarbins/rar712-linux-x64"
+          ],
+          "executable_sha256": "c9dcacb4e1e9313be11e370adb791b06302dd0b3140fadd406e63c5758263ec5"
+        },
+        {
+          "name": "rar-3.93",
+          "family": "rar",
+          "command": [
+            "/home/gaz/src/tmp/rar/_refs/rarbins/rar393-linux-x64"
+          ],
+          "executable_sha256": "4cb3c99988704a65ac768469ecdf70df344b2b12e1b0cee371c8deb631bc6229"
+        },
+        {
+          "name": "7zip-26.04",
+          "family": "7zip",
+          "command": [
+            "/home/gaz/src/rars/target/producer-marker/tools/7zip/7zz"
+          ],
+          "executable_sha256": "d1bc79f00e9815b24048ab167690bdd1dbc387de7dbc47e8d75d68689e49cf4f"
+        },
+        {
+          "name": "libarchive-3.8.5",
+          "family": "libarchive",
+          "command": [
+            "/usr/bin/bsdtar"
+          ],
+          "executable_sha256": "a160f970a1ba6e6fe4ee3300f1bb8536fb5e8af04daf862cea97f79918964826"
+        },
+        {
+          "name": "unar-1.10.8",
+          "family": "unar",
+          "command": [
+            "/home/gaz/src/rars/target/producer-marker/tools/root/usr/bin/unar"
+          ],
+          "list_command": [
+            "/home/gaz/src/rars/target/producer-marker/tools/root/usr/bin/lsar"
+          ],
+          "env": {
+            "LD_LIBRARY_PATH": "/home/gaz/src/rars/target/producer-marker/tools/root/usr/lib/x86_64-linux-gnu:/home/gaz/src/rars/target/producer-marker/tools/root/usr/lib"
+          },
+          "executable_sha256": "8702c710abe2034594a10dd28a7f1aa9f7126db42a3c52cdfff1a19abfecf432",
+          "list_executable_sha256": "9d94b1e69c90d92534430003f0c439f3e5db2a7a244ae66c413909ae53603c2d"
+        },
+        {
+          "name": "rars-0.10.2",
+          "family": "rars",
+          "command": [
+            "/home/gaz/src/rars/target/producer-marker/rars-control"
+          ],
+          "executable_sha256": "3c90189127449f45ad893c6d79e8b4ff449462518ac315690d5f2bec44e32ae9"
+        },
+        {
+          "name": "rars-production",
+          "family": "rars",
+          "command": [
+            "/home/gaz/src/rars/target/producer-marker-rar20/rars-production"
+          ],
+          "executable_sha256": "ce64c0ab7dd4cc7135ebe79c368ac9ef359f3416c47fb08f0662658dbeda6991"
+        }
+      ],
+      "cases": {
+        "rar20/stored": {
+          "options": [
+            "--store"
+          ],
+          "expected": {
+            "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+            "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "text.txt": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2",
+            "unicode-caf\u00e9.txt": "9a0dabfb45748293950408e8a3a3e5482342e6bdd79cded4de89bb48e0fb2c0c"
+          }
+        },
+        "rar20/compressed": {
+          "options": [],
+          "expected": {
+            "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+            "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "text.txt": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2",
+            "unicode-caf\u00e9.txt": "9a0dabfb45748293950408e8a3a3e5482342e6bdd79cded4de89bb48e0fb2c0c"
+          }
+        },
+        "rar20/solid": {
+          "options": [
+            "--solid"
+          ],
+          "expected": {
+            "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+            "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "text.txt": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2",
+            "unicode-caf\u00e9.txt": "9a0dabfb45748293950408e8a3a3e5482342e6bdd79cded4de89bb48e0fb2c0c"
+          }
+        },
+        "rar20/comment": {
+          "options": [
+            "--comment",
+            "User comment survives independently"
+          ],
+          "expected": {
+            "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+            "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "text.txt": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2",
+            "unicode-caf\u00e9.txt": "9a0dabfb45748293950408e8a3a3e5482342e6bdd79cded4de89bb48e0fb2c0c"
+          }
+        },
+        "rar20/password-stored": {
+          "options": [
+            "--store",
+            "--password",
+            "probe-password"
+          ],
+          "expected": {
+            "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+            "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "text.txt": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2",
+            "unicode-caf\u00e9.txt": "9a0dabfb45748293950408e8a3a3e5482342e6bdd79cded4de89bb48e0fb2c0c"
+          }
+        },
+        "rar20/password-compressed": {
+          "options": [
+            "--password",
+            "probe-password"
+          ],
+          "expected": {
+            "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+            "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "text.txt": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2",
+            "unicode-caf\u00e9.txt": "9a0dabfb45748293950408e8a3a3e5482342e6bdd79cded4de89bb48e0fb2c0c"
+          }
+        },
+        "rar20/stored-volumes": {
+          "options": [
+            "--store",
+            "--volume-size",
+            "4k"
+          ],
+          "expected": {
+            "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+          }
+        },
+        "rar20/compressed-volumes": {
+          "options": [
+            "--volume-size",
+            "4k"
+          ],
+          "expected": {
+            "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+          }
+        },
+        "rar20/solid-volumes": {
+          "options": [
+            "--solid",
+            "--volume-size",
+            "4k"
+          ],
+          "expected": {
+            "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+          }
+        },
+        "rar20/password-volumes": {
+          "options": [
+            "--password",
+            "probe-password",
+            "--volume-size",
+            "4k"
+          ],
+          "expected": {
+            "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+          }
+        },
+        "rar20/empty-file": {
+          "options": [
+            "--store"
+          ],
+          "expected": {
+            "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        }
+      },
+      "results": [
+        {
+          "engine": "unrar-7.20",
+          "case": "rar20/stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.12",
+          "case": "rar20/stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-3.93",
+          "case": "rar20/stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "7zip-26.04",
+          "case": "rar20/stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "libarchive-3.8.5",
+          "case": "rar20/stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "unar-1.10.8",
+          "case": "rar20/stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-0.10.2",
+          "case": "rar20/stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-production",
+          "case": "rar20/stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "unrar-7.20",
+          "case": "rar20/compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.12",
+          "case": "rar20/compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-3.93",
+          "case": "rar20/compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "7zip-26.04",
+          "case": "rar20/compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "libarchive-3.8.5",
+          "case": "rar20/compressed",
+          "status": "CONTROL_FAIL",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 1,
+            "contents_match": false,
+            "comment_match": true,
+            "manifest": {
+              "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+              "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "text.txt": "151ff79f29e96d211576b9a2e3e78f518b26109916616945d50cdee82dd2ba8b"
+            }
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 1,
+            "contents_match": false,
+            "comment_match": true,
+            "manifest": {
+              "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+              "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "text.txt": "151ff79f29e96d211576b9a2e3e78f518b26109916616945d50cdee82dd2ba8b"
+            }
+          }
+        },
+        {
+          "engine": "unar-1.10.8",
+          "case": "rar20/compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-0.10.2",
+          "case": "rar20/compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-production",
+          "case": "rar20/compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "unrar-7.20",
+          "case": "rar20/solid",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.12",
+          "case": "rar20/solid",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-3.93",
+          "case": "rar20/solid",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "7zip-26.04",
+          "case": "rar20/solid",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "libarchive-3.8.5",
+          "case": "rar20/solid",
+          "status": "CONTROL_FAIL",
+          "control": {
+            "test_exit": 1,
+            "extract_exit": 1,
+            "contents_match": false,
+            "comment_match": true,
+            "manifest": {
+              "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+              "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "text.txt": "151ff79f29e96d211576b9a2e3e78f518b26109916616945d50cdee82dd2ba8b"
+            }
+          },
+          "marked": {
+            "test_exit": 1,
+            "extract_exit": 1,
+            "contents_match": false,
+            "comment_match": true,
+            "manifest": {
+              "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+              "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "text.txt": "151ff79f29e96d211576b9a2e3e78f518b26109916616945d50cdee82dd2ba8b"
+            }
+          }
+        },
+        {
+          "engine": "unar-1.10.8",
+          "case": "rar20/solid",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-0.10.2",
+          "case": "rar20/solid",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-production",
+          "case": "rar20/solid",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "unrar-7.20",
+          "case": "rar20/comment",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.12",
+          "case": "rar20/comment",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-3.93",
+          "case": "rar20/comment",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "7zip-26.04",
+          "case": "rar20/comment",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "libarchive-3.8.5",
+          "case": "rar20/comment",
+          "status": "CONTROL_FAIL",
+          "control": {
+            "test_exit": 1,
+            "extract_exit": 1,
+            "contents_match": false,
+            "comment_match": true,
+            "manifest": {}
+          },
+          "marked": {
+            "test_exit": 1,
+            "extract_exit": 1,
+            "contents_match": false,
+            "comment_match": true,
+            "manifest": {}
+          }
+        },
+        {
+          "engine": "unar-1.10.8",
+          "case": "rar20/comment",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-0.10.2",
+          "case": "rar20/comment",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-production",
+          "case": "rar20/comment",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "unrar-7.20",
+          "case": "rar20/password-stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.12",
+          "case": "rar20/password-stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-3.93",
+          "case": "rar20/password-stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "7zip-26.04",
+          "case": "rar20/password-stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "libarchive-3.8.5",
+          "case": "rar20/password-stored",
+          "status": "CONTROL_FAIL",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 1,
+            "contents_match": false,
+            "comment_match": true,
+            "manifest": {
+              "binary.bin": "0da6712993f4a8e80ec17bae32fa8bfe05337ca9d0a417b12c5fd36534312b1d",
+              "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "text.txt": "06f7a7aa01d75ef6a0f5eabafd98453acfd32938c0bc90441f46e20678c0bfdf",
+              "unicode-caf\u00e9.txt": "3cc24c50488aedc51722126157da0bfaa034fe1648ec07ad05d3045ef5a1d60e"
+            }
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 1,
+            "contents_match": false,
+            "comment_match": true,
+            "manifest": {
+              "binary.bin": "0da6712993f4a8e80ec17bae32fa8bfe05337ca9d0a417b12c5fd36534312b1d",
+              "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "text.txt": "06f7a7aa01d75ef6a0f5eabafd98453acfd32938c0bc90441f46e20678c0bfdf",
+              "unicode-caf\u00e9.txt": "3cc24c50488aedc51722126157da0bfaa034fe1648ec07ad05d3045ef5a1d60e"
+            }
+          }
+        },
+        {
+          "engine": "unar-1.10.8",
+          "case": "rar20/password-stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-0.10.2",
+          "case": "rar20/password-stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-production",
+          "case": "rar20/password-stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "unrar-7.20",
+          "case": "rar20/password-compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.12",
+          "case": "rar20/password-compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-3.93",
+          "case": "rar20/password-compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "7zip-26.04",
+          "case": "rar20/password-compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "libarchive-3.8.5",
+          "case": "rar20/password-compressed",
+          "status": "CONTROL_FAIL",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 1,
+            "contents_match": false,
+            "comment_match": true,
+            "manifest": {
+              "binary.bin": "0da6712993f4a8e80ec17bae32fa8bfe05337ca9d0a417b12c5fd36534312b1d",
+              "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "text.txt": "151ff79f29e96d211576b9a2e3e78f518b26109916616945d50cdee82dd2ba8b"
+            }
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 1,
+            "contents_match": false,
+            "comment_match": true,
+            "manifest": {
+              "binary.bin": "0da6712993f4a8e80ec17bae32fa8bfe05337ca9d0a417b12c5fd36534312b1d",
+              "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "text.txt": "151ff79f29e96d211576b9a2e3e78f518b26109916616945d50cdee82dd2ba8b"
+            }
+          }
+        },
+        {
+          "engine": "unar-1.10.8",
+          "case": "rar20/password-compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-0.10.2",
+          "case": "rar20/password-compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-production",
+          "case": "rar20/password-compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "unrar-7.20",
+          "case": "rar20/stored-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.12",
+          "case": "rar20/stored-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-3.93",
+          "case": "rar20/stored-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "7zip-26.04",
+          "case": "rar20/stored-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "libarchive-3.8.5",
+          "case": "rar20/stored-volumes",
+          "status": "CONTROL_FAIL",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 1,
+            "contents_match": false,
+            "comment_match": true,
+            "manifest": {
+              "binary.bin": "7829e71e138b93e8eafcf316bcdc8e117c914204974d09fecb5778f3499d608e"
+            }
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 1,
+            "contents_match": false,
+            "comment_match": true,
+            "manifest": {
+              "binary.bin": "7829e71e138b93e8eafcf316bcdc8e117c914204974d09fecb5778f3499d608e"
+            }
+          }
+        },
+        {
+          "engine": "unar-1.10.8",
+          "case": "rar20/stored-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-0.10.2",
+          "case": "rar20/stored-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-production",
+          "case": "rar20/stored-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "unrar-7.20",
+          "case": "rar20/compressed-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.12",
+          "case": "rar20/compressed-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-3.93",
+          "case": "rar20/compressed-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "7zip-26.04",
+          "case": "rar20/compressed-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "libarchive-3.8.5",
+          "case": "rar20/compressed-volumes",
+          "status": "CONTROL_FAIL",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 1,
+            "contents_match": false,
+            "comment_match": true,
+            "manifest": {
+              "binary.bin": "7829e71e138b93e8eafcf316bcdc8e117c914204974d09fecb5778f3499d608e"
+            }
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 1,
+            "contents_match": false,
+            "comment_match": true,
+            "manifest": {
+              "binary.bin": "7829e71e138b93e8eafcf316bcdc8e117c914204974d09fecb5778f3499d608e"
+            }
+          }
+        },
+        {
+          "engine": "unar-1.10.8",
+          "case": "rar20/compressed-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-0.10.2",
+          "case": "rar20/compressed-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-production",
+          "case": "rar20/compressed-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "unrar-7.20",
+          "case": "rar20/solid-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.12",
+          "case": "rar20/solid-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-3.93",
+          "case": "rar20/solid-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "7zip-26.04",
+          "case": "rar20/solid-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "libarchive-3.8.5",
+          "case": "rar20/solid-volumes",
+          "status": "CONTROL_FAIL",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 1,
+            "contents_match": false,
+            "comment_match": true,
+            "manifest": {
+              "binary.bin": "7829e71e138b93e8eafcf316bcdc8e117c914204974d09fecb5778f3499d608e"
+            }
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 1,
+            "contents_match": false,
+            "comment_match": true,
+            "manifest": {
+              "binary.bin": "7829e71e138b93e8eafcf316bcdc8e117c914204974d09fecb5778f3499d608e"
+            }
+          }
+        },
+        {
+          "engine": "unar-1.10.8",
+          "case": "rar20/solid-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-0.10.2",
+          "case": "rar20/solid-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-production",
+          "case": "rar20/solid-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "unrar-7.20",
+          "case": "rar20/password-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.12",
+          "case": "rar20/password-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-3.93",
+          "case": "rar20/password-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "7zip-26.04",
+          "case": "rar20/password-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "libarchive-3.8.5",
+          "case": "rar20/password-volumes",
+          "status": "CONTROL_FAIL",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 1,
+            "contents_match": false,
+            "comment_match": true,
+            "manifest": {
+              "binary.bin": "0f18ba9d655914ac3e232ad4d20bdfe6c1f8dd52e5a8cfe13f780ca9447f2f88"
+            }
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 1,
+            "contents_match": false,
+            "comment_match": true,
+            "manifest": {
+              "binary.bin": "0f18ba9d655914ac3e232ad4d20bdfe6c1f8dd52e5a8cfe13f780ca9447f2f88"
+            }
+          }
+        },
+        {
+          "engine": "unar-1.10.8",
+          "case": "rar20/password-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-0.10.2",
+          "case": "rar20/password-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-production",
+          "case": "rar20/password-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "unrar-7.20",
+          "case": "rar20/empty-file",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.12",
+          "case": "rar20/empty-file",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-3.93",
+          "case": "rar20/empty-file",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "7zip-26.04",
+          "case": "rar20/empty-file",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "libarchive-3.8.5",
+          "case": "rar20/empty-file",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "unar-1.10.8",
+          "case": "rar20/empty-file",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-0.10.2",
+          "case": "rar20/empty-file",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rars-production",
+          "case": "rar20/empty-file",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        }
+      ],
+      "summary": {
+        "PASS": 79,
+        "CONTROL_FAIL": 9
+      }
+    },
+    "windows": {
+      "control_sha256": "8f77ff36533367050e4f1854e71130d4e70097fa5aa518385d6851c805413504",
+      "marked_sha256": "222442cca0158d536821da60428fc5ee893c684adadc283fa694f1a754c2bcc1",
+      "engines": [
+        {
+          "name": "rar-290",
+          "family": "rar",
+          "command": [
+            "wine",
+            "/home/gaz/src/rars/target/producer-marker-rar29/winrar290/Rar.exe"
+          ],
+          "windows": true,
+          "env": {
+            "WINEPREFIX": "/home/gaz/src/rars/target/producer-marker/wine",
+            "WINEDEBUG": "-all",
+            "WINESERVER": "/home/gaz/src/rars/target/producer-marker-rar34/tools/wineserver-persistent"
+          },
+          "executable_sha256": "3f938b2f4cc13b9b85d61417b36af45a970dbee0e09e9d9e13f4e00350485112"
+        },
+        {
+          "name": "winrar-290",
+          "family": "winrar",
+          "command": [
+            "wine",
+            "/home/gaz/src/rars/target/producer-marker-rar29/winrar290/WinRAR.exe"
+          ],
+          "windows": true,
+          "env": {
+            "WINEPREFIX": "/home/gaz/src/rars/target/producer-marker/wine",
+            "WINEDEBUG": "-all",
+            "WINESERVER": "/home/gaz/src/rars/target/producer-marker-rar34/tools/wineserver-persistent"
+          },
+          "executable_sha256": "e9d68fa652ed89e3e2ad512ca8c690ce46c335cc8e0db26ab323c91ce45bae47"
+        },
+        {
+          "name": "rar-300",
+          "family": "rar",
+          "command": [
+            "wine",
+            "/home/gaz/src/rars/target/producer-marker-rar34/tools/winrar300/Rar.exe"
+          ],
+          "windows": true,
+          "env": {
+            "WINEPREFIX": "/home/gaz/src/rars/target/producer-marker/wine",
+            "WINEDEBUG": "-all",
+            "WINESERVER": "/home/gaz/src/rars/target/producer-marker-rar34/tools/wineserver-persistent"
+          },
+          "executable_sha256": "fa76d9059fc4fe103e3de1868c76d86efbac9295fcd3e5f1c430cd1c5b4ad710"
+        },
+        {
+          "name": "winrar-300",
+          "family": "winrar",
+          "command": [
+            "wine",
+            "/home/gaz/src/rars/target/producer-marker-rar34/tools/winrar300/WinRAR.exe"
+          ],
+          "windows": true,
+          "env": {
+            "WINEPREFIX": "/home/gaz/src/rars/target/producer-marker/wine",
+            "WINEDEBUG": "-all",
+            "WINESERVER": "/home/gaz/src/rars/target/producer-marker-rar34/tools/wineserver-persistent"
+          },
+          "executable_sha256": "02c35862bf07ec9cf58cb3d8b2cd72049fbecd072b5e34297e8f3641d78f4e2a"
+        },
+        {
+          "name": "rar-420",
+          "family": "rar",
+          "command": [
+            "wine",
+            "/home/gaz/src/rars/target/producer-marker-rar34/tools/winrar420/Rar.exe"
+          ],
+          "windows": true,
+          "env": {
+            "WINEPREFIX": "/home/gaz/src/rars/target/producer-marker/wine",
+            "WINEDEBUG": "-all",
+            "WINESERVER": "/home/gaz/src/rars/target/producer-marker-rar34/tools/wineserver-persistent"
+          },
+          "executable_sha256": "9aa5cfc426d8fafb8826018d72302fcefafac0d07165245aab621267fab5ae59"
+        },
+        {
+          "name": "winrar-420",
+          "family": "winrar",
+          "command": [
+            "wine",
+            "/home/gaz/src/rars/target/producer-marker-rar34/tools/winrar420/WinRAR.exe"
+          ],
+          "windows": true,
+          "env": {
+            "WINEPREFIX": "/home/gaz/src/rars/target/producer-marker/wine",
+            "WINEDEBUG": "-all",
+            "WINESERVER": "/home/gaz/src/rars/target/producer-marker-rar34/tools/wineserver-persistent"
+          },
+          "executable_sha256": "b908109795e2bae549c34e8011e4e128207af90502b1129f0487310ef615ab3f"
+        },
+        {
+          "name": "rar-5.00",
+          "family": "rar",
+          "command": [
+            "wine",
+            "/home/gaz/src/rars/target/producer-marker/tools/rar500/Rar.exe"
+          ],
+          "windows": true,
+          "env": {
+            "WINEPREFIX": "/home/gaz/src/rars/target/producer-marker/wine",
+            "WINEDEBUG": "-all",
+            "WINESERVER": "/home/gaz/src/rars/target/producer-marker-rar34/tools/wineserver-persistent"
+          },
+          "executable_sha256": "2ebc5986cabc99312ff3431d4300bd121bab4972ebfa1f745d74171d4c21e7b1"
+        },
+        {
+          "name": "rar-6.02",
+          "family": "rar",
+          "command": [
+            "wine",
+            "/home/gaz/src/tmp/rar/research/re/winrar602/bin/Rar.exe"
+          ],
+          "windows": true,
+          "env": {
+            "WINEPREFIX": "/home/gaz/src/rars/target/producer-marker/wine",
+            "WINEDEBUG": "-all",
+            "WINESERVER": "/home/gaz/src/rars/target/producer-marker-rar34/tools/wineserver-persistent"
+          },
+          "executable_sha256": "4b16ea1b1273f8746cf399c71bfc1f5bff7378b5414b4ea044c55e0ee08c89d3"
+        },
+        {
+          "name": "rar-7.21b1",
+          "family": "rar",
+          "command": [
+            "wine",
+            "/home/gaz/src/rars/target/producer-marker/tools/rar721/Rar.exe"
+          ],
+          "windows": true,
+          "env": {
+            "WINEPREFIX": "/home/gaz/src/rars/target/producer-marker/wine",
+            "WINEDEBUG": "-all",
+            "WINESERVER": "/home/gaz/src/rars/target/producer-marker-rar34/tools/wineserver-persistent"
+          },
+          "executable_sha256": "767325aa31a2e42c0364261aa453f9617d00d8f8f1decc63570f8b0e32ac2c8b"
+        },
+        {
+          "name": "winrar-602-gui",
+          "family": "winrar",
+          "command": [
+            "wine",
+            "/home/gaz/src/rars/target/producer-marker/tools/winrar-gui-602/WinRAR.exe"
+          ],
+          "windows": true,
+          "env": {
+            "WINEPREFIX": "/home/gaz/src/rars/target/producer-marker/wine",
+            "WINEDEBUG": "-all",
+            "WINESERVER": "/home/gaz/src/rars/target/producer-marker-rar34/tools/wineserver-persistent"
+          },
+          "executable_sha256": "6321e32f8d63f64d30be5e3269fc37a187b2b4f28dea02589284de0e9a37dd40"
+        },
+        {
+          "name": "winrar-721-gui",
+          "family": "winrar",
+          "command": [
+            "wine",
+            "/home/gaz/src/rars/target/producer-marker/tools/winrar-gui-721/WinRAR.exe"
+          ],
+          "windows": true,
+          "env": {
+            "WINEPREFIX": "/home/gaz/src/rars/target/producer-marker/wine",
+            "WINEDEBUG": "-all",
+            "WINESERVER": "/home/gaz/src/rars/target/producer-marker-rar34/tools/wineserver-persistent"
+          },
+          "executable_sha256": "98f2e8cc5b3ecb40d4a9041a9f22325c1dfcae90071b82410628004fbeee5022"
+        },
+        {
+          "name": "bandizip-7.47",
+          "family": "bandizip",
+          "command": [
+            "wine",
+            "/home/gaz/src/rars/target/producer-marker/tools/bandizip-full/bz.x64.exe"
+          ],
+          "windows": true,
+          "env": {
+            "WINEPREFIX": "/home/gaz/src/rars/target/producer-marker/wine",
+            "WINEDEBUG": "-all",
+            "WINESERVER": "/home/gaz/src/rars/target/producer-marker-rar34/tools/wineserver-persistent"
+          },
+          "executable_sha256": "3000d3f4ff1ba2c8fad9f895a53bd63acd3417affd04925e9b7fa0ce8e60bda5"
+        }
+      ],
+      "cases": {
+        "rar20/stored": {
+          "options": [
+            "--store"
+          ],
+          "expected": {
+            "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+            "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "text.txt": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2",
+            "unicode-cafe.txt": "9a0dabfb45748293950408e8a3a3e5482342e6bdd79cded4de89bb48e0fb2c0c"
+          }
+        },
+        "rar20/compressed": {
+          "options": [],
+          "expected": {
+            "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+            "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "text.txt": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2",
+            "unicode-cafe.txt": "9a0dabfb45748293950408e8a3a3e5482342e6bdd79cded4de89bb48e0fb2c0c"
+          }
+        },
+        "rar20/solid": {
+          "options": [
+            "--solid"
+          ],
+          "expected": {
+            "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+            "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "text.txt": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2",
+            "unicode-cafe.txt": "9a0dabfb45748293950408e8a3a3e5482342e6bdd79cded4de89bb48e0fb2c0c"
+          }
+        },
+        "rar20/comment": {
+          "options": [
+            "--comment",
+            "User comment survives independently"
+          ],
+          "expected": {
+            "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+            "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "text.txt": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2",
+            "unicode-cafe.txt": "9a0dabfb45748293950408e8a3a3e5482342e6bdd79cded4de89bb48e0fb2c0c"
+          }
+        },
+        "rar20/password-stored": {
+          "options": [
+            "--store",
+            "--password",
+            "probe-password"
+          ],
+          "expected": {
+            "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+            "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "text.txt": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2",
+            "unicode-cafe.txt": "9a0dabfb45748293950408e8a3a3e5482342e6bdd79cded4de89bb48e0fb2c0c"
+          }
+        },
+        "rar20/password-compressed": {
+          "options": [
+            "--password",
+            "probe-password"
+          ],
+          "expected": {
+            "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+            "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "text.txt": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2",
+            "unicode-cafe.txt": "9a0dabfb45748293950408e8a3a3e5482342e6bdd79cded4de89bb48e0fb2c0c"
+          }
+        },
+        "rar20/stored-volumes": {
+          "options": [
+            "--store",
+            "--volume-size",
+            "4k"
+          ],
+          "expected": {
+            "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+          }
+        },
+        "rar20/compressed-volumes": {
+          "options": [
+            "--volume-size",
+            "4k"
+          ],
+          "expected": {
+            "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+          }
+        },
+        "rar20/solid-volumes": {
+          "options": [
+            "--solid",
+            "--volume-size",
+            "4k"
+          ],
+          "expected": {
+            "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+          }
+        },
+        "rar20/password-volumes": {
+          "options": [
+            "--password",
+            "probe-password",
+            "--volume-size",
+            "4k"
+          ],
+          "expected": {
+            "binary.bin": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+          }
+        },
+        "rar20/empty-file": {
+          "options": [
+            "--store"
+          ],
+          "expected": {
+            "empty.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        }
+      },
+      "results": [
+        {
+          "engine": "rar-290",
+          "case": "rar20/stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-290",
+          "case": "rar20/stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-300",
+          "case": "rar20/stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-300",
+          "case": "rar20/stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-420",
+          "case": "rar20/stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-420",
+          "case": "rar20/stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-5.00",
+          "case": "rar20/stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-6.02",
+          "case": "rar20/stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.21b1",
+          "case": "rar20/stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-602-gui",
+          "case": "rar20/stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-721-gui",
+          "case": "rar20/stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "bandizip-7.47",
+          "case": "rar20/stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-290",
+          "case": "rar20/compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-290",
+          "case": "rar20/compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-300",
+          "case": "rar20/compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-300",
+          "case": "rar20/compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-420",
+          "case": "rar20/compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-420",
+          "case": "rar20/compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-5.00",
+          "case": "rar20/compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-6.02",
+          "case": "rar20/compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.21b1",
+          "case": "rar20/compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-602-gui",
+          "case": "rar20/compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-721-gui",
+          "case": "rar20/compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "bandizip-7.47",
+          "case": "rar20/compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-290",
+          "case": "rar20/solid",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-290",
+          "case": "rar20/solid",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-300",
+          "case": "rar20/solid",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-300",
+          "case": "rar20/solid",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-420",
+          "case": "rar20/solid",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-420",
+          "case": "rar20/solid",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-5.00",
+          "case": "rar20/solid",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-6.02",
+          "case": "rar20/solid",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.21b1",
+          "case": "rar20/solid",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-602-gui",
+          "case": "rar20/solid",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-721-gui",
+          "case": "rar20/solid",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "bandizip-7.47",
+          "case": "rar20/solid",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-290",
+          "case": "rar20/comment",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-290",
+          "case": "rar20/comment",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-300",
+          "case": "rar20/comment",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-300",
+          "case": "rar20/comment",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-420",
+          "case": "rar20/comment",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-420",
+          "case": "rar20/comment",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-5.00",
+          "case": "rar20/comment",
+          "status": "CONTROL_FAIL",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": false
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": false
+          }
+        },
+        {
+          "engine": "rar-6.02",
+          "case": "rar20/comment",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.21b1",
+          "case": "rar20/comment",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-602-gui",
+          "case": "rar20/comment",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-721-gui",
+          "case": "rar20/comment",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "bandizip-7.47",
+          "case": "rar20/comment",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-290",
+          "case": "rar20/password-stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-290",
+          "case": "rar20/password-stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-300",
+          "case": "rar20/password-stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-300",
+          "case": "rar20/password-stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-420",
+          "case": "rar20/password-stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-420",
+          "case": "rar20/password-stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-5.00",
+          "case": "rar20/password-stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-6.02",
+          "case": "rar20/password-stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.21b1",
+          "case": "rar20/password-stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-602-gui",
+          "case": "rar20/password-stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-721-gui",
+          "case": "rar20/password-stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "bandizip-7.47",
+          "case": "rar20/password-stored",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-290",
+          "case": "rar20/password-compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-290",
+          "case": "rar20/password-compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-300",
+          "case": "rar20/password-compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-300",
+          "case": "rar20/password-compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-420",
+          "case": "rar20/password-compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-420",
+          "case": "rar20/password-compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-5.00",
+          "case": "rar20/password-compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-6.02",
+          "case": "rar20/password-compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.21b1",
+          "case": "rar20/password-compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-602-gui",
+          "case": "rar20/password-compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-721-gui",
+          "case": "rar20/password-compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "bandizip-7.47",
+          "case": "rar20/password-compressed",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-290",
+          "case": "rar20/stored-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-290",
+          "case": "rar20/stored-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-300",
+          "case": "rar20/stored-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-300",
+          "case": "rar20/stored-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-420",
+          "case": "rar20/stored-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-420",
+          "case": "rar20/stored-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-5.00",
+          "case": "rar20/stored-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-6.02",
+          "case": "rar20/stored-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.21b1",
+          "case": "rar20/stored-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-602-gui",
+          "case": "rar20/stored-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-721-gui",
+          "case": "rar20/stored-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "bandizip-7.47",
+          "case": "rar20/stored-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-290",
+          "case": "rar20/compressed-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-290",
+          "case": "rar20/compressed-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-300",
+          "case": "rar20/compressed-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-300",
+          "case": "rar20/compressed-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-420",
+          "case": "rar20/compressed-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-420",
+          "case": "rar20/compressed-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-5.00",
+          "case": "rar20/compressed-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-6.02",
+          "case": "rar20/compressed-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.21b1",
+          "case": "rar20/compressed-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-602-gui",
+          "case": "rar20/compressed-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-721-gui",
+          "case": "rar20/compressed-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "bandizip-7.47",
+          "case": "rar20/compressed-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-290",
+          "case": "rar20/solid-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-290",
+          "case": "rar20/solid-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-300",
+          "case": "rar20/solid-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-300",
+          "case": "rar20/solid-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-420",
+          "case": "rar20/solid-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-420",
+          "case": "rar20/solid-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-5.00",
+          "case": "rar20/solid-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-6.02",
+          "case": "rar20/solid-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.21b1",
+          "case": "rar20/solid-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-602-gui",
+          "case": "rar20/solid-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-721-gui",
+          "case": "rar20/solid-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "bandizip-7.47",
+          "case": "rar20/solid-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-290",
+          "case": "rar20/password-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-290",
+          "case": "rar20/password-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-300",
+          "case": "rar20/password-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-300",
+          "case": "rar20/password-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-420",
+          "case": "rar20/password-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-420",
+          "case": "rar20/password-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-5.00",
+          "case": "rar20/password-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-6.02",
+          "case": "rar20/password-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.21b1",
+          "case": "rar20/password-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-602-gui",
+          "case": "rar20/password-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-721-gui",
+          "case": "rar20/password-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "bandizip-7.47",
+          "case": "rar20/password-volumes",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-290",
+          "case": "rar20/empty-file",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-290",
+          "case": "rar20/empty-file",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-300",
+          "case": "rar20/empty-file",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-300",
+          "case": "rar20/empty-file",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-420",
+          "case": "rar20/empty-file",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-420",
+          "case": "rar20/empty-file",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-5.00",
+          "case": "rar20/empty-file",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-6.02",
+          "case": "rar20/empty-file",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "rar-7.21b1",
+          "case": "rar20/empty-file",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-602-gui",
+          "case": "rar20/empty-file",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "winrar-721-gui",
+          "case": "rar20/empty-file",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        },
+        {
+          "engine": "bandizip-7.47",
+          "case": "rar20/empty-file",
+          "status": "PASS",
+          "control": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          },
+          "marked": {
+            "test_exit": 0,
+            "extract_exit": 0,
+            "contents_match": true,
+            "comment_match": true
+          }
+        }
+      ],
+      "summary": {
+        "PASS": 131,
+        "CONTROL_FAIL": 1
+      }
+    }
+  },
+  "dos": {
+    "control_sha256": "8f77ff36533367050e4f1854e71130d4e70097fa5aa518385d6851c805413504",
+    "marked_sha256": "ce64c0ab7dd4cc7135ebe79c368ac9ef359f3416c47fb08f0662658dbeda6991",
+    "executables": {
+      "RAR.EXE": "426b45982a6a675d149f7ef3cbd3ad3171234c187cb633891c066aa819259651",
+      "UNRAR.EXE": "02b4c3ac29aa9ea7e856c366227d92bc624d986d36fe5c696c3cd9ee481c5df7"
+    },
+    "results": [
+      {
+        "case": "stored",
+        "variant": "control",
+        "directory": "A00C",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "stored",
+        "variant": "control",
+        "directory": "A00C",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "stored",
+        "variant": "marked",
+        "directory": "A00M",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "stored",
+        "variant": "marked",
+        "directory": "A00M",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "compressed",
+        "variant": "control",
+        "directory": "A01C",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "compressed",
+        "variant": "control",
+        "directory": "A01C",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "compressed",
+        "variant": "marked",
+        "directory": "A01M",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "compressed",
+        "variant": "marked",
+        "directory": "A01M",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "solid",
+        "variant": "control",
+        "directory": "A02C",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "solid",
+        "variant": "control",
+        "directory": "A02C",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "solid",
+        "variant": "marked",
+        "directory": "A02M",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "solid",
+        "variant": "marked",
+        "directory": "A02M",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "comment",
+        "variant": "control",
+        "directory": "A03C",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "comment",
+        "variant": "control",
+        "directory": "A03C",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "comment",
+        "variant": "marked",
+        "directory": "A03M",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "comment",
+        "variant": "marked",
+        "directory": "A03M",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "password-stored",
+        "variant": "control",
+        "directory": "A04C",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "password-stored",
+        "variant": "control",
+        "directory": "A04C",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "password-stored",
+        "variant": "marked",
+        "directory": "A04M",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "password-stored",
+        "variant": "marked",
+        "directory": "A04M",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "password-compressed",
+        "variant": "control",
+        "directory": "A05C",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "password-compressed",
+        "variant": "control",
+        "directory": "A05C",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "password-compressed",
+        "variant": "marked",
+        "directory": "A05M",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "password-compressed",
+        "variant": "marked",
+        "directory": "A05M",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086",
+          "CAFE.TXT": "5909165ea46d5ea96063ccaba9f12abae780625bd8a34541bf0aaff99179a142",
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "TEXT.TXT": "e532e0a580e0102ff5f7aba9d2bcab34fc7454f56bd60f82e04580b394b644e2"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "stored-volumes",
+        "variant": "control",
+        "directory": "A06C",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "stored-volumes",
+        "variant": "control",
+        "directory": "A06C",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "stored-volumes",
+        "variant": "marked",
+        "directory": "A06M",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "stored-volumes",
+        "variant": "marked",
+        "directory": "A06M",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "compressed-volumes",
+        "variant": "control",
+        "directory": "A07C",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "compressed-volumes",
+        "variant": "control",
+        "directory": "A07C",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "compressed-volumes",
+        "variant": "marked",
+        "directory": "A07M",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "compressed-volumes",
+        "variant": "marked",
+        "directory": "A07M",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "solid-volumes",
+        "variant": "control",
+        "directory": "A08C",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "solid-volumes",
+        "variant": "control",
+        "directory": "A08C",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "solid-volumes",
+        "variant": "marked",
+        "directory": "A08M",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "solid-volumes",
+        "variant": "marked",
+        "directory": "A08M",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "password-volumes",
+        "variant": "control",
+        "directory": "A09C",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "password-volumes",
+        "variant": "control",
+        "directory": "A09C",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "password-volumes",
+        "variant": "marked",
+        "directory": "A09M",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "password-volumes",
+        "variant": "marked",
+        "directory": "A09M",
+        "expected": {
+          "BINARY.BIN": "fada1bc7d7936347cefabc3de6804d7088673af9394c601be6d862d146ee1086"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "empty-file",
+        "variant": "control",
+        "directory": "A10C",
+        "expected": {
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "empty-file",
+        "variant": "control",
+        "directory": "A10C",
+        "expected": {
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "empty-file",
+        "variant": "marked",
+        "directory": "A10M",
+        "expected": {
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "engine": "RAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      },
+      {
+        "case": "empty-file",
+        "variant": "marked",
+        "directory": "A10M",
+        "expected": {
+          "EMPTY.TXT": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "engine": "UNRAR",
+        "test_ok": true,
+        "extract_ok": true,
+        "contents_match": true,
+        "comment_match": true,
+        "pass": true
+      }
+    ],
+    "negative": [
+      {
+        "engine": "RAR",
+        "variant": "control",
+        "test_exit": 3
+      },
+      {
+        "engine": "UNRAR",
+        "variant": "control",
+        "test_exit": 3
+      },
+      {
+        "engine": "RAR",
+        "variant": "marked",
+        "test_exit": 3
+      },
+      {
+        "engine": "UNRAR",
+        "variant": "marked",
+        "test_exit": 3
+      }
+    ],
+    "updates": [
+      {
+        "engine": "RAR",
+        "variant": "control",
+        "comment_preserved": true,
+        "contents_match": true,
+        "marker_retained": false
+      },
+      {
+        "engine": "RAR",
+        "variant": "marked",
+        "comment_preserved": true,
+        "contents_match": true,
+        "marker_retained": false
+      }
+    ]
+  },
+  "maintenance": {
+    "framing": [
+      "archives/rar20/comment/control/archive.rar",
+      "archives/rar20/comment/marked/archive.rar",
+      "archives/rar20/compressed/control/archive.rar",
+      "archives/rar20/compressed/marked/archive.rar",
+      "archives/rar20/compressed-volumes/control/archive.r00",
+      "archives/rar20/compressed-volumes/control/archive.r01",
+      "archives/rar20/compressed-volumes/control/archive.rar",
+      "archives/rar20/compressed-volumes/marked/archive.r00",
+      "archives/rar20/compressed-volumes/marked/archive.r01",
+      "archives/rar20/compressed-volumes/marked/archive.rar",
+      "archives/rar20/empty-file/control/archive.rar",
+      "archives/rar20/empty-file/marked/archive.rar",
+      "archives/rar20/password-compressed/control/archive.rar",
+      "archives/rar20/password-compressed/marked/archive.rar",
+      "archives/rar20/password-stored/control/archive.rar",
+      "archives/rar20/password-stored/marked/archive.rar",
+      "archives/rar20/password-volumes/control/archive.r00",
+      "archives/rar20/password-volumes/control/archive.r01",
+      "archives/rar20/password-volumes/control/archive.rar",
+      "archives/rar20/password-volumes/marked/archive.r00",
+      "archives/rar20/password-volumes/marked/archive.r01",
+      "archives/rar20/password-volumes/marked/archive.rar",
+      "archives/rar20/solid/control/archive.rar",
+      "archives/rar20/solid/marked/archive.rar",
+      "archives/rar20/solid-volumes/control/archive.r00",
+      "archives/rar20/solid-volumes/control/archive.r01",
+      "archives/rar20/solid-volumes/control/archive.rar",
+      "archives/rar20/solid-volumes/marked/archive.r00",
+      "archives/rar20/solid-volumes/marked/archive.r01",
+      "archives/rar20/solid-volumes/marked/archive.rar",
+      "archives/rar20/stored/control/archive.rar",
+      "archives/rar20/stored/marked/archive.rar",
+      "archives/rar20/stored-volumes/control/archive.r00",
+      "archives/rar20/stored-volumes/control/archive.r01",
+      "archives/rar20/stored-volumes/control/archive.rar",
+      "archives/rar20/stored-volumes/marked/archive.r00",
+      "archives/rar20/stored-volumes/marked/archive.r01",
+      "archives/rar20/stored-volumes/marked/archive.rar"
+    ],
+    "updates": [
+      {
+        "engine": "rar-290",
+        "variant": "control",
+        "comment_preserved": true,
+        "contents_match": true,
+        "marker_retained": false
+      },
+      {
+        "engine": "rar-290",
+        "variant": "marked",
+        "comment_preserved": true,
+        "contents_match": true,
+        "marker_retained": false
+      },
+      {
+        "engine": "rar-3.93",
+        "variant": "control",
+        "comment_preserved": true,
+        "contents_match": true,
+        "marker_retained": false
+      },
+      {
+        "engine": "rar-3.93",
+        "variant": "marked",
+        "comment_preserved": true,
+        "contents_match": true,
+        "marker_retained": false
+      }
+    ]
+  },
+  "negative": [
+    {
+      "engine": "rar-290",
+      "format": "rar20",
+      "label": "control",
+      "test_exit": 3
+    },
+    {
+      "engine": "rar-290",
+      "format": "rar20",
+      "label": "marked",
+      "test_exit": 3
+    },
+    {
+      "engine": "winrar-290",
+      "format": "rar20",
+      "label": "control",
+      "test_exit": 3
+    },
+    {
+      "engine": "winrar-290",
+      "format": "rar20",
+      "label": "marked",
+      "test_exit": 3
+    },
+    {
+      "engine": "winrar-300",
+      "format": "rar20",
+      "label": "control",
+      "test_exit": 3
+    },
+    {
+      "engine": "winrar-300",
+      "format": "rar20",
+      "label": "marked",
+      "test_exit": 3
+    },
+    {
+      "engine": "winrar-420",
+      "format": "rar20",
+      "label": "control",
+      "test_exit": 3
+    },
+    {
+      "engine": "winrar-420",
+      "format": "rar20",
+      "label": "marked",
+      "test_exit": 3
+    },
+    {
+      "engine": "winrar-602-gui",
+      "format": "rar20",
+      "label": "control",
+      "test_exit": 3
+    },
+    {
+      "engine": "winrar-602-gui",
+      "format": "rar20",
+      "label": "marked",
+      "test_exit": 3
+    },
+    {
+      "engine": "winrar-721-gui",
+      "format": "rar20",
+      "label": "control",
+      "test_exit": 3
+    },
+    {
+      "engine": "winrar-721-gui",
+      "format": "rar20",
+      "label": "marked",
+      "test_exit": 3
+    },
+    {
+      "engine": "rar-3.93",
+      "format": "rar20",
+      "label": "control",
+      "test_exit": 3
+    },
+    {
+      "engine": "rar-3.93",
+      "format": "rar20",
+      "label": "marked",
+      "test_exit": 3
+    }
+  ],
+  "summary": {
+    "paired_comparisons": 242,
+    "executable_builds": 22,
+    "passing_pairs": 232,
+    "control_failures": 10,
+    "regressions": 0,
+    "negative_controls": 18,
+    "updates": 6
+  },
+  "discarded_harness_runs": [
+    "Default DOSBox speed exceeded time limit; rerun with maximum cycles.",
+    "DOS negative-result redirection truncated results on false IF branches; corrected to append and reran."
+  ]
+}

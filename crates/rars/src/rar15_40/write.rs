@@ -13,13 +13,167 @@ use crate::codec::rar29::{
 };
 use crate::crc32::Crc32;
 pub use crate::filter::{FilterKind, FilterPolicy, FilterSpec};
+pub use crate::streaming::EntrySource;
 use crate::streaming::WriterResources;
 use crate::write_plan::{MemberCoding, PlanShape, WriterOption};
 use crate::write_progress::{ProgressReporter, WorkTracker};
 use crate::write_stream::{MemberBytes, MemberPayload};
+use crate::FeatureSet;
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 use std::io::Write;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WriterOptions {
+    pub target: ArchiveVersion,
+    pub features: FeatureSet,
+    pub compression_level: Option<u8>,
+    pub dictionary_size: Option<usize>,
+    /// Which engine compresses a member. Only the RAR 2.9 family has more than
+    /// one, so the other targets ignore anything but the default.
+    pub method: Rar29Method,
+    /// Retained NewSub comment DOS timestamp and host ID.
+    pub(crate) archive_comment_metadata: Option<(u32, u8)>,
+}
+
+/// Which compression engine the RAR 2.9 family writer uses for a member.
+///
+/// PPMd is an alternative to LZ, not a filter, even though the writer used to
+/// carry it as one. Keeping the two apart is what lets a filter be chosen
+/// without also deciding the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Rar29Method {
+    /// Let the content decide. Text-shaped members are measured against PPMd;
+    /// anything else goes straight to LZ, so a binary member never pays for a
+    /// PPMd encode it was always going to lose. Compression levels 1 to 4 skip
+    /// the trial entirely, since those settings are asking for speed.
+    #[default]
+    Auto,
+    Lz,
+    Ppmd,
+}
+
+impl WriterOptions {
+    pub const fn new(target: ArchiveVersion, features: FeatureSet) -> Self {
+        Self {
+            target,
+            features,
+            compression_level: None,
+            dictionary_size: None,
+            method: Rar29Method::Auto,
+            archive_comment_metadata: None,
+        }
+    }
+
+    pub const fn with_method(mut self, method: Rar29Method) -> Self {
+        self.method = method;
+        self
+    }
+
+    pub const fn with_compression_level(mut self, level: u8) -> Self {
+        self.compression_level = Some(level);
+        self
+    }
+
+    pub const fn with_dictionary_size(mut self, size: usize) -> Self {
+        self.dictionary_size = Some(size);
+        self
+    }
+}
+
+impl Default for WriterOptions {
+    fn default() -> Self {
+        Self {
+            target: ArchiveVersion::Rar15,
+            features: FeatureSet::store_only(),
+            compression_level: None,
+            dictionary_size: None,
+            method: Rar29Method::Auto,
+            archive_comment_metadata: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredEntry<'a> {
+    pub name: &'a [u8],
+    pub data: &'a [u8],
+    pub file_time: u32,
+    pub file_attr: u32,
+    pub host_os: u8,
+    pub password: Option<&'a [u8]>,
+    pub file_comment: Option<&'a [u8]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileEntry<'a> {
+    pub name: &'a [u8],
+    pub data: &'a [u8],
+    pub file_time: u32,
+    pub file_attr: u32,
+    pub host_os: u8,
+    pub password: Option<&'a [u8]>,
+    pub file_comment: Option<&'a [u8]>,
+}
+
+/// One member of an archive written a member at a time.
+///
+/// The bytes are opened when the member is coded and dropped once it is
+/// written, so an archive of many files never holds more than the members
+/// being worked on. A stored member is copied straight from its source and
+/// never lands on the heap at all.
+#[derive(Debug, Clone)]
+pub struct StreamingEntry {
+    pub name: Vec<u8>,
+    pub source: EntrySource,
+    pub file_time: u32,
+    pub file_attr: u32,
+    pub host_os: u8,
+    pub password: Option<Vec<u8>>,
+    pub file_comment: Option<Vec<u8>>,
+}
+
+impl StreamingEntry {
+    pub fn new(name: impl Into<Vec<u8>>, source: EntrySource) -> Self {
+        Self {
+            name: name.into(),
+            source,
+            file_time: 0,
+            file_attr: 0,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        }
+    }
+
+    pub fn with_file_time(mut self, file_time: u32) -> Self {
+        self.file_time = file_time;
+        self
+    }
+
+    pub fn with_file_attr(mut self, file_attr: u32) -> Self {
+        self.file_attr = file_attr;
+        self
+    }
+
+    pub fn with_host_os(mut self, host_os: u8) -> Self {
+        self.host_os = host_os;
+        self
+    }
+
+    pub fn with_password(mut self, password: impl Into<Vec<u8>>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
+
+    pub fn with_file_comment(mut self, comment: impl Into<Vec<u8>>) -> Self {
+        self.file_comment = Some(comment.into());
+        self
+    }
+}
+
+#[cfg(any(test, feature = "encryption"))]
 fn checked_align16(value: usize, message: &'static str) -> Result<usize> {
     value
         .checked_add(15)
@@ -69,6 +223,7 @@ const RAR29_LZ_BLOCK_SIZE: usize = 64 * 1024;
 /// cannot resolve the real one. It has to stay an upper bound, so it does not
 /// follow the block size.
 const RAR29_MAX_DICTIONARY_SIZE: usize = 4 * 1024 * 1024;
+#[cfg(feature = "encryption")]
 const RAR15_ALIGN_OVERFLOW: &str = "RAR 1.5 block size overflows usize";
 
 pub fn write_stored_archive(
@@ -103,6 +258,7 @@ pub(crate) struct RetainedMemberMetadata<'a> {
 
 pub(crate) struct RetainedFileEntry<'a> {
     pub(crate) file: FileEntry<'a>,
+    pub(crate) source: Option<&'a EntrySource>,
     pub(crate) metadata: RetainedMemberMetadata<'a>,
 }
 
@@ -114,10 +270,12 @@ pub(crate) fn write_archive_with_retained_metadata(
     options: WriterOptions,
     coding: MemberCoding,
     archive_comment: Option<&[u8]>,
+    resources: &WriterResources,
     progress: Option<&dyn WriteProgress>,
     header_password: Option<&[u8]>,
     archive_comment_password: Option<&[u8]>,
-) -> Result<Vec<u8>> {
+    output: &mut dyn Write,
+) -> Result<()> {
     // Builder validates retained records at their setters and constructs each
     // file with its metadata, so neither record validity nor array length can
     // change at this private handoff.
@@ -125,6 +283,9 @@ pub(crate) fn write_archive_with_retained_metadata(
         .iter()
         .map(|entry| {
             let mut member = Member::from_file(&entry.file);
+            if let Some(source) = entry.source {
+                member.bytes = MemberBytes::NamedSource(source, entry.file.name);
+            }
             member.unicode_name = entry.metadata.unicode_name;
             member.unpack_version = entry.metadata.unpack_version;
             member.extended_times = entry.metadata.extended_times;
@@ -133,19 +294,17 @@ pub(crate) fn write_archive_with_retained_metadata(
             member
         })
         .collect();
-    let mut out = Vec::new();
     write_archive_to(
         &members,
         options,
         coding,
         archive_comment,
-        &WriterResources::default(),
+        resources,
         progress,
-        &mut out,
+        output,
         header_password,
         archive_comment_password,
-    )?;
-    Ok(out)
+    )
 }
 
 pub fn write_compressed_archive(
@@ -270,6 +429,13 @@ fn write_archive_to(
     explicit_header_password: Option<&[u8]>,
     archive_comment_password: Option<&[u8]>,
 ) -> Result<()> {
+    if explicit_header_password.is_some()
+        || archive_comment_password.is_some()
+        || members.iter().any(|member| member.password.is_some())
+    {
+        crate::crypto::require_encryption()?;
+    }
+
     if resources.max_preparation_bytes().is_some() || resources.max_memory_bytes().is_some() {
         return Err(Error::UnsupportedFamilyFeature {
             family: options.target.family(),
@@ -425,6 +591,9 @@ fn write_members_to(
     let mut head = Vec::new();
     write_main_header(&mut head, main_flags);
     output.write_all(&head)?;
+    if !uses_old_style_archive_comment(options.target) {
+        write_producer(output, options.target, header_password, progress.reporter())?;
+    }
     write_archive_comment(
         output,
         archive_comment,
@@ -432,6 +601,11 @@ fn write_members_to(
         header_password,
         archive_comment_password,
     )?;
+    // Old-style comments must immediately follow the main header. Readers look
+    // there directly when MHD_COMMENT is set, rather than scanning subblocks.
+    if uses_old_style_archive_comment(options.target) {
+        write_producer(output, options.target, header_password, progress.reporter())?;
+    }
 
     // Solid members share one encoder, so they are coded in order. Independent
     // ones are coded a window at a time and written as each window lands.
@@ -448,7 +622,12 @@ fn write_members_to(
                 progress,
             )
             .map_err(|error| crate::write_stream::member_error(error, member.name, "preparing"))?;
-            let solid_continuation = encoded.method != 0x30 && solid_run_has_member;
+            // A directory header carries no data but still sits in the chain.
+            // 7-Zip restarts its decoder at any header without FHD_SOLID,
+            // directories included, so one inside a run must say the run goes
+            // on; UnRAR passes over directory headers either way.
+            let solid_continuation =
+                (encoded.method != 0x30 || member.is_directory) && solid_run_has_member;
             // Storing a member rebuilds the encoder, so the chain ends there.
             // An empty compressed member leaves the chain exactly as it was:
             // it feeds the encoder nothing, and readers pass over an empty
@@ -472,11 +651,19 @@ fn write_members_to(
                 progress.reporter(),
             )
             .map_err(|error| crate::write_stream::member_error(error, member.name, "writing"))?;
+            member.bytes.release();
         }
     } else {
+        // Scoped rewrite sources retain plaintext until emission; their disk
+        // quota may admit fewer inputs than the CPU pool can prepare at once.
+        let window = members
+            .iter()
+            .filter_map(|member| member.bytes.source())
+            .map(EntrySource::max_preparation_window)
+            .fold(crate::parallel::default_window(), usize::min);
         crate::parallel::map_slice_windowed(
             members,
-            crate::parallel::default_window(),
+            window,
             |member| {
                 encode_member(member, options, coding, &mut None, resources, progress).map_err(
                     |error| crate::write_stream::member_error(error, member.name, "preparing"),
@@ -492,7 +679,11 @@ fn write_members_to(
                     header_password,
                     progress.reporter(),
                 )
-                .map_err(|error| crate::write_stream::member_error(error, member.name, "writing"))
+                .map_err(|error| {
+                    crate::write_stream::member_error(error, member.name, "writing")
+                })?;
+                member.bytes.release();
+                Ok(())
             },
         )?;
     }
@@ -1104,7 +1295,13 @@ impl<'a> Member<'a> {
             unicode_name: None,
             unpack_version: None,
             extended_times: None,
-            is_directory: false,
+            // Streaming callers have no retained metadata wrapper. The native
+            // attribute word already distinguishes directory sources.
+            is_directory: if entry.host_os == 3 {
+                entry.file_attr & 0o170000 == 0o040000
+            } else {
+                entry.file_attr & 0x10 != 0
+            },
             is_symlink: false,
         }
     }
@@ -1152,6 +1349,9 @@ fn encode_member<'a>(
     let unpacked_size = member.unpacked_size()?;
     validate_member(member.name, unpacked_size)?;
     if member.is_directory {
+        if unpacked_size != 0 {
+            return Err(Error::InvalidArgument("directory source must be empty"));
+        }
         return Ok(EncodedMember {
             payload: MemberPayload::Packed(Vec::new()),
             method: 0x30,
@@ -1186,7 +1386,8 @@ fn encode_member<'a>(
             unpacked_size,
             file_crc: {
                 let mut crc = Crc32::new();
-                member.bytes.walk_with_progress(
+                member.bytes.walk_exact_with_progress(
+                    unpacked_size as u64,
                     progress.reporter(),
                     |chunk| {
                         crc.update(chunk);
@@ -1200,7 +1401,7 @@ fn encode_member<'a>(
 
     let data = member
         .bytes
-        .load_with_progress(progress.reporter())?;
+        .load_exact_with_progress(unpacked_size as u64, progress.reporter())?;
     let mut crc = Crc32::new();
     for chunk in data.chunks(64 * 1024) {
         progress.check()?;
@@ -1341,12 +1542,7 @@ pub(crate) fn write_stored_volumes_with_progress(
     let progress = ProgressReporter(&control);
     crate::write_progress::check_cancelled(Some(progress))?;
     validate_plan(options, PlanShape::new().volumes(true), false, false)?;
-    validate_volume_writer_inputs(
-        entry.name,
-        entry.data,
-        entry.file_comment,
-        options,
-    )?;
+    validate_volume_writer_inputs(entry.name, entry.data, entry.file_comment, options)?;
     if options.features.header_encryption {
         return write_header_encrypted_split_volumes(SplitVolumeRecord {
             progress,
@@ -1437,12 +1633,7 @@ fn write_compressed_volumes_impl(
         false,
         false,
     )?;
-    validate_volume_writer_inputs(
-        entry.name,
-        entry.data,
-        entry.file_comment,
-        options,
-    )?;
+    validate_volume_writer_inputs(entry.name, entry.data, entry.file_comment, options)?;
     // A volume set holds one member, and splitting it changes nothing about
     // how far back the window has to reach.
     if options.dictionary_size.is_none() {
@@ -1839,17 +2030,22 @@ fn encode_filtered_payload(
     // would quietly overrule a flag the caller set.
     let forced_ppmd_filter =
         options.method == Rar29Method::Ppmd && matches!(policy, FilterPolicy::Explicit(_));
-    let encoder = match (lz_method != 0x30 && !forced_ppmd_filter, solid_encoder.as_mut()) {
+    let encoder = match (
+        lz_method != 0x30 && !forced_ppmd_filter,
+        solid_encoder.as_mut(),
+    ) {
         (true, Some(SolidEncoder::Rar29(encoder))) => encoder,
-        _ => return encode_rar29_policy_filtered_payload(
-            data,
-            policy,
-            options.method,
-            rar29_encode_options_for_options(options)?,
-            lz_method,
-            ppmd_trial_pays(lz_method.saturating_sub(0x30)),
-            progress,
-        ),
+        _ => {
+            return encode_rar29_policy_filtered_payload(
+                data,
+                policy,
+                options.method,
+                rar29_encode_options_for_options(options)?,
+                lz_method,
+                ppmd_trial_pays(lz_method.saturating_sub(0x30)),
+                progress,
+            )
+        }
     };
 
     // An empty member has no range to filter, and `--no-filter` asked for none,
@@ -2159,28 +2355,42 @@ fn encrypt_split_packed_data(
     target: ArchiveVersion,
     password: &[u8],
 ) -> Result<Option<[u8; 8]>> {
-    match target {
-        ArchiveVersion::Rar15 => {
-            Rar15Cipher::new(password).crypt_in_place(data);
-            Ok(None)
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = (data, target, password);
+        Err(Error::FeatureDisabled {
+            feature: "encryption",
+        })
+    }
+    #[cfg(feature = "encryption")]
+    {
+        match target {
+            ArchiveVersion::Rar15 => {
+                Rar15Cipher::new(password).crypt_in_place(data);
+                Ok(None)
+            }
+            ArchiveVersion::Rar20 => {
+                let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)
+                    .expect("byte vector length plus padding fits usize");
+                data.resize(padded_len, 0);
+                Rar20Cipher::new(password)
+                    .encrypt_in_place(data)
+                    .expect("padded legacy ciphertext is block aligned");
+                Ok(None)
+            }
+            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
+                let salt = random_rar30_salt()?;
+                let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)
+                    .expect("byte vector length plus padding fits usize");
+                data.resize(padded_len, 0);
+                Rar30Cipher::new(password, Some(salt))
+                    .map_err(super::map_rar30_crypto_error)?
+                    .encrypt_in_place(data)
+                    .expect("padded legacy ciphertext is block aligned");
+                Ok(Some(salt))
+            }
+            _ => Err(Error::UnsupportedVersion(target)),
         }
-        ArchiveVersion::Rar20 => {
-            let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)?;
-            data.resize(padded_len, 0);
-            Rar20Cipher::new(password).encrypt_in_place(data)?;
-            Ok(None)
-        }
-        ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
-            let salt = random_rar30_salt()?;
-            let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)?;
-            data.resize(padded_len, 0);
-            Rar30Cipher::new(password, Some(salt))
-                .map_err(super::map_rar30_crypto_error)?
-                .encrypt_in_place(data)
-                .map_err(super::map_rar30_crypto_error)?;
-            Ok(Some(salt))
-        }
-        _ => Err(Error::UnsupportedVersion(target)),
     }
 }
 
@@ -2212,64 +2422,77 @@ fn encrypt_packed_data_with_progress(
     password: Option<&[u8]>,
     progress: Option<ProgressReporter<'_>>,
 ) -> Result<Option<[u8; 8]>> {
-    crate::write_progress::check_cancelled(progress)?;
-    let Some(password) = password else {
-        return Ok(None);
-    };
-    match target {
-        ArchiveVersion::Rar15 => {
-            let mut cipher = Rar15Cipher::new(password);
-            for chunk in data.chunks_mut(64 * 1024) {
-                crate::write_progress::check_cancelled(progress)?;
-                cipher.crypt_in_place(chunk);
-            }
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = (data, target);
+        crate::write_progress::check_cancelled(progress)?;
+        if password.is_none() {
             Ok(None)
+        } else {
+            Err(Error::FeatureDisabled {
+                feature: "encryption",
+            })
         }
-        ArchiveVersion::Rar20 => {
-            let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)?;
-            data.resize(padded_len, 0);
-            let mut cipher = Rar20Cipher::new(password);
-            for chunk in data.chunks_mut(64 * 1024) {
-                crate::write_progress::check_cancelled(progress)?;
-                cipher.encrypt_in_place(chunk)?;
+    }
+    #[cfg(feature = "encryption")]
+    {
+        crate::write_progress::check_cancelled(progress)?;
+        let Some(password) = password else {
+            return Ok(None);
+        };
+        match target {
+            ArchiveVersion::Rar15 => {
+                let mut cipher = Rar15Cipher::new(password);
+                for chunk in data.chunks_mut(64 * 1024) {
+                    crate::write_progress::check_cancelled(progress)?;
+                    cipher.crypt_in_place(chunk);
+                }
+                Ok(None)
             }
-            Ok(None)
-        }
-        ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
-            let salt = random_rar30_salt()?;
-            let padded_len =
-                data.len()
-                    .checked_add(15)
-                    .map(|len| len & !15)
-                    .ok_or(Error::InvalidArgument(
-                        "RAR 3.x encrypted data size overflows",
-                    ))?;
-            data.resize(padded_len, 0);
-            let mut cipher =
-                Rar30Cipher::new(password, Some(salt)).map_err(super::map_rar30_crypto_error)?;
-            for chunk in data.chunks_mut(64 * 1024) {
-                crate::write_progress::check_cancelled(progress)?;
-                cipher
-                    .encrypt_in_place(chunk)
+            ArchiveVersion::Rar20 => {
+                let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)
+                    .expect("byte vector length plus padding fits usize");
+                data.resize(padded_len, 0);
+                let mut cipher = Rar20Cipher::new(password);
+                for chunk in data.chunks_mut(64 * 1024) {
+                    crate::write_progress::check_cancelled(progress)?;
+                    cipher
+                        .encrypt_in_place(chunk)
+                        .expect("padded ciphertext and 64 KiB chunks are block aligned");
+                }
+                Ok(None)
+            }
+            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
+                let salt = random_rar30_salt()?;
+                // Byte vectors are bounded by isize::MAX, so adding 15 fits usize.
+                let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)
+                    .expect("byte vector length plus padding fits usize");
+                data.resize(padded_len, 0);
+                let mut cipher = Rar30Cipher::new(password, Some(salt))
                     .map_err(super::map_rar30_crypto_error)?;
+                for chunk in data.chunks_mut(64 * 1024) {
+                    crate::write_progress::check_cancelled(progress)?;
+                    cipher
+                        .encrypt_in_place(chunk)
+                        .expect("padded ciphertext and 64 KiB chunks are block aligned");
+                }
+                Ok(Some(salt))
             }
-            Ok(Some(salt))
+            _ => Err(Error::UnsupportedFeature {
+                version: target,
+                feature: "RAR writer file encryption",
+            }),
         }
-        _ => Err(Error::UnsupportedFeature {
-            version: target,
-            feature: "RAR writer file encryption",
-        }),
     }
 }
 
+#[cfg(feature = "encryption")]
 fn random_rar30_salt() -> Result<[u8; 8]> {
     let mut salt = [0; 8];
-    getrandom::fill(&mut salt).map_err(|error| {
-        crate::write_stream::entropy_error(
-            error,
-            "RAR 3.x writer could not generate encryption salt",
-        )
-    })?;
+    crate::write_stream::fill_entropy(
+        &mut salt,
+        "RAR 3.x writer could not generate encryption salt",
+    )?;
     Ok(salt)
 }
 
@@ -2315,6 +2538,54 @@ fn write_comment_header(out: &mut Vec<u8>, comment: Option<&[u8]>) -> Result<()>
     out.extend_from_slice(comment);
     write_comment_header_crc(out, start);
     Ok(())
+}
+
+// Archive-level advisory metadata: header encryption does not conceal its payload.
+fn write_producer(
+    out: &mut dyn Write,
+    target: ArchiveVersion,
+    header_password: Option<&[u8]>,
+    progress: Option<ProgressReporter<'_>>,
+) -> Result<()> {
+    crate::write_progress::check_cancelled(progress)?;
+    if !matches!(
+        target,
+        ArchiveVersion::Rar15
+            | ArchiveVersion::Rar20
+            | ArchiveVersion::Rar29
+            | ArchiveVersion::Rar30
+            | ArchiveVersion::Rar40
+    ) {
+        return Ok(());
+    }
+    let data = crate::producer::DATA;
+    let mut header = Vec::new();
+    write_file_header(
+        &mut header,
+        &FileRecord {
+            head_type: NEWSUB_HEAD,
+            name: crate::producer::NAME,
+            unpacked_size: data.len(),
+            file_crc: crc32(data),
+            packed_size: data.len(),
+            file_time: 0,
+            file_attr: 0,
+            host_os: 0,
+            target,
+            method: 0x30,
+            dictionary_flags: 0,
+            flags: 0x4000,
+            salt: None,
+            extra: &[],
+        },
+    )?;
+    if let Some(password) = header_password {
+        write_encrypted_header(out, &header, password)?;
+    } else {
+        out.write_all(&header)?;
+    }
+    out.write_all(data)?;
+    crate::write_progress::check_cancelled(progress)
 }
 
 fn uses_old_style_archive_comment(target: ArchiveVersion) -> bool {
@@ -2398,18 +2669,28 @@ fn write_encrypted_end_block(out: &mut dyn Write, password: &[u8]) -> Result<()>
 }
 
 fn write_encrypted_header(out: &mut dyn Write, header: &[u8], password: &[u8]) -> Result<()> {
-    let salt = random_rar30_salt()?;
-    let encrypted_size = checked_align16(header.len(), RAR15_ALIGN_OVERFLOW)?;
-    let mut encrypted_header = Vec::with_capacity(encrypted_size);
-    encrypted_header.extend_from_slice(header);
-    encrypted_header.resize(encrypted_size, 0);
-    Rar30Cipher::new(password, Some(salt))
-        .map_err(super::map_rar30_crypto_error)?
-        .encrypt_in_place(&mut encrypted_header)
-        .map_err(super::map_rar30_crypto_error)?;
-    out.write_all(&salt)?;
-    out.write_all(&encrypted_header)?;
-    Ok(())
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = (out, header, password);
+        Err(Error::FeatureDisabled {
+            feature: "encryption",
+        })
+    }
+    #[cfg(feature = "encryption")]
+    {
+        let salt = random_rar30_salt()?;
+        let encrypted_size = checked_align16(header.len(), RAR15_ALIGN_OVERFLOW)?;
+        let mut encrypted_header = Vec::with_capacity(encrypted_size);
+        encrypted_header.extend_from_slice(header);
+        encrypted_header.resize(encrypted_size, 0);
+        Rar30Cipher::new(password, Some(salt))
+            .map_err(super::map_rar30_crypto_error)?
+            .encrypt_in_place(&mut encrypted_header)
+            .map_err(super::map_rar30_crypto_error)?;
+        out.write_all(&salt)?;
+        out.write_all(&encrypted_header)?;
+        Ok(())
+    }
 }
 
 fn validate_member(name: &[u8], unpacked_size: usize) -> Result<()> {
@@ -2610,6 +2891,7 @@ fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
         out.extend_from_slice(RAR15_SIGNATURE);
         write_main_header(&mut out, main_flags);
+        write_producer(&mut out, entry.target, None, Some(entry.progress))?;
         write_file_header_and_data(
             &mut out,
             FileRecord {
@@ -2696,6 +2978,7 @@ fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<
         let mut out = Vec::new();
         out.extend_from_slice(RAR15_SIGNATURE);
         write_main_header(&mut out, main_flags);
+        write_producer(&mut out, entry.target, Some(password), Some(entry.progress))?;
         let mut header = Vec::new();
         write_file_header(
             &mut header,
@@ -2761,6 +3044,73 @@ fn write_comment_header_crc(out: &mut [u8], start: usize) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn streaming_directory_sources_cannot_discard_payloads() {
+        for (host_os, attributes) in [(3, 0o040750), (2, 0x10)] {
+            let entry = super::StreamingEntry::new(
+                b"directory".to_vec(),
+                crate::EntrySource::from_bytes(b"must not be discarded".to_vec()),
+            )
+            .with_host_os(host_os)
+            .with_file_attr(attributes);
+            let error = super::write_streaming_archive_to(
+                &[entry],
+                super::WriterOptions::new(
+                    crate::ArchiveVersion::Rar30,
+                    crate::FeatureSet::store_only(),
+                ),
+                crate::MemberCoding::Stored,
+                None,
+                &crate::WriterResources::default(),
+                None,
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("directory source must be empty"));
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn encrypted_payload_padding_preserves_cipher_state_across_chunks() {
+        for target in [crate::ArchiveVersion::Rar20, crate::ArchiveVersion::Rar30] {
+            for length in [0usize, 1, 15, 16, 17, 65535, 65536, 65537] {
+                let plaintext: Vec<u8> = (0..length)
+                    .map(|index| (index as u8).wrapping_mul(37))
+                    .collect();
+                for split in [false, true] {
+                    let mut data = plaintext.clone();
+                    let salt = if split {
+                        super::encrypt_split_packed_data(&mut data, target, b"pw")
+                    } else {
+                        super::encrypt_packed_data_for_writer(&mut data, target, Some(b"pw"))
+                    }
+                    .unwrap();
+                    let padded = length.div_ceil(16) * 16;
+                    assert_eq!(data.len(), padded);
+                    match target {
+                        crate::ArchiveVersion::Rar20 => {
+                            assert_eq!(salt, None);
+                            super::Rar20Cipher::new(b"pw")
+                                .decrypt_in_place(&mut data)
+                                .unwrap();
+                        }
+                        crate::ArchiveVersion::Rar30 => {
+                            assert!(salt.is_some());
+                            super::Rar30Cipher::new(b"pw", salt)
+                                .unwrap()
+                                .decrypt_in_place(&mut data)
+                                .unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert_eq!(&data[..length], plaintext);
+                    assert!(data[length..].iter().all(|&byte| byte == 0));
+                }
+            }
+        }
+    }
+
     #[test]
     fn member_cancellation_during_workspace_admission_is_preserved() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3089,7 +3439,10 @@ mod tests {
     #[test]
     fn audio_filter_candidate_checks_the_smallest_admitted_window() {
         for channels in 1..=4 {
-            assert!(!is_audio_filter_candidate(&vec![0; channels * 64 - 1], channels));
+            assert!(!is_audio_filter_candidate(
+                &vec![0; channels * 64 - 1],
+                channels
+            ));
             assert!(is_audio_filter_candidate(&vec![0; channels * 64], channels));
         }
     }

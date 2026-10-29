@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::{
     Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, ErrorKind,
     ReadCancellation,
@@ -377,8 +379,8 @@ fn filtered_comment_uses_bounded_scratch_and_cleans_up() {
         .with_rar50_buffered_decode_limit(0)
         .with_max_total_output_bytes(comment.len() as u64);
     assert_eq!(
-        archive.comment_with_options(options).unwrap_err().kind(),
-        ErrorKind::ResourceLimit
+        archive.comment_with_options(options).unwrap(),
+        Some(comment.clone())
     );
     let dir = scratch::case("comment-scratch");
     let policy = Rar50Scratch::new(&*dir, 100_000).with_filter_memory_limit(64 * 1024);

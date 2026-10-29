@@ -7,6 +7,33 @@ import rars
 from test_extract_guards import _headers, _read_vint
 
 
+def named_headers(data, kind, name):
+    """Find RAR5 file/service headers by type and wire name, not position."""
+    for header in _headers(data):
+        _, body_at, _ = header
+        _, cursor = _read_vint(data, body_at)
+        actual_kind, cursor = _read_vint(data, cursor)
+        if actual_kind != kind:
+            continue
+        flags, cursor = _read_vint(data, cursor)
+        if flags & 1:
+            _, cursor = _read_vint(data, cursor)  # Extra-area size.
+        if flags & 2:
+            _, cursor = _read_vint(data, cursor)  # Data-area size.
+        file_flags, cursor = _read_vint(data, cursor)
+        _, cursor = _read_vint(data, cursor)  # Unpacked size.
+        _, cursor = _read_vint(data, cursor)  # Attributes.
+        if file_flags & 2:
+            cursor += 4  # Modification time.
+        if file_flags & 4:
+            cursor += 4  # Data CRC32.
+        _, cursor = _read_vint(data, cursor)  # Compression information.
+        _, cursor = _read_vint(data, cursor)  # Host OS.
+        length, cursor = _read_vint(data, cursor)
+        if data[cursor:cursor + length] == name:
+            yield header
+
+
 def archive_bytes(**options):
     builder = rars.RarBuilder(**options)
     builder.add_directory("empty", mtime=123)
@@ -160,14 +187,8 @@ def test_invalid_file_comment_fails_before_destination_is_touched(tmp_path):
     builder.add_bytes(b"payload", "file")
     builder.set_file_comment("file", b"comment")
     data = bytearray(builder.to_bytes())
-    for _, body_at, body_end in _headers(data):
-        _, cursor = _read_vint(data, body_at)
-        kind, _ = _read_vint(data, cursor)
-        if kind == 3:
-            data[body_end] ^= 1
-            break
-    else:
-        pytest.fail("missing comment service")
+    _, _, body_end = next(named_headers(data, 3, b"CMT"))
+    data[body_end] ^= 1
     source = rars.RarFile.from_bytes(bytes(data))
     destination = tmp_path / "existing.rar"
     destination.write_bytes(b"keep existing archive")
@@ -246,7 +267,8 @@ def test_rewrite_preserves_mixed_data_and_comment_encryption():
     secret.set_file_comment("encrypted", b"private comment")
     a, b = plain.to_bytes(), secret.to_bytes()
     # Join member blocks under the first non-solid main header.
-    combined = a[:_headers(a)[-1][0]] + b[_headers(b)[1][0]:]
+    member_at, _, _ = next(named_headers(b, 2, b"encrypted"))
+    combined = a[:_headers(a)[-1][0]] + b[member_at:]
     source = rars.RarFile.from_bytes(combined, password="secret")
     assert source.rewrite_preservation_issues() == []
     rewritten = rars.RarBuilder.from_archive(source).to_bytes()

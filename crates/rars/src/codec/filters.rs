@@ -1,6 +1,7 @@
 use super::{Error, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(test, feature = "write"))]
 pub(crate) enum FilterOp {
     #[cfg(test)]
     E8,
@@ -18,6 +19,7 @@ pub(crate) struct DeltaErrorMessages {
     pub truncated_source: &'static str,
 }
 
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn encode_in_place(
     op: FilterOp,
     data: &mut [u8],
@@ -146,6 +148,7 @@ pub(crate) fn e8e9_decode_with_control(
     Ok(())
 }
 
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn e8e9_encode(data: &mut [u8], file_offset: u32, include_e9: bool) {
     if data.len() <= 4 {
         return;
@@ -226,6 +229,7 @@ pub(crate) fn delta_decode_with_allowance<B: super::workspace::Budget>(
     Ok(out)
 }
 
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn delta_encode(
     data: &[u8],
     channels: usize,
@@ -240,6 +244,7 @@ pub(crate) fn delta_encode(
     .map(super::workspace::Buffer::into_vec)
 }
 
+#[cfg(any(test, feature = "write"))]
 pub(crate) fn delta_encode_with_allowance<B: super::workspace::Budget>(
     data: &[u8],
     channels: usize,
@@ -265,6 +270,28 @@ pub(crate) fn delta_encode_with_allowance<B: super::workspace::Budget>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn short_x86_operands_are_unchanged_and_still_observe_cancellation() {
+        for length in 0..=4 {
+            for include_e9 in [false, true] {
+                let original = vec![0xe8; length];
+                let mut data = original.clone();
+                super::e8e9_encode(&mut data, u32::MAX, include_e9);
+                assert_eq!(data, original);
+                super::e8e9_decode(&mut data, u32::MAX, include_e9);
+                assert_eq!(data, original);
+                let token = crate::ReadCancellation::new();
+                token.cancel();
+                let control = crate::read_control::ReadControl::new(Some(&token));
+                assert_eq!(
+                    super::e8e9_decode_with_control(&mut data, 0, include_e9, &control),
+                    Err(super::Error::Cancelled)
+                );
+                assert_eq!(data, original);
+            }
+        }
+    }
+
     #[test]
     fn configured_x86_scanning_matches_default_across_poll_boundaries() {
         let mut input = vec![0; 192 * 1024];

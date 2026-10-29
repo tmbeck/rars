@@ -241,6 +241,7 @@ impl<T, B: Budget> Buffer<T, B> {
     /// Admit one exact allocation before copying slices that form a buffer.
     /// The total is checked first, so none of the copies can grow past its
     /// charged capacity.
+    #[cfg(feature = "write")]
     pub(crate) fn from_slices(slices: &[&[T]], allowance: &B) -> Result<Self>
     where
         T: Copy,
@@ -313,6 +314,7 @@ impl<T, B: Budget> Buffer<T, B> {
     pub(crate) fn retain(&mut self, keep: impl FnMut(&T) -> bool) {
         self.values.retain(keep);
     }
+    #[cfg(any(feature = "write", feature = "encryption"))]
     pub(crate) fn truncate(&mut self, len: usize) {
         self.values.truncate(len);
     }
@@ -326,7 +328,7 @@ impl<T, B: Budget> Buffer<T, B> {
         self.values.resize(len, value);
         Ok(())
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "write"))]
     pub(crate) fn resize_with(&mut self, len: usize, make: impl FnMut() -> T) -> Result<()> {
         if B::LIMITED && len > self.values.capacity() {
             self.reserve(len - self.values.len())?;
@@ -336,16 +338,6 @@ impl<T, B: Budget> Buffer<T, B> {
     }
     pub(crate) fn clear(&mut self) {
         self.values.clear();
-    }
-    pub(crate) fn insert(&mut self, index: usize, value: T) -> Result<()> {
-        if B::LIMITED {
-            self.reserve(1)?;
-        }
-        self.values.insert(index, value);
-        Ok(())
-    }
-    pub(crate) fn remove(&mut self, index: usize) -> T {
-        self.values.remove(index)
     }
     pub(crate) fn try_collect(
         values: impl ExactSizeIterator<Item = Result<T>>,
@@ -370,6 +362,7 @@ impl<T, B: Budget> Buffer<T, B> {
     }
     /// Admit the final window before modifying it. A refusal keeps the old
     /// history intact, and input larger than the window is never copied in full.
+    #[cfg(any(test, feature = "write"))]
     pub(crate) fn remember(&mut self, input: &[T], limit: usize) -> Result<()>
     where
         T: Copy,
@@ -392,6 +385,7 @@ impl<T, B: Budget> Buffer<T, B> {
         self.values.extend_from_slice(values);
         Ok(())
     }
+    #[cfg(any(test, feature = "write"))]
     pub(crate) fn prepend(&mut self, prefix: impl ExactSizeIterator<Item = T>) -> Result<()> {
         self.reserve(prefix.len())?;
         let old_len = self.values.len();
@@ -493,6 +487,7 @@ impl<T> From<Vec<T>> for Buffer<T> {
     }
 }
 impl<T> Buffer<T> {
+    #[cfg(any(test, feature = "write"))]
     pub(crate) fn from_vec(values: Vec<T>) -> Self {
         Self { values, charge: () }
     }
@@ -514,6 +509,7 @@ impl<B: Budget> Buffer<u8, B> {
             self.extend_from_slice(&chunk[..len]).map_err(Into::into)?;
         }
     }
+    #[cfg(feature = "write")]
     pub(crate) fn write_msb_bits(
         &mut self,
         bit_pos: &mut usize,
@@ -528,6 +524,7 @@ impl<B: Budget> Buffer<u8, B> {
         super::fast::write_msb_bits(&mut self.values, bit_pos, value, count);
         Ok(())
     }
+    #[cfg(feature = "write")]
     pub(crate) fn write_msb_bits_admitted(
         &mut self,
         bit_pos: &mut usize,
@@ -583,6 +580,40 @@ impl<T: PartialEq, B: Budget> PartialEq<Vec<T>> for Buffer<T, B> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn interrupted_reads_retry_and_buffer_flush_preserves_charge() {
+        use std::io::{self, Cursor, Read, Write};
+        struct InterruptedOnce {
+            interrupted: bool,
+            data: Cursor<&'static [u8]>,
+        }
+        impl Read for InterruptedOnce {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                self.data.read(out)
+            }
+        }
+        let ledger = Allowance::limited(16);
+        let mut input = InterruptedOnce {
+            interrupted: false,
+            data: Cursor::new(b"payload".as_slice()),
+        };
+        let mut bytes = Buffer::new(&ledger);
+        bytes.read_to_end(&mut input).unwrap();
+        assert!(input.interrupted);
+        assert_eq!(&*bytes, b"payload");
+        let charged = ledger.used();
+        assert!(charged >= 7);
+        bytes.flush().unwrap();
+        assert_eq!(&*bytes, b"payload");
+        assert_eq!(ledger.used(), charged);
+        drop(bytes);
+        assert_eq!(ledger.used(), 0);
+    }
+
     #[test]
     fn boxed_workspace_is_admitted_before_construction_and_released_on_failure() {
         let small = Allowance::limited(31);

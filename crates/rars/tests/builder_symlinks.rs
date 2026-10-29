@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::{ArchiveReader, ArchiveVersion, Builder};
 
 #[test]
@@ -167,7 +169,13 @@ fn zero_size_rar5_unix_link_header_preserves_its_target() {
     rewritten.add_archive_redirection(&member).unwrap();
     let output = ArchiveReader::read_owned(rewritten.to_bytes().unwrap()).unwrap();
     assert_eq!(
-        output.members().next().unwrap().unix_symlink().unwrap().target_name,
+        output
+            .members()
+            .next()
+            .unwrap()
+            .unix_symlink()
+            .unwrap()
+            .target_name,
         b"target"
     );
 }
@@ -245,7 +253,13 @@ fn retains_windows_links_and_file_copy_records() {
         if kind >= 4 {
             let mut broken = output.clone();
             if let rars::Archive::Rar50Plus(archive) = &mut broken {
-                if let rars::rar50::Block::File(file) = &mut archive.blocks[1] {
+                if let rars::rar50::Block::File(file) = archive
+                    .blocks
+                    .iter_mut()
+                    .filter(|block| matches!(block, rars::rar50::Block::File(_)))
+                    .nth(1)
+                    .unwrap()
+                {
                     file.redirection.as_mut().unwrap().target_name = b"missing".to_vec();
                 }
             }
@@ -301,8 +315,8 @@ fn link_setters_refuse_shapes_the_target_format_cannot_write() {
     let archive = ArchiveReader::read_owned(seed.to_bytes().unwrap()).unwrap();
     let member = archive.members().next().unwrap();
     for format in [ArchiveVersion::Rar20, ArchiveVersion::Rar50] {
-        let mut builder = Builder::new(format)
-            .volume_size((format == ArchiveVersion::Rar50).then_some(1024));
+        let mut builder =
+            Builder::new(format).volume_size((format == ArchiveVersion::Rar50).then_some(1024));
         assert!(builder.add_archive_redirection(&member).is_err());
         assert!(builder.is_empty());
     }
@@ -429,7 +443,12 @@ fn batch_link_targets_reject_invalid_targets_and_corrupt_dependencies() {
         let mut archive = ArchiveReader::read_owned(data).unwrap();
         // Alter the parsed expected CRC to isolate integrity failure from decoding.
         if let rars::Archive::Rar15To40(legacy) = &mut archive {
-            if let rars::rar15_40::Block::File(file) = &mut legacy.blocks[0] {
+            if let rars::rar15_40::Block::File(file) = legacy
+                .blocks
+                .iter_mut()
+                .find(|block| matches!(block, rars::rar15_40::Block::File(_)))
+                .unwrap()
+            {
                 file.file_crc ^= 1;
             } else {
                 panic!("expected first file");

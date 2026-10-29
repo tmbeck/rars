@@ -1,7 +1,9 @@
 // Exercise the packed-shape async JavaScript API under Node.
+import "./test-wasm-bindings.cjs";
 import "./test-npm-api.mjs";
 import "./test-npm-errors.mjs";
 import "./test-npm-client.mjs";
+import "./test-npm-node.mjs";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -45,6 +47,7 @@ await check("every format round-trips without blocking API calls", async () => {
     const archive = await RarArchive.open(bytes);
     assert.deepEqual(archive.entries.map((entry) => entry.name), ["hello.txt", "dir/second.txt"]);
     assert.deepEqual(await archive.get("hello.txt").bytes(), HELLO, format);
+    assert.deepEqual(await archive.readMany([archive.entries[1], "hello.txt", archive.entries[1]]), [SECOND, HELLO, SECOND]);
     await archive.test();
     archive.close();
     writer.close();
@@ -209,8 +212,9 @@ await check("RAR5 decoder and volume budgets reach WASM", async () => {
   await assert.rejects(archive.entries[0].bytes({ rar50DictionarySizeLimit: 0 }), limited);
   const filtered = await RarArchive.open(await readFile(new URL(
     "../crates/rars/tests/fixtures/rar50/filter_e8.rar", import.meta.url)));
-  await assert.rejects(filtered.entries[0].bytes({ rar50BufferedDecodeLimit: 0 }), limited);
-  assert.ok((await filtered.entries[0].bytes()).length > 0);
+  const expected = await filtered.entries[0].bytes();
+  assert.ok(expected.length > 0);
+  assert.deepEqual(await filtered.entries[0].bytes({ rar50BufferedDecodeLimit: 0 }), expected);
   const payload = new Uint8Array(180000).fill(9);
   for (const format of ["rar14", "rar29", "rar50", "rar70"]) {
     const writer = new RarWriter({ format, level: 0 }).add("a.bin", payload);

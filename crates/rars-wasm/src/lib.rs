@@ -409,15 +409,15 @@ impl RarFile {
     pub fn get_info(&self, name: &str) -> Option<RarInfo> {
         self.infos
             .iter()
+            .rev()
             .find(|info| info.name == name.as_bytes())
             .cloned()
     }
 
     /// Decode one member.
     ///
-    /// Solid archives decode from the start every time, so pulling several
-    /// members out of one costs a pass each. Reading a whole solid archive is
-    /// better served by asking for each member in archive order.
+    /// Each call starts a new decoder session. Use `readMany` for several
+    /// members so required solid predecessors are decoded once.
     pub fn read(
         &self,
         name: &str,
@@ -425,17 +425,23 @@ impl RarFile {
         settings: JsValue,
     ) -> Result<Vec<u8>, JsValue> {
         let password = password_bytes(password)?.or_else(|| self.password.clone());
-        self.archives[0]
-            .read_member_with_options(
-                name.as_bytes(),
-                read_options(password.as_deref(), &settings)?,
-            )
-            .map_err(js_error)?
-            .ok_or_else(|| {
-                js_error(
-                    rars_rs::Error::EntryNotFound.at_entry(name.as_bytes().to_vec(), "reading"),
-                )
-            })
+        let options = read_options(password.as_deref(), &settings)?;
+        let found = if let Some(index) = self
+            .infos
+            .iter()
+            .rposition(|info| info.name == name.as_bytes())
+        {
+            if self.archives.len() == 1 {
+                self.archives[0].read_member_at_with_options(index, options)
+            } else {
+                rars_rs::read_volume_member_at_with_options(&self.archives, index, options)
+            }
+        } else {
+            Ok(None)
+        };
+        found.map_err(js_error)?.ok_or_else(|| {
+            js_error(rars_rs::Error::EntryNotFound.at_entry(name.as_bytes().to_vec(), "reading"))
+        })
     }
 
     /// Decode one member by archive-order index.
@@ -463,6 +469,36 @@ impl RarFile {
                 &format!("no such archive entry index: {index}"),
             )
         })
+    }
+
+    /// Decode selected indices in one session, preserving order and duplicates.
+    #[wasm_bindgen(js_name = readMany)]
+    pub fn read_many(
+        &self,
+        indices: Vec<u32>,
+        password: Option<Password>,
+        settings: JsValue,
+    ) -> Result<js_sys::Array, JsValue> {
+        let indices: Vec<usize> = indices.into_iter().map(|index| index as usize).collect();
+        let password = password_bytes(password)?.or_else(|| self.password.clone());
+        let options = read_options(password.as_deref(), &settings)?;
+        let data = if self.archives.len() == 1 {
+            self.archives[0].read_members_at_with_options(&indices, options)
+        } else {
+            rars_rs::read_volume_members_at_with_options(&self.archives, &indices, options)
+        }
+        .map_err(js_error)?;
+        let results = js_sys::Array::new();
+        for (index, bytes) in indices.into_iter().zip(data) {
+            let bytes = bytes.ok_or_else(|| {
+                binding_error(
+                    "ENTRY_NOT_FOUND",
+                    &format!("no file payload at archive entry index: {index}"),
+                )
+            })?;
+            results.push(&js_sys::Uint8Array::from(bytes.as_slice()));
+        }
+        Ok(results)
     }
 
     /// Decode every member and discard the bytes, throwing on the first
@@ -533,14 +569,15 @@ fn info_with_encoding(
 }
 
 fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
+    let solid = member.is_solid();
     // RAR 1.3 checksums are 16 bit and RAR 5 may carry a BLAKE2sp hash instead
     // of a CRC, so the one field JavaScript sees is the CRC-32 where the format
     // has one and null everywhere else.
-    let (crc, solid) = match member.detail {
-        rars_rs::ArchiveMemberDetail::Rar13 { .. } => (None, false),
-        rars_rs::ArchiveMemberDetail::Rar15To40 { crc32, solid, .. } => (Some(crc32), solid),
-        rars_rs::ArchiveMemberDetail::Rar50Plus { crc32, .. } => (crc32, false),
-        _ => (None, false),
+    let crc = match member.detail {
+        rars_rs::ArchiveMemberDetail::Rar13 { .. } => None,
+        rars_rs::ArchiveMemberDetail::Rar15To40 { crc32, .. } => Some(crc32),
+        rars_rs::ArchiveMemberDetail::Rar50Plus { crc32, .. } => crc32,
+        _ => None,
     };
     RarInfo {
         display_name: String::from_utf8_lossy(&member.meta.name).into_owned(),
@@ -873,9 +910,6 @@ fn password_bytes(password: Option<Password>) -> Result<Option<Vec<u8>>, JsValue
         return Ok(None);
     };
     let value: JsValue = password.into();
-    if value.is_undefined() || value.is_null() {
-        return Ok(None);
-    }
     if let Some(text) = value.as_string() {
         return Ok(Some(text.into_bytes()));
     }
@@ -995,4 +1029,121 @@ fn read_options<'a>(
     options.rar50_dictionary_size_limit = read_limit(settings, "rar50DictionarySizeLimit")?;
     options.rar50_buffered_decode_limit = read_limit(settings, "rar50BufferedDecodeLimit")?;
     Ok(options)
+}
+
+// This export exists only in the test engine built by coverage-wasm.py.
+// It exercises private error conversion in a real JavaScript host without
+// requiring browser-only types to work in native Rust unit tests.
+#[cfg(test)]
+mod host_tests {
+    #[test]
+    fn duplicate_name_metadata_selects_the_last_entry() {
+        let mut builder = rars_rs::Builder::new(rars_rs::ArchiveVersion::Rar50)
+            .store(true)
+            .allow_duplicate_names(true);
+        for payload in [b"first".as_slice(), b"second".as_slice()] {
+            builder
+                .add_bytes(b"same".to_vec(), payload.to_vec(), None, None)
+                .unwrap();
+        }
+        let archive = rars_rs::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        let file = super::RarFile {
+            infos: archive.members().map(super::info_from_member).collect(),
+            archives: vec![archive],
+            password: None,
+        };
+        assert_eq!(file.get_info("same").unwrap().size, 6.0);
+    }
+
+    #[test]
+    fn binding_preserves_rar5_member_solid_flags() {
+        for version in [
+            rars_rs::ArchiveVersion::Rar50,
+            rars_rs::ArchiveVersion::Rar70,
+        ] {
+            let mut builder = rars_rs::Builder::new(version).solid(true);
+            for name in [b"first".as_slice(), b"second".as_slice()] {
+                builder
+                    .add_bytes(name.to_vec(), b"repeated payload ".repeat(4), None, None)
+                    .unwrap();
+            }
+            let archive = rars_rs::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            let flags: Vec<_> = archive
+                .members()
+                .map(|member| super::info_from_member(member).solid)
+                .collect();
+            assert_eq!(flags, [false, true], "{version:?}");
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = __testErrorRecords)]
+    pub fn error_records() -> js_sys::Array {
+        use rars_rs::Error;
+        let limit = 9_007_199_254_740_993;
+        let required = u64::MAX;
+        let used = 17;
+        let errors = [
+            Error::Codec(rars_rs::codec::Error::WorkspaceLimitExceeded(Box::new(
+                rars_rs::codec::WorkspaceLimitError {
+                    limit,
+                    required,
+                    used,
+                },
+            ))),
+            Error::MemoryLimitExceeded {
+                limit,
+                required,
+                dictionary_size: used,
+            },
+            Error::WriterPreparationLimitExceeded {
+                limit,
+                required,
+                used,
+            },
+            Error::WriterPreparedHeaderLimitExceeded {
+                limit,
+                required,
+                used,
+            },
+            Error::WriterSpoolMemoryLimitExceeded {
+                limit,
+                required,
+                used,
+            },
+            Error::WriterSpoolLimitExceeded {
+                limit,
+                required,
+                used,
+            },
+            Error::TotalOutputLimitExceeded {
+                limit,
+                required,
+                used,
+            },
+            Error::MemberOutputLimitExceeded { limit, required },
+            Error::HeaderBytesLimitExceeded { limit, required },
+            Error::Rar50DictionaryLimitExceeded { limit, required },
+            Error::Rar50BufferedDecodeLimitExceeded { limit, required },
+            Error::HeaderCountLimitExceeded { limit, required },
+            Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            Error::Rar5Recovery(rars_rs::recovery::rar5::Error::Io(
+                std::io::ErrorKind::BrokenPipe,
+            )),
+        ];
+        errors
+            .into_iter()
+            .map(|error| {
+                let wrapped = Error::InVolume {
+                    number: 3,
+                    source: Box::new(
+                        error
+                            .at_entry(vec![0xff, 0, 1], "reading")
+                            .at_archive_offset(usize::MAX),
+                    ),
+                };
+                super::js_error(wrapped)
+            })
+            .collect()
+    }
 }

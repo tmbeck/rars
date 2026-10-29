@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::{ArchiveReader, ArchiveVersion, Builder};
 
 #[test]
@@ -33,7 +35,11 @@ fn preserving_builder_accepts_native_unix_directories() {
 
 #[test]
 fn preserving_builder_refuses_unix_device_entries() {
-    for version in [ArchiveVersion::Rar20, ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+    for version in [
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar50,
+    ] {
         let mut builder = Builder::new(version).store(true);
         builder
             .add_bytes(b"device".to_vec(), Vec::new(), None, Some(0o020600))
@@ -194,7 +200,10 @@ fn retained_legacy_comment_metadata_requires_the_comment_to_be_copied() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(output.comment(None).unwrap(), Some(b"archive note".to_vec()));
+    assert_eq!(
+        output.comment(None).unwrap(),
+        Some(b"archive note".to_vec())
+    );
 }
 
 #[test]
@@ -208,7 +217,10 @@ fn preserving_builder_requires_password_for_encrypted_legacy_archive_comment() {
         .unwrap();
     let source = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
     assert!(source.rewrite_preservation_issues().is_empty());
-    assert!(matches!(source.preserving_builder(None), Err(rars::Error::NeedPassword)));
+    assert!(matches!(
+        source.preserving_builder(None),
+        Err(rars::Error::NeedPassword)
+    ));
 
     let mut preserving = source
         .preserving_builder(Some(b"secret"))
@@ -218,11 +230,22 @@ fn preserving_builder_requires_password_for_encrypted_legacy_archive_comment() {
     preserving
         .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
         .unwrap();
-    preserving.set_entry_encryption(b"file", None, None).unwrap();
+    preserving
+        .set_entry_encryption(b"file", None, None)
+        .unwrap();
     let output = ArchiveReader::read_owned(preserving.to_bytes().unwrap()).unwrap();
-    assert!(matches!(output.comment(None), Err(rars::Error::NeedPassword)));
-    assert_eq!(output.comment(Some(b"secret")).unwrap(), Some(b"private note".to_vec()));
-    assert_eq!(output.read_member(b"file", None).unwrap().unwrap(), b"payload");
+    assert!(matches!(
+        output.comment(None),
+        Err(rars::Error::NeedPassword)
+    ));
+    assert_eq!(
+        output.comment(Some(b"secret")).unwrap(),
+        Some(b"private note".to_vec())
+    );
+    assert_eq!(
+        output.read_member(b"file", None).unwrap().unwrap(),
+        b"payload"
+    );
 }
 
 #[test]
@@ -274,7 +297,10 @@ fn preserving_builder_requires_password_for_encrypted_legacy_members() {
             .add_bytes(b"encrypted".to_vec(), b"payload".to_vec(), None, None)
             .unwrap();
         let source = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
-        assert!(source.rewrite_preservation_issues().is_empty(), "{version:?}");
+        assert!(
+            source.rewrite_preservation_issues().is_empty(),
+            "{version:?}"
+        );
         assert!(matches!(
             source.preserving_builder(None),
             Err(rars::Error::NeedPassword)
@@ -347,7 +373,10 @@ fn preservation_preflight_refuses_metadata_it_cannot_rewrite() {
         "main header metadata",
     );
     check(|archive| archive.main.archive_flags |= 1, "volume layout");
-    check(|archive| archive.main.volume_number = Some(1), "volume layout");
+    check(
+        |archive| archive.main.volume_number = Some(1),
+        "volume layout",
+    );
     check(
         |archive| archive.main.block.flags |= 2,
         "main header metadata",
@@ -362,7 +391,12 @@ fn preservation_preflight_refuses_metadata_it_cannot_rewrite() {
     );
     check(
         |archive| {
-            if let rar50::Block::File(file) = &mut archive.blocks[0] {
+            if let rar50::Block::File(file) = archive
+                .blocks
+                .iter_mut()
+                .find(|block| matches!(block, rar50::Block::File(_)))
+                .unwrap()
+            {
                 file.name = b"../file".to_vec();
             }
         },
@@ -370,7 +404,12 @@ fn preservation_preflight_refuses_metadata_it_cannot_rewrite() {
     );
     check(
         |archive| {
-            if let rar50::Block::File(file) = &mut archive.blocks[0] {
+            if let rar50::Block::File(file) = archive
+                .blocks
+                .iter_mut()
+                .find(|block| matches!(block, rar50::Block::File(_)))
+                .unwrap()
+            {
                 file.host_os = 99;
             }
         },
@@ -378,7 +417,12 @@ fn preservation_preflight_refuses_metadata_it_cannot_rewrite() {
     );
     check(
         |archive| {
-            if let rar50::Block::File(file) = &mut archive.blocks[0] {
+            if let rar50::Block::File(file) = archive
+                .blocks
+                .iter_mut()
+                .find(|block| matches!(block, rar50::Block::File(_)))
+                .unwrap()
+            {
                 file.block.flags |= 8;
             }
         },
@@ -386,7 +430,12 @@ fn preservation_preflight_refuses_metadata_it_cannot_rewrite() {
     );
     check(
         |archive| {
-            if let rar50::Block::File(file) = &mut archive.blocks[0] {
+            if let rar50::Block::File(file) = archive
+                .blocks
+                .iter_mut()
+                .find(|block| matches!(block, rar50::Block::File(_)))
+                .unwrap()
+            {
                 file.host_os = 1;
                 file.attributes = 1 << 20;
             }
@@ -395,7 +444,12 @@ fn preservation_preflight_refuses_metadata_it_cannot_rewrite() {
     );
     check(
         |archive| {
-            if let rar50::Block::File(file) = &mut archive.blocks[0] {
+            if let rar50::Block::File(file) = archive
+                .blocks
+                .iter_mut()
+                .find(|block| matches!(block, rar50::Block::File(_)))
+                .unwrap()
+            {
                 file.host_os = 1;
                 file.file_flags |= 1;
                 file.attributes = 0o100644;
@@ -405,7 +459,12 @@ fn preservation_preflight_refuses_metadata_it_cannot_rewrite() {
     );
     check(
         |archive| {
-            if let rar50::Block::File(file) = &mut archive.blocks[0] {
+            if let rar50::Block::File(file) = archive
+                .blocks
+                .iter_mut()
+                .find(|block| matches!(block, rar50::Block::File(_)))
+                .unwrap()
+            {
                 file.host_os = 0;
                 file.attributes = 0x10;
             }
@@ -414,7 +473,12 @@ fn preservation_preflight_refuses_metadata_it_cannot_rewrite() {
     );
     check(
         |archive| {
-            if let rar50::Block::File(file) = &mut archive.blocks[0] {
+            if let rar50::Block::File(file) = archive
+                .blocks
+                .iter_mut()
+                .find(|block| matches!(block, rar50::Block::File(_)))
+                .unwrap()
+            {
                 file.block.flags |= 0x100;
             }
         },
@@ -422,7 +486,12 @@ fn preservation_preflight_refuses_metadata_it_cannot_rewrite() {
     );
     check(
         |archive| {
-            if let rar50::Block::File(file) = &mut archive.blocks[0] {
+            if let rar50::Block::File(file) = archive
+                .blocks
+                .iter_mut()
+                .find(|block| matches!(block, rar50::Block::File(_)))
+                .unwrap()
+            {
                 file.file_flags |= 8;
             }
         },
@@ -430,7 +499,12 @@ fn preservation_preflight_refuses_metadata_it_cannot_rewrite() {
     );
     check(
         |archive| {
-            if let rar50::Block::File(file) = &mut archive.blocks[0] {
+            if let rar50::Block::File(file) = archive
+                .blocks
+                .iter_mut()
+                .find(|block| matches!(block, rar50::Block::File(_)))
+                .unwrap()
+            {
                 file.compression_info |= 1 << 21;
             }
         },
@@ -438,7 +512,12 @@ fn preservation_preflight_refuses_metadata_it_cannot_rewrite() {
     );
     check(
         |archive| {
-            if let rar50::Block::File(file) = &mut archive.blocks[0] {
+            if let rar50::Block::File(file) = archive
+                .blocks
+                .iter_mut()
+                .find(|block| matches!(block, rar50::Block::File(_)))
+                .unwrap()
+            {
                 file.compression_info = (file.compression_info & !0x3f) | 2;
             }
         },
@@ -446,7 +525,12 @@ fn preservation_preflight_refuses_metadata_it_cannot_rewrite() {
     );
     check(
         |archive| {
-            if let rar50::Block::File(file) = &mut archive.blocks[0] {
+            if let rar50::Block::File(file) = archive
+                .blocks
+                .iter_mut()
+                .find(|block| matches!(block, rar50::Block::File(_)))
+                .unwrap()
+            {
                 file.compression_info |= 0x40;
             }
         },
@@ -579,7 +663,9 @@ fn preservation_preflight_checks_every_derived_service_field() {
         mutate(service);
         let issues = Archive::Rar50Plus(candidate).rewrite_preservation_issues();
         assert!(
-            issues.iter().any(|issue| issue.contains("unsupported derived service")),
+            issues
+                .iter()
+                .any(|issue| issue.contains("unsupported derived service")),
             "{name:?}: {issues:?}"
         );
     };
@@ -694,6 +780,33 @@ fn legacy_rewrite_helpers_leave_regular_files_without_link_or_modern_metadata() 
     let member = archive.members().next().unwrap();
     assert!(member.file_times().unwrap().is_none());
     assert!(member.unix_symlink().is_none());
+}
+
+#[test]
+fn link_target_scan_skips_corrupt_regular_payloads_in_every_family() {
+    const PAYLOAD: &[u8] = b"a distinct stored payload for the link scan";
+    for version in [
+        ArchiveVersion::Rar14,
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar50,
+    ] {
+        let mut builder = Builder::new(version).store(true);
+        builder
+            .add_directory(b"directory".to_vec(), None, None)
+            .unwrap();
+        builder
+            .add_bytes(b"file".to_vec(), PAYLOAD.to_vec(), None, None)
+            .unwrap();
+        let mut bytes = builder.to_bytes().unwrap();
+        let offset = bytes
+            .windows(PAYLOAD.len())
+            .position(|window| window == PAYLOAD)
+            .unwrap();
+        bytes[offset] ^= 1;
+        let archive = ArchiveReader::read_owned(bytes).unwrap();
+        assert!(archive.read_member_at(1, None).is_err(), "{version:?}");
+        assert_eq!(archive.legacy_symlink_targets(None).unwrap(), [None, None]);
+    }
 }
 
 #[test]

@@ -505,19 +505,21 @@ fn compress_members_whole(
             return Err(Error::Cancelled);
         }
         if members[start].execution != Execution::WholeMember {
-            results.push(
-                compress_fallback_member(
-                    start,
-                    &sources[start],
-                    integrity[start],
-                    plan,
-                    members[start].workspace,
-                    resources,
-                    advance,
-                    error_context,
+            results
+                .push(
+                    compress_fallback_member(
+                        start,
+                        &sources[start],
+                        integrity[start],
+                        plan,
+                        members[start].workspace,
+                        resources,
+                        advance,
+                        error_context,
+                    )
+                    .map_err(|error| error_context(start, error))?,
                 )
-                .map_err(|error| error_context(start, error))?,
-            )?;
+                .expect("one compression result per source was admitted");
             start += 1;
             continue;
         }
@@ -882,7 +884,15 @@ where
                     job.blocks
                         .push_growing((member, job.data.len(), !stream.has_more()))?;
                 }
-                histories[member].remember(&job.data, plan.encode_options.max_match_distance)?;
+                if stream.has_more() {
+                    histories[member]
+                        .remember(&job.data, plan.encode_options.max_match_distance)?;
+                } else {
+                    // The final job already owns its input and preceding
+                    // history. No later job can read this member's retained
+                    // buffer, so release it instead of copying terminal bytes.
+                    histories[member] = Buffer::new(allowance);
+                }
                 jobs.push(job)?;
             }
 
@@ -1026,14 +1036,13 @@ fn read_block<B: Budget>(
     splitter.accept(&data);
     while stream.has_more() {
         let next = read_chunk(stream, block_size, progress)?;
-        if !splitter.extends(&next) {
+        if !splitter.try_extend(&next) {
             // Deciding needs the chunk in hand, so this reads one further than
             // it keeps. Hand it back for the next block rather than seeking
             // backwards, which an `EntryReader` cannot always do.
             stream.pushback = next;
             break;
         }
-        splitter.accept(&next);
         data.extend_from_slice(&next)
             .map_err(Into::<crate::codec::Error>::into)?;
     }
@@ -1198,9 +1207,10 @@ fn append_packed_runs<B: Budget, C: Budget>(
             advance.finished(stream.member, stream.input_size);
         }
     }
-    if let Some(previous) = previous {
-        streams[previous].packed.park();
-    }
+    // Both wave builders dispatch only non-empty jobs, and every job emits
+    // one packed block for each recorded boundary.
+    let previous = previous.expect("compression wave contains a packed block");
+    streams[previous].packed.park();
     Ok(())
 }
 
@@ -1230,6 +1240,117 @@ pub(super) fn compress_members_reporting(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn stream_creation_failure_keeps_member_context_before_opening_source() {
+        let scratch = crate::scratch::case("stream-creation-context");
+        for solid in [false, true] {
+            let resources = WriterResources::new(128 * 1024 * 1024)
+                .with_max_memory_bytes(128 * 1024 * 1024)
+                .with_temp_dir(scratch.join("missing-directory"));
+            let options = EncodeOptions::new(8).with_max_match_distance(65536);
+            let plan = CompressPlan {
+                algorithm_version: 0,
+                encode_options: options,
+                dictionary_size: 65536,
+                block_size: 65536,
+                solid,
+                method: 1,
+                filter_policy: FilterPolicy::None,
+                candidates: vec![options].into(),
+            };
+            let source = EntrySource::from_opener(1, || {
+                panic!("spool creation must fail before opening the source")
+            });
+            let error = compress_members_with_context(
+                &[source],
+                &plan,
+                &resources,
+                &|_| true,
+                &|index, error| {
+                    assert_eq!(index, 0);
+                    error.at_entry(b"unopened.bin".to_vec(), "compressing")
+                },
+            )
+            .err()
+            .unwrap();
+            assert_eq!(error.kind(), crate::ErrorKind::Io);
+            assert_eq!(
+                error.entry_context(),
+                Some((b"unopened.bin".as_slice(), "compressing"))
+            );
+            assert_eq!(resources.workspace_in_use(), 0);
+            assert_eq!(resources.managed_memory_in_use(), 0);
+            assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn cancellation_after_wave_check_keeps_admission_error_context() {
+        struct CancelAfterObservation(crate::WriteCancellation);
+        impl CompressionProgress for CancelAfterObservation {
+            fn advance(&self, _: u64) -> bool {
+                !self.0.is_cancelled()
+            }
+            fn is_cancelled(&self) -> bool {
+                // Model cancellation arriving just after the observation.
+                let observed = self.0.is_cancelled();
+                self.0.cancel();
+                observed
+            }
+        }
+        let scratch = crate::scratch::case("wave-admission-context");
+        let resources = WriterResources::new(128 * 1024 * 1024).with_temp_dir(&*scratch);
+        let options = EncodeOptions::new(8).with_max_match_distance(65536);
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size: 65536,
+            block_size: 65536,
+            solid: false,
+            method: 1,
+            filter_policy: FilterPolicy::Auto,
+            candidates: vec![options].into(),
+        };
+        let execution = ExecutionPlan::with_resources(&plan, [32].into_iter(), &resources).unwrap();
+        let ExecutionPlan::IndependentMembers(members) = execution else {
+            panic!("expected whole-member plan");
+        };
+        assert_eq!(members[0].execution, Execution::WholeMember);
+        let source = EntrySource::from_opener(32, || {
+            panic!("cancelled admission must precede source opening")
+        });
+        let progress = CancelAfterObservation(crate::WriteCancellation::new());
+        let error = compress_members_whole(
+            &[source],
+            &[(32, 0, [0; 32])],
+            &plan,
+            &members,
+            &resources,
+            &progress,
+            &|index, error| {
+                assert_eq!(index, 0);
+                error.at_entry(b"waiting.bin".to_vec(), "compressing")
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), crate::ErrorKind::Cancelled);
+        assert_eq!(
+            error.entry_context(),
+            Some((b"waiting.bin".as_slice(), "compressing"))
+        );
+        assert_eq!(resources.workspace_in_use(), 0);
+        assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+    }
+
     #[test]
     fn streaming_compression_releases_each_refused_preparation_allocation() {
         use std::sync::atomic::Ordering;
@@ -1249,12 +1370,8 @@ mod tests {
                 candidates: vec![options].into(),
             };
             let run = |resources: &WriterResources| -> Result<()> {
-                let packed = compress_members_reporting(
-                    &sources,
-                    plan.clone(),
-                    resources,
-                    &|_| true,
-                )?;
+                let packed =
+                    compress_members_reporting(&sources, plan.clone(), resources, &|_| true)?;
                 assert_eq!(packed.len(), 1);
                 Ok(())
             };
@@ -1299,8 +1416,8 @@ mod tests {
         let source = EntrySource::from_opener(1024, || {
             Err(std::io::Error::other("injected worker source failure").into())
         });
-        let resources = WriterResources::new(70 * 1024 * 1024)
-            .with_max_memory_bytes(70 * 1024 * 1024);
+        let resources =
+            WriterResources::new(70 * 1024 * 1024).with_max_memory_bytes(70 * 1024 * 1024);
         let error = compress_members_reporting(&[source], plan, &resources, &|_| true)
             .err()
             .expect("the admitted worker must report its source failure");
@@ -1339,7 +1456,10 @@ mod tests {
         drop(Records::<u8>::new(limit as usize, &resources).unwrap());
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn whole_member_cancellation_after_start_does_not_open_source() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1391,7 +1511,10 @@ mod tests {
         }
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn whole_member_cancellation_between_waves_does_not_open_next_source() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1462,7 +1585,11 @@ mod tests {
             let result = pool.install(|| {
                 compress_members_reporting(&[first, second], plan.clone(), &resources, &progress)
             });
-            assert!(matches!(result, Err(Error::Cancelled)), "{:?}", result.err());
+            assert!(
+                matches!(result, Err(Error::Cancelled)),
+                "{:?}",
+                result.err()
+            );
             if let Some(token) = &token {
                 assert!(token.is_cancelled());
             } else {
@@ -1557,10 +1684,7 @@ mod tests {
         let jobs = Records::collect(
             [
                 (None::<u8>, Some(Err::<u8, _>(Error::Cancelled))),
-                (
-                    None,
-                    Some(Err(Error::InvalidArgument("codec failure"))),
-                ),
+                (None, Some(Err(Error::InvalidArgument("codec failure")))),
             ]
             .into_iter()
             .map(Ok),
@@ -1569,9 +1693,15 @@ mod tests {
         .unwrap();
         let output = Records::new(2, &resources).unwrap();
         assert_eq!(
-            complete_jobs(jobs, output, &resources, &Cancelled, |_, _, _| -> Result<u8> {
-                panic!("cancelled worker overwrote its recorded result")
-            })
+            complete_jobs(
+                jobs,
+                output,
+                &resources,
+                &Cancelled,
+                |_, _, _| -> Result<u8> {
+                    panic!("cancelled worker overwrote its recorded result")
+                }
+            )
             .err()
             .unwrap(),
             Error::InvalidArgument("codec failure")
@@ -1579,7 +1709,10 @@ mod tests {
 
         let jobs = Records::collect(
             [
-                (None::<u8>, Some(Err::<u8, _>(Error::InvalidArgument("first")))),
+                (
+                    None::<u8>,
+                    Some(Err::<u8, _>(Error::InvalidArgument("first"))),
+                ),
                 (None, Some(Err(Error::InvalidArgument("second")))),
             ]
             .into_iter()
@@ -1589,9 +1722,15 @@ mod tests {
         .unwrap();
         let output = Records::new(2, &resources).unwrap();
         assert_eq!(
-            complete_jobs(jobs, output, &resources, &Cancelled, |_, _, _| -> Result<u8> {
-                panic!("cancelled worker overwrote its recorded result")
-            })
+            complete_jobs(
+                jobs,
+                output,
+                &resources,
+                &Cancelled,
+                |_, _, _| -> Result<u8> {
+                    panic!("cancelled worker overwrote its recorded result")
+                }
+            )
             .err()
             .unwrap(),
             Error::InvalidArgument("first")
@@ -1623,9 +1762,11 @@ mod tests {
         let resources = WriterResources::default();
         let source = EntrySource::from_factory(Untouched);
         assert_eq!(
-            compress_members_with_context(&[source], &plan, &resources, &Cancelled, &|_, error| error)
-                .err()
-                .unwrap(),
+            compress_members_with_context(&[source], &plan, &resources, &Cancelled, &|_, error| {
+                error
+            })
+            .err()
+            .unwrap(),
             Error::Cancelled
         );
         assert_eq!(
@@ -1657,7 +1798,10 @@ mod tests {
         );
         let running = |_: u64| true;
         for (resources, progress) in [
-            (WriterResources::default(), &Cancelled as &dyn CompressionProgress),
+            (
+                WriterResources::default(),
+                &Cancelled as &dyn CompressionProgress,
+            ),
             (resources, &running as &dyn CompressionProgress),
         ] {
             assert_eq!(
@@ -1937,10 +2081,13 @@ mod tests {
         }
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn streaming_ledger_covers_repeated_waves_and_retained_history() {
-        use std::sync::atomic::AtomicU64;
+        use crate::atomic64::AtomicU64;
         let scratch = crate::scratch::case("stream-ledger-waves");
         let size = crate::codec::rar50::MAX_LZ_BLOCK_SIZE * 2 + 4096;
         let data: Vec<u8> = (0..size).map(|i| ((i * 71) % 251) as u8).collect();
@@ -2182,11 +2329,15 @@ mod tests {
         }
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn admitted_workers_share_one_ledger_without_racing_for_spare_capacity() {
+        use crate::atomic64::AtomicU64;
         use crate::streaming::preparation::Bytes;
-        use std::sync::{atomic::AtomicU64, Barrier};
+        use std::sync::Barrier;
         let ledger = Allowance::limited(65536);
         let resources = WriterResources::default().with_execution_allowance(ledger.clone());
         let pool = rayon::ThreadPoolBuilder::new()
@@ -2245,7 +2396,10 @@ mod tests {
         }
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn whole_member_ledger_selects_fitting_waves_before_opening_sources() {
         use std::sync::{atomic::AtomicUsize, Arc, Barrier};
@@ -2354,7 +2508,10 @@ mod tests {
         }
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn failed_wave_skips_queued_sources_and_releases_successful_siblings() {
         use std::sync::atomic::AtomicUsize;
@@ -2406,7 +2563,10 @@ mod tests {
         );
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn sibling_failure_joins_running_work_and_keeps_the_original_error() {
         use std::sync::{atomic::AtomicUsize, Barrier};
@@ -2439,7 +2599,10 @@ mod tests {
         drop(Records::<u8>::new(65536, &resources).unwrap());
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn whole_member_allowance_precedes_source_open_and_survives_until_spooling() {
         use std::sync::{atomic::AtomicUsize, Arc};
@@ -2561,7 +2724,10 @@ mod tests {
         assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn whole_member_sources_open_only_after_combined_admission() {
         use std::sync::{atomic::AtomicUsize, Arc};
@@ -2601,6 +2767,63 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::Relaxed), 4);
         assert_eq!(resources.workspace_in_use(), 0);
+        assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn automatic_filter_fallback_source_failure_keeps_member_context() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let scratch = crate::scratch::case("fallback-source-error");
+        let resources = WriterResources::new(70 * 1024 * 1024).with_temp_dir(&*scratch);
+        let length = 2 * 1024 * 1024;
+        let options = EncodeOptions::new(8).with_max_match_distance(128 * 1024);
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size: 128 * 1024,
+            block_size: crate::codec::rar50::LZ_BLOCK_SIZE,
+            solid: false,
+            method: 1,
+            filter_policy: FilterPolicy::Auto,
+            candidates: vec![options].into(),
+        };
+        let execution =
+            ExecutionPlan::with_resources(&plan, std::iter::once(length), &resources).unwrap();
+        let ExecutionPlan::IndependentMembers(ref members) = execution else {
+            panic!("automatic filtering should plan independent members");
+        };
+        assert!(matches!(members[0].execution, Execution::Blocks { .. }));
+        drop(execution);
+        let opens = Arc::new(AtomicUsize::new(0));
+        let source = EntrySource::from_opener(length, {
+            let opens = Arc::clone(&opens);
+            move || {
+                opens.fetch_add(1, Ordering::Relaxed);
+                Err(std::io::Error::other("fallback source refused").into())
+            }
+        });
+        let error = compress_members_with_context(
+            &[source],
+            &plan,
+            &resources,
+            &|_| true,
+            &|index, error| {
+                assert_eq!(index, 0);
+                error.at_entry(b"fallback.bin".to_vec(), "compressing")
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), crate::ErrorKind::Io);
+        assert_eq!(
+            error.entry_context(),
+            Some((b"fallback.bin".as_slice(), "compressing"))
+        );
+        assert!(error.to_string().contains("fallback source refused"));
+        assert_eq!(opens.load(Ordering::Relaxed), 1);
         assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
     }
 
@@ -2899,7 +3122,10 @@ mod tests {
         larger.encode_options.max_match_distance *= 2;
         assert_eq!(whole_member_workspace(size as u64, &larger), required);
     }
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     #[test]
     fn whole_members_use_multiple_workers_without_changing_bytes() {
         use std::collections::HashSet;
