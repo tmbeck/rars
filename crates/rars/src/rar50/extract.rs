@@ -503,7 +503,7 @@ impl FileHeader {
                 return Buffer::copied(&packed[..unpacked_size], &decoder.allowance())
                     .map_err(Error::from);
             }
-            if packed.len() as u64 != self.unpacked_size {
+            if self.known_unpacked_size().is_some() && packed.len() as u64 != self.unpacked_size {
                 return Err(Error::InvalidHeader(
                     "RAR 5 stored file has mismatched packed and unpacked sizes",
                 ));
@@ -625,7 +625,10 @@ impl FileHeader {
         writer: &mut dyn Write,
         allowance: &B,
     ) -> Result<()> {
-        if !self.encrypted && self.packed_size() != self.unpacked_size {
+        if !self.encrypted
+            && self.known_unpacked_size().is_some()
+            && self.packed_size() != self.unpacked_size
+        {
             return Err(self.entry_error(
                 "decoding",
                 Error::InvalidHeader("RAR 5 stored file has mismatched packed and unpacked sizes"),
@@ -649,8 +652,9 @@ impl FileHeader {
             if count == 0 {
                 break;
             }
-            let remaining =
-                usize::try_from(self.unpacked_size.saturating_sub(written)).unwrap_or(usize::MAX);
+            let remaining = self.known_unpacked_size().map_or(usize::MAX, |size| {
+                usize::try_from(size.saturating_sub(written)).unwrap_or(usize::MAX)
+            });
             let chunk_len = count.min(remaining);
             // Past the unpacked size is the cipher block's padding, which
             // may hold any bytes; only the unpacked bytes are written.
@@ -672,7 +676,7 @@ impl FileHeader {
                 .map_err(|error| self.entry_error("writing", error))?;
         }
 
-        if written != self.unpacked_size {
+        if self.known_unpacked_size().is_some() && written != self.unpacked_size {
             return Err(self.entry_error(
                 "decoding",
                 Error::InvalidHeader("RAR 5 stored file has mismatched packed and unpacked sizes"),
@@ -1674,8 +1678,11 @@ impl<B: Budget> PendingSplitRefs<B> {
                 break;
             }
             let chunk = if final_file.encrypted {
-                let remaining = usize::try_from(final_file.unpacked_size.saturating_sub(written))
-                    .unwrap_or(usize::MAX);
+                let remaining = final_file
+                    .known_unpacked_size()
+                    .map_or(usize::MAX, |size| {
+                        usize::try_from(size.saturating_sub(written)).unwrap_or(usize::MAX)
+                    });
                 // The padding after the unpacked size may hold any bytes, as
                 // unrar accepts.
                 let chunk_len = count.min(remaining);
@@ -1693,7 +1700,7 @@ impl<B: Budget> PendingSplitRefs<B> {
             writer.write_all(chunk)?;
         }
 
-        if written != final_file.unpacked_size {
+        if final_file.known_unpacked_size().is_some() && written != final_file.unpacked_size {
             return Err(Error::InvalidHeader(
                 "RAR 5 stored split file has mismatched packed and unpacked sizes",
             ));
