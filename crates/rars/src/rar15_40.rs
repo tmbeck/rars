@@ -35,7 +35,7 @@ use crate::extraction_links::{check_legacy_size, emit_legacy_link, legacy_output
 pub use crate::streaming::{EntrySource, WriterResources};
 #[cfg(feature = "write")]
 pub use crate::write_plan::MemberCoding;
-pub use extract::extract_volumes_to;
+pub use extract::{extract_volumes_to, extract_volumes_to_with_errors};
 pub(crate) use extract::extract_volumes_with_links;
 use extract::{DecoderSession, DecryptingReader, PackedReader};
 #[cfg(feature = "write")]
@@ -934,12 +934,17 @@ impl Archive {
 
         options.check_cancelled()?;
         link_owners(&mut blocks);
-        Ok(Self {
+        let archive = Self {
             sfx_offset: sig.offset,
             main,
             blocks,
             source: ArchiveSource::Memory(input),
-        })
+        };
+        if options.auto_repair && archive.has_recovery_record() {
+            archive.auto_repaired(options)
+        } else {
+            Ok(archive)
+        }
     }
 
     pub(crate) fn parse_seekable(
@@ -1067,12 +1072,17 @@ impl Archive {
 
         options.check_cancelled()?;
         link_owners(&mut blocks);
-        Ok(Self {
+        let archive = Self {
             sfx_offset,
             main,
             blocks,
             source,
-        })
+        };
+        if options.auto_repair && archive.has_recovery_record() {
+            archive.auto_repaired(options)
+        } else {
+            Ok(archive)
+        }
     }
 
     /// The highest format requirement present in this container, not its creator release.
@@ -1349,6 +1359,89 @@ impl Archive {
         })
     }
 
+    pub fn has_recovery_record(&self) -> bool {
+        self.main.has_recovery_record()
+            || self.protect_records().next().is_some()
+            || self.new_subs().any(|sub| sub.kind == NewSubKind::RecoveryRecord)
+    }
+
+    pub fn with_overlay(&self, patches: Arc<std::collections::BTreeMap<u64, Vec<u8>>>) -> Self {
+        let mut cloned = self.clone();
+        cloned.source = cloned.source.with_overlay(patches);
+        cloned
+    }
+
+    pub fn is_overlaid(&self) -> bool {
+        self.source.is_overlaid()
+    }
+
+    #[cfg(feature = "recovery")]
+    pub fn recovery_patches_with_options(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<std::collections::BTreeMap<u64, Vec<u8>>> {
+        options.check_cancelled()?;
+        let control = crate::read_control::ReadControl::new(options.cancellation);
+        let source_bytes = self.source_bytes()?;
+        if let Some(recovery) = self
+            .new_subs()
+            .find(|sub| sub.kind == NewSubKind::RecoveryRecord)
+        {
+            repair_newsub_recovery_patches(
+                &source_bytes,
+                self.sfx_offset,
+                self,
+                recovery,
+                &control,
+            )
+        } else {
+            let protect = self.protect_records().next().ok_or(Error::InvalidHeader(
+                "RAR 2.x archive does not contain a PROTECT_HEAD recovery record",
+            ))?;
+            repair_protect_head_patches(
+                &source_bytes,
+                self.sfx_offset,
+                protect,
+                &control,
+            )
+        }
+    }
+
+    #[cfg(not(feature = "recovery"))]
+    pub fn recovery_patches_with_options(
+        &self,
+        _options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<std::collections::BTreeMap<u64, Vec<u8>>> {
+        Err(Error::FeatureDisabled {
+            feature: "recovery",
+        })
+    }
+
+    pub fn auto_repaired(&self, options: crate::ArchiveReadOptions<'_>) -> Result<Self> {
+        if !options.auto_repair || self.is_overlaid() || !self.has_recovery_record() {
+            return Ok(self.clone());
+        }
+        #[cfg(feature = "recovery")]
+        {
+            match self.recovery_patches_with_options(options) {
+                Ok(patches) if !patches.is_empty() => {
+                    Ok(self.with_overlay(Arc::new(patches)))
+                }
+                Ok(_) => Ok(self.clone()),
+                Err(err) => {
+                    if matches!(err.kind(), crate::ErrorKind::Cancelled) {
+                        return Err(err);
+                    }
+                    Ok(self.clone())
+                }
+            }
+        }
+        #[cfg(not(feature = "recovery"))]
+        {
+            Ok(self.clone())
+        }
+    }
+
     #[cfg(feature = "recovery")]
     fn source_bytes(&self) -> Result<Vec<u8>> {
         self.source.bytes()
@@ -1422,6 +1515,21 @@ impl Archive {
             .map(|_| ())
     }
 
+    pub fn extract_to_with_errors<F, E>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        mut open: F,
+        on_error: E,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+        E: FnMut(&crate::ArchiveMember, &Error) -> Result<crate::ExtractionErrorAction>,
+    {
+        let mut err_handler = on_error;
+        self.extract_impl(options, &mut open, None, Some(&mut err_handler), None)
+            .map(|_| ())
+    }
+
     pub(crate) fn extract_controlled(
         &self,
         options: crate::ArchiveReadOptions<'_>,
@@ -1448,8 +1556,16 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        let repaired_archive;
+        let target = if options.auto_repair && !self.is_overlaid() && self.has_recovery_record() {
+            repaired_archive = self.auto_repaired(options)?;
+            &repaired_archive
+        } else {
+            self
+        };
+
         if let Some(limit) = options.max_reader_workspace_bytes {
-            return self.extract_with_allowance(
+            return target.extract_with_allowance(
                 options,
                 open,
                 selector,
@@ -1458,7 +1574,7 @@ impl Archive {
                 &crate::codec::workspace::Allowance::limited(limit),
             );
         }
-        self.extract_with_allowance(
+        target.extract_with_allowance(
             options,
             open,
             selector,
@@ -1486,8 +1602,7 @@ impl Archive {
         let mut budget = crate::output_limit::OutputBudget::new(options);
         let mut session = DecoderSession::with_allowance(self.main.is_solid(), password, allowance);
         session.read_control = budget.control.clone();
-        let solid = selector.is_some()
-            && (self.main.is_solid() || self.files().any(|file| file.is_solid()));
+        let solid = self.main.is_solid() || self.files().any(|file| file.is_solid());
         for file in self.files() {
             let selected = crate::extraction_control::select(
                 &mut selector,
@@ -1969,14 +2084,13 @@ fn parse_protect_header(
     })
 }
 
-/// Repaired bytes plus whether any sector was actually rebuilt.
 #[cfg(feature = "recovery")]
-fn repair_protect_head_bytes(
+fn repair_protect_head_patches(
     source: &[u8],
     sfx_offset: usize,
     protect: &ProtectHeader,
     control: &crate::read_control::ReadControl,
-) -> Result<(Vec<u8>, bool)> {
+) -> Result<std::collections::BTreeMap<u64, Vec<u8>>> {
     control.check()?;
     if protect.rec_sectors == 0 {
         return Err(Error::InvalidHeader(
@@ -2035,7 +2149,7 @@ fn repair_protect_head_bytes(
         }
     }
     if damaged.is_empty() {
-        return Ok((source.to_vec(), false));
+        return Ok(std::collections::BTreeMap::new());
     }
     if damaged.len() > usize::from(protect.rec_sectors) {
         return Err(Error::InvalidHeader(
@@ -2055,7 +2169,7 @@ fn repair_protect_head_bytes(
         used_slots[slot] = true;
     }
 
-    let mut repaired = source.to_vec();
+    let mut patches = std::collections::BTreeMap::new();
     for &missing_index in &damaged {
         control.check()?;
         let slot = missing_index % usize::from(protect.rec_sectors);
@@ -2068,13 +2182,11 @@ fn repair_protect_head_bytes(
             let sector_start = protected_start + index * 512;
             for (out, byte) in sector
                 .iter_mut()
-                .zip(&repaired[sector_start..sector_start + 512])
+                .zip(&source[sector_start..sector_start + 512])
             {
                 *out ^= *byte;
             }
         }
-        let sector_start = protected_start + missing_index * 512;
-        repaired[sector_start..sector_start + 512].copy_from_slice(&sector);
         let actual = (!crc32(&sector) & 0xffff) as u16;
         let expected = u16::from_le_bytes(
             tags[missing_index * 2..missing_index * 2 + 2]
@@ -2084,19 +2196,36 @@ fn repair_protect_head_bytes(
         if actual != expected {
             return Err(Error::CrcMismatch { expected, actual });
         }
+        let sector_start = protected_start + missing_index * 512;
+        patches.insert(sector_start as u64, sector);
     }
+    Ok(patches)
+}
+
+#[cfg(feature = "recovery")]
+fn repair_protect_head_bytes(
+    source: &[u8],
+    sfx_offset: usize,
+    protect: &ProtectHeader,
+    control: &crate::read_control::ReadControl,
+) -> Result<(Vec<u8>, bool)> {
+    let patches = repair_protect_head_patches(source, sfx_offset, protect, control)?;
+    if patches.is_empty() {
+        return Ok((source.to_vec(), false));
+    }
+    let mut repaired = source.to_vec();
+    crate::read_at::apply_overlay(&patches, 0, &mut repaired);
     Ok((repaired, true))
 }
 
-/// Repaired bytes plus whether any sector was actually rebuilt.
 #[cfg(feature = "recovery")]
-fn repair_newsub_recovery_bytes(
+fn repair_newsub_recovery_patches(
     source: &[u8],
     sfx_offset: usize,
     archive: &Archive,
     recovery: &NewSubHeader,
     control: &crate::read_control::ReadControl,
-) -> Result<(Vec<u8>, bool)> {
+) -> Result<std::collections::BTreeMap<u64, Vec<u8>>> {
     control.check()?;
     let recovery_data = newsub_recovery_data(archive, recovery, control)?;
     let expected_unpacked = usize::try_from(recovery.file.unp_size)
@@ -2147,7 +2276,7 @@ fn repair_newsub_recovery_bytes(
         }
     }
     if damaged.is_empty() {
-        return Ok((source.to_vec(), false));
+        return Ok(std::collections::BTreeMap::new());
     }
     if damaged.len() > parity_sectors {
         return Err(Error::InvalidHeader(
@@ -2167,7 +2296,7 @@ fn repair_newsub_recovery_bytes(
         used_slots[slot] = true;
     }
 
-    let mut repaired = source.to_vec();
+    let mut patches = std::collections::BTreeMap::new();
     for &missing_index in &damaged {
         control.check()?;
         let slot = missing_index % parity_sectors;
@@ -2177,7 +2306,7 @@ fn repair_newsub_recovery_bytes(
             if index == missing_index {
                 continue;
             }
-            let other = protected_sector(&repaired, protected_start, protected_len, index);
+            let other = protected_sector(source, protected_start, protected_len, index);
             for (out, byte) in sector.iter_mut().zip(other) {
                 control.check()?;
                 *out ^= byte;
@@ -2194,9 +2323,26 @@ fn repair_newsub_recovery_bytes(
         }
         let sector_start = protected_start + missing_index * 512;
         let write_len = 512.min(protected_end - sector_start);
-        repaired[sector_start..sector_start + write_len].copy_from_slice(&sector[..write_len]);
+        patches.insert(sector_start as u64, sector[..write_len].to_vec());
     }
 
+    Ok(patches)
+}
+
+#[cfg(feature = "recovery")]
+fn repair_newsub_recovery_bytes(
+    source: &[u8],
+    sfx_offset: usize,
+    archive: &Archive,
+    recovery: &NewSubHeader,
+    control: &crate::read_control::ReadControl,
+) -> Result<(Vec<u8>, bool)> {
+    let patches = repair_newsub_recovery_patches(source, sfx_offset, archive, recovery, control)?;
+    if patches.is_empty() {
+        return Ok((source.to_vec(), false));
+    }
+    let mut repaired = source.to_vec();
+    crate::read_at::apply_overlay(&patches, 0, &mut repaired);
     Ok((repaired, true))
 }
 

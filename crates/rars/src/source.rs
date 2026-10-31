@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
 use crate::io_util::read_exact_at;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -84,13 +85,33 @@ pub(crate) enum RangeReader<'a> {
     Memory(Cursor<&'a [u8]>),
     File(std::io::Take<File>),
     Reader(std::io::Take<SourceCursor>),
+    Overlay(Box<OverlayRangeReader<'a>>),
 }
+
+pub(crate) struct OverlayRangeReader<'a> {
+    inner: RangeReader<'a>,
+    offset: u64,
+    patches: Arc<BTreeMap<u64, Vec<u8>>>,
+}
+
+impl Read for OverlayRangeReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(bytes)?;
+        if count > 0 {
+            crate::read_at::apply_overlay(&self.patches, self.offset, &mut bytes[..count]);
+            self.offset = self.offset.saturating_add(count as u64);
+        }
+        Ok(count)
+    }
+}
+
 impl Read for RangeReader<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Memory(reader) => reader.read(bytes),
             Self::File(reader) => reader.read(bytes),
             Self::Reader(reader) => reader.read(bytes),
+            Self::Overlay(reader) => reader.read(bytes),
         }
     }
 }
@@ -100,9 +121,39 @@ pub(crate) enum ArchiveSource {
     Memory(Arc<[u8]>),
     File(Arc<PathBuf>),
     Reader(Arc<ReaderSource>),
+    Overlay {
+        base: Arc<ArchiveSource>,
+        patches: Arc<BTreeMap<u64, Vec<u8>>>,
+    },
 }
 
 impl ArchiveSource {
+    pub(crate) fn with_overlay(self, patches: Arc<BTreeMap<u64, Vec<u8>>>) -> Self {
+        if patches.is_empty() {
+            return self;
+        }
+        match self {
+            Self::Overlay { base, patches: existing } => {
+                let mut combined = (*existing).clone();
+                for (&offset, data) in patches.iter() {
+                    combined.insert(offset, data.clone());
+                }
+                Self::Overlay {
+                    base,
+                    patches: Arc::new(combined),
+                }
+            }
+            base => Self::Overlay {
+                base: Arc::new(base),
+                patches,
+            },
+        }
+    }
+
+    pub(crate) fn is_overlaid(&self) -> bool {
+        matches!(self, Self::Overlay { .. })
+    }
+
     pub(crate) fn read_range(&self, range: Range<usize>) -> Result<Vec<u8>> {
         match self {
             Self::Memory(data) => data
@@ -114,12 +165,17 @@ impl ArchiveSource {
                 read_exact_at(&mut file, range.start, range.len())
             }
             Self::Reader(source) => read_exact_at(&mut source.cursor(), range.start, range.len()),
+            Self::Overlay { base, patches } => {
+                let mut data = base.read_range(range.clone())?;
+                crate::read_at::apply_overlay(patches, range.start as u64, &mut data);
+                Ok(data)
+            }
         }
     }
 
     pub(crate) fn copy_range_to(&self, range: Range<usize>, writer: &mut dyn Write) -> Result<()> {
         match self {
-            Self::Reader(_) => {
+            Self::Reader(_) | Self::Overlay { .. } => {
                 let mut reader = self.range_reader(range)?;
                 std::io::copy(&mut reader, writer)?;
             }
@@ -156,6 +212,14 @@ impl ArchiveSource {
                 file.seek(SeekFrom::Start(range.start as u64))?;
                 Ok(RangeReader::File(file.take(range.len() as u64)))
             }
+            Self::Overlay { base, patches } => {
+                let inner = base.range_reader(range.clone())?;
+                Ok(RangeReader::Overlay(Box::new(OverlayRangeReader {
+                    inner,
+                    offset: range.start as u64,
+                    patches: patches.clone(),
+                })))
+            }
         }
     }
 
@@ -165,6 +229,7 @@ impl ArchiveSource {
             Self::Memory(data) => Ok(data.len()),
             Self::File(path) => usize::try_from(std::fs::metadata(path.as_ref())?.len())
                 .map_err(|_| Error::InvalidHeader("archive size overflows host address size")),
+            Self::Overlay { base, .. } => base.len(),
         }
     }
 
@@ -174,6 +239,11 @@ impl ArchiveSource {
             Self::Reader(source) => self.read_range(0..source.len),
             Self::Memory(data) => Ok(data.to_vec()),
             Self::File(path) => Ok(std::fs::read(path.as_ref())?),
+            Self::Overlay { base, patches } => {
+                let mut data = base.bytes()?;
+                crate::read_at::apply_overlay(patches, 0, &mut data);
+                Ok(data)
+            }
         }
     }
 }
@@ -249,5 +319,23 @@ mod tests {
         assert_eq!(error.to_string(), "archive reader lock poisoned");
         assert!(matches!(Error::from(error), Error::Io(_)));
         assert_eq!(sibling.stream_position().unwrap(), 0);
+    }
+
+    #[test]
+    fn archive_source_overlay_serves_sparse_patches() {
+        let base = ArchiveSource::Memory(Arc::from(b"0123456789abcdef".as_slice()));
+        let mut patches = BTreeMap::new();
+        patches.insert(4, b"XXXX".to_vec());
+        let overlaid = base.with_overlay(Arc::new(patches));
+        assert!(overlaid.is_overlaid());
+        assert_eq!(overlaid.len().unwrap(), 16);
+
+        let data = overlaid.read_range(2..10).unwrap();
+        assert_eq!(&data, b"23XXXX89");
+
+        let mut reader = overlaid.range_reader(2..10).unwrap();
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).unwrap();
+        assert_eq!(&buf, b"23XXXX89");
     }
 }

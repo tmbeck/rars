@@ -27,7 +27,9 @@ pub(crate) mod producer;
 pub(crate) mod write;
 
 pub(crate) use extract::test_volumes_to;
-pub use extract::{extract_volumes_to, extract_volumes_to_with_redirections};
+pub use extract::{
+    extract_volumes_to, extract_volumes_to_with_errors, extract_volumes_to_with_redirections,
+};
 #[cfg(feature = "write")]
 pub use write::{
     write_streaming_archive_to, write_streaming_archive_with_progress, write_streaming_volumes_to,
@@ -665,7 +667,11 @@ impl Archive {
             options,
         )?;
         parsed.sfx_offset = sig.offset;
-        Ok(parsed)
+        if options.auto_repair && parsed.has_recovery_record() {
+            parsed.auto_repaired(options)
+        } else {
+            Ok(parsed)
+        }
     }
 
     fn parse_seekable(
@@ -696,12 +702,17 @@ impl Archive {
         )?;
 
         options.check_cancelled()?;
-        Ok(Self {
+        let archive = Self {
             sfx_offset,
             main,
             blocks,
             source,
-        })
+        };
+        if options.auto_repair && archive.has_recovery_record() {
+            archive.auto_repaired(options)
+        } else {
+            Ok(archive)
+        }
     }
 
     pub(crate) fn parse_file_backed(
@@ -744,12 +755,17 @@ impl Archive {
         )?;
 
         options.check_cancelled()?;
-        Ok(Self {
+        let archive = Self {
             sfx_offset,
             main,
             blocks,
             source,
-        })
+        };
+        if options.auto_repair && archive.has_recovery_record() {
+            archive.auto_repaired(options)
+        } else {
+            Ok(archive)
+        }
     }
 
     fn read_range(&self, range: Range<usize>) -> Result<Vec<u8>> {
@@ -826,6 +842,100 @@ impl Archive {
             }
         }
         Ok(None)
+    }
+
+    pub fn has_recovery_record(&self) -> bool {
+        self.main.has_recovery_record()
+            || self
+                .services()
+                .any(|service| matches!(service.recovery_record(), Ok(Some(_))))
+    }
+
+    pub fn with_overlay(&self, patches: Arc<std::collections::BTreeMap<u64, Vec<u8>>>) -> Self {
+        let mut cloned = self.clone();
+        cloned.source = cloned.source.with_overlay(patches);
+        cloned
+    }
+
+    pub fn is_overlaid(&self) -> bool {
+        self.source.is_overlaid()
+    }
+
+    #[cfg(feature = "recovery")]
+    pub fn recovery_patches_with_options(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<std::collections::BTreeMap<u64, Vec<u8>>> {
+        options.check_cancelled()?;
+        let control = crate::read_control::ReadControl::new(options.cancellation);
+        let recovery = self.recovery_service()?;
+        let prefix_start = self.sfx_offset;
+        let prefix_end = recovery.block.offset;
+        let prefix_len = prefix_end
+            .checked_sub(prefix_start)
+            .ok_or(Error::InvalidHeader(
+                "RAR 5 recovery prefix range overflows archive bounds",
+            ))?;
+        let source_len = self.source_len()?;
+        if prefix_end > source_len {
+            return Err(Error::InvalidHeader(
+                "RAR 5 recovery prefix is out of bounds",
+            ));
+        }
+        let recovery_data = recovery.decoded_recovery_data(self, options.password, &control)?;
+        let repaired_shards =
+            crate::recovery::rar5::repair_inline_recovery_prefix_shards_with_control(
+                prefix_len,
+                &recovery_data,
+                |range| {
+                    let start = prefix_start + range.start;
+                    let end = prefix_start + range.end;
+                    self.read_range(start..end)
+                        .map_err(|_| crate::recovery::rar5::Error::BadRecoveryChunk)
+                },
+                &control,
+            )?;
+        let mut patches = std::collections::BTreeMap::new();
+        for (range, data) in repaired_shards {
+            let offset = (prefix_start + range.start) as u64;
+            patches.insert(offset, data);
+        }
+        Ok(patches)
+    }
+
+    #[cfg(not(feature = "recovery"))]
+    pub fn recovery_patches_with_options(
+        &self,
+        _options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<std::collections::BTreeMap<u64, Vec<u8>>> {
+        Err(Error::FeatureDisabled {
+            feature: "recovery",
+        })
+    }
+
+    pub fn auto_repaired(&self, options: crate::ArchiveReadOptions<'_>) -> Result<Self> {
+        if !options.auto_repair || self.is_overlaid() || !self.has_recovery_record() {
+            return Ok(self.clone());
+        }
+        #[cfg(feature = "recovery")]
+        {
+            match self.recovery_patches_with_options(options) {
+                Ok(patches) if !patches.is_empty() => {
+                    Ok(self.with_overlay(Arc::new(patches)))
+                }
+                Ok(_) => Ok(self.clone()),
+                Err(err) => {
+                    if matches!(err.kind(), crate::ErrorKind::Cancelled) {
+                        return Err(err);
+                    }
+                    Ok(self.clone())
+                }
+            }
+        }
+        #[cfg(not(feature = "recovery"))]
+        {
+            Ok(self.clone())
+        }
     }
 
     pub fn repair_recovery(&self) -> Result<Vec<u8>> {

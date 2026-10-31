@@ -66,7 +66,7 @@ mod progress;
 mod read_control;
 pub use read_control::ReadCancellation;
 mod read_at;
-pub use read_at::{ReadAt, SeekReader};
+pub use read_at::{apply_overlay, ReadAt, RepairedReadAt, SeekReader};
 mod extraction_control;
 mod extraction_links;
 mod file_times;
@@ -231,6 +231,9 @@ pub struct ArchiveReadOptions<'a> {
     /// borrow a sibling's spare. Insufficient allowance returns ResourceLimit;
     /// increase the limit or use sequential extraction. Partial output can remain.
     pub max_reader_workspace_bytes: Option<u64>,
+    /// Whether to automatically repair damaged sectors/shards using recovery records
+    /// during parsing or extraction, without rewriting the archive file.
+    pub auto_repair: bool,
 }
 
 impl<'a> ArchiveReadOptions<'a> {
@@ -315,6 +318,12 @@ impl<'a> ArchiveReadOptions<'a> {
     /// Enables caller-configured disk scratch for large RAR5/7 members.
     pub fn with_rar50_scratch(mut self, scratch: &'a Rar50Scratch) -> Self {
         self.rar50_scratch = Some(scratch);
+        self
+    }
+
+    /// Enables or disables transparent in-memory recovery record repair.
+    pub fn with_auto_repair(mut self, enabled: bool) -> Self {
+        self.auto_repair = enabled;
         self
     }
 }
@@ -741,7 +750,12 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
         options.check_cancelled()?;
-        match self {
+        let archive = if options.auto_repair && !self.is_overlaid() && self.has_recovery_record() {
+            self.auto_repaired(options)?
+        } else {
+            self.clone()
+        };
+        match &archive {
             Self::Rar13(archive) => {
                 archive.extract_to_with_options(options, |meta| open(&rar13_meta(meta)))
             }
@@ -749,6 +763,36 @@ impl Archive {
                 archive.extract_to(options, |meta| open(&rar15_40_meta(meta)))
             }
             Self::Rar50Plus(archive) => archive.extract_to(options, |meta| open(&rar50_meta(meta))),
+        }
+    }
+
+    /// Streams extracted entries to caller-provided writers with read options and error callback.
+    pub fn extract_to_with_errors<F, E>(
+        &self,
+        options: ArchiveReadOptions<'_>,
+        mut open: F,
+        on_error: E,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+        E: FnMut(&ArchiveMember, &Error) -> Result<ExtractionErrorAction>,
+    {
+        options.check_cancelled()?;
+        let archive = if options.auto_repair && !self.is_overlaid() && self.has_recovery_record() {
+            self.auto_repaired(options)?
+        } else {
+            self.clone()
+        };
+        match &archive {
+            Self::Rar13(archive) => {
+                archive.extract_to_with_errors(options, |meta| open(&rar13_meta(meta)), on_error)
+            }
+            Self::Rar15To40(archive) => {
+                archive.extract_to_with_errors(options, |meta| open(&rar15_40_meta(meta)), on_error)
+            }
+            Self::Rar50Plus(archive) => {
+                archive.extract_to_with_errors(options, |meta| open(&rar50_meta(meta)), on_error)
+            }
         }
     }
 
@@ -797,7 +841,12 @@ impl Archive {
     where
         F: FnMut(&ArchiveMember) -> Result<ExtractionDecision>,
     {
-        match self {
+        let archive = if options.auto_repair && !self.is_overlaid() && self.has_recovery_record() {
+            self.auto_repaired(options)?
+        } else {
+            self.clone()
+        };
+        match &archive {
             Self::Rar13(archive) => archive.extract_controlled(options, &mut decide, None),
             Self::Rar15To40(archive) => archive.extract_controlled(options, &mut decide, None),
             Self::Rar50Plus(archive) => archive.extract_controlled(options, &mut decide, None),
@@ -823,7 +872,12 @@ impl Archive {
         F: FnMut(&ArchiveMember) -> Result<ExtractionDecision>,
         E: FnMut(&ArchiveMember, &Error) -> Result<ExtractionErrorAction>,
     {
-        match self {
+        let archive = if options.auto_repair && !self.is_overlaid() && self.has_recovery_record() {
+            self.auto_repaired(options)?
+        } else {
+            self.clone()
+        };
+        match &archive {
             Self::Rar13(archive) => {
                 archive.extract_controlled(options, &mut decide, Some(&mut on_error))
             }
@@ -863,7 +917,12 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
         options.check_cancelled()?;
-        match self {
+        let archive = if options.auto_repair && !self.is_overlaid() && self.has_recovery_record() {
+            self.auto_repaired(options)?
+        } else {
+            self.clone()
+        };
+        match &archive {
             Self::Rar13(archive) => {
                 archive.extract_to_with_options(options, |meta| open(&rar13_meta(meta)))
             }
@@ -1116,6 +1175,74 @@ impl Archive {
                 family: ArchiveFamily::Rar13,
                 feature: "recovery repair for RAR 1.3/1.4 archives",
             }),
+        }
+    }
+
+    /// Returns true if this archive contains a recovery record (RAR 2.x, 3.x/4.x, or 5.0+).
+    pub fn has_recovery_record(&self) -> bool {
+        match self {
+            Self::Rar13(_) => false,
+            Self::Rar15To40(archive) => archive.has_recovery_record(),
+            Self::Rar50Plus(archive) => archive.has_recovery_record(),
+        }
+    }
+
+    /// Wraps the archive's source with a sparse in-memory patch overlay.
+    pub fn with_overlay(
+        &self,
+        patches: std::sync::Arc<std::collections::BTreeMap<u64, Vec<u8>>>,
+    ) -> Self {
+        match self {
+            Self::Rar13(archive) => Self::Rar13(archive.clone()),
+            Self::Rar15To40(archive) => Self::Rar15To40(archive.with_overlay(patches)),
+            Self::Rar50Plus(archive) => Self::Rar50Plus(archive.with_overlay(patches)),
+        }
+    }
+
+    /// Returns true if this archive source is already wrapped with a sparse patch overlay.
+    pub fn is_overlaid(&self) -> bool {
+        match self {
+            Self::Rar13(_) => false,
+            Self::Rar15To40(archive) => archive.is_overlaid(),
+            Self::Rar50Plus(archive) => archive.is_overlaid(),
+        }
+    }
+
+    /// Computes the recovery patches (reconstructed sectors/shards) for this archive without
+    /// rewriting or duplicating the entire archive.
+    pub fn recovery_patches_with_options(
+        &self,
+        options: ArchiveReadOptions<'_>,
+    ) -> Result<std::collections::BTreeMap<u64, Vec<u8>>> {
+        match self {
+            Self::Rar13(_) => Ok(std::collections::BTreeMap::new()),
+            Self::Rar15To40(archive) => archive.recovery_patches_with_options(options),
+            Self::Rar50Plus(archive) => archive.recovery_patches_with_options(options),
+        }
+    }
+
+    /// Automatically applies recovery record repairs as a sparse overlay if this archive has
+    /// a recovery record and auto-repair is enabled in options.
+    pub fn auto_repaired(&self, options: ArchiveReadOptions<'_>) -> Result<Self> {
+        match self {
+            Self::Rar13(archive) => Ok(Self::Rar13(archive.clone())),
+            Self::Rar15To40(archive) => archive.auto_repaired(options).map(Self::Rar15To40),
+            Self::Rar50Plus(archive) => archive.auto_repaired(options).map(Self::Rar50Plus),
+        }
+    }
+
+    /// Computes a sparse repair overlay and returns a `RepairedReadAt` source
+    /// on top of the given `source`.
+    pub fn repair_source(
+        source: std::sync::Arc<dyn ReadAt>,
+        options: ArchiveReadOptions<'_>,
+    ) -> Result<std::sync::Arc<dyn ReadAt>> {
+        let archive = ArchiveReader::read_source_with_options(source.clone(), options)?;
+        let patches = archive.recovery_patches_with_options(options)?;
+        if patches.is_empty() {
+            Ok(source)
+        } else {
+            Ok(std::sync::Arc::new(RepairedReadAt::new(source, patches)))
         }
     }
 
@@ -1542,14 +1669,59 @@ where
 pub fn extract_volumes_to_with_options<F>(
     archives: &[Archive],
     options: ArchiveReadOptions<'_>,
-    mut open: F,
+    open: F,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
+    extract_volumes_to_with_options_and_errors(archives, options, open, |_, err| Err(err.clone()))
+}
+
+/// Streams a multivolume archive set to caller-provided writers with error callback.
+pub fn extract_volumes_to_with_errors<F, E>(
+    archives: &[Archive],
+    password: Option<&[u8]>,
+    open: F,
+    on_error: E,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    E: FnMut(&ArchiveMember, &Error) -> Result<ExtractionErrorAction>,
+{
+    extract_volumes_to_with_options_and_errors(archives, read_options(password), open, on_error)
+}
+
+/// Streams a multivolume archive set to caller-provided writers with read options and error callback.
+pub fn extract_volumes_to_with_options_and_errors<F, E>(
+    archives: &[Archive],
+    options: ArchiveReadOptions<'_>,
+    mut open: F,
+    on_error: E,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    E: FnMut(&ArchiveMember, &Error) -> Result<ExtractionErrorAction>,
+{
     options.check_cancelled()?;
     let Some(first) = archives.first() else {
         return Err(Error::InvalidHeader("volume set is empty"));
+    };
+
+    let repaired_archives: Vec<Archive>;
+    let archives = if options.auto_repair {
+        repaired_archives = archives
+            .iter()
+            .map(|a| {
+                if !a.is_overlaid() && a.has_recovery_record() {
+                    a.auto_repaired(options)
+                } else {
+                    Ok(a.clone())
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        &repaired_archives
+    } else {
+        archives
     };
 
     match first.family() {
@@ -1559,11 +1731,21 @@ where
         }
         ArchiveFamily::Rar15To40 => {
             let typed = rar15_40_volumes(archives)?;
-            rar15_40::extract_volumes_to(&typed, options, |meta| open(&rar15_40_meta(meta)))
+            rar15_40::extract_volumes_to_with_errors(
+                &typed,
+                options,
+                |meta| open(&rar15_40_meta(meta)),
+                on_error,
+            )
         }
         ArchiveFamily::Rar50Plus => {
             let typed = rar50_volumes(archives)?;
-            rar50::extract_volumes_to(&typed, options, |meta| open(&rar50_meta(meta)))
+            rar50::extract_volumes_to_with_errors(
+                &typed,
+                options,
+                |meta| open(&rar50_meta(meta)),
+                on_error,
+            )
         }
     }
 }

@@ -531,7 +531,9 @@ impl Archive {
                     out.write_all(&buffer[..chunk.len()])?;
                 }
             }
-            ArchiveSource::File(_) | ArchiveSource::Reader(_) => {
+            ArchiveSource::File(_)
+            | ArchiveSource::Reader(_)
+            | ArchiveSource::Overlay { .. } => {
                 let mut file = self.source.range_reader(range.clone())?;
                 let mut remaining = range.len();
                 while remaining > 0 {
@@ -569,6 +571,21 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
         self.extract_impl(options, &mut open, None, None)
+            .map(|_| ())
+    }
+
+    pub fn extract_to_with_errors<F, E>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        mut open: F,
+        on_error: E,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+        E: FnMut(&crate::ArchiveMember, &Error) -> Result<crate::ExtractionErrorAction>,
+    {
+        let mut err_handler = on_error;
+        self.extract_impl(options, &mut open, None, Some(&mut err_handler))
             .map(|_| ())
     }
 
@@ -916,7 +933,9 @@ impl Entry {
             ArchiveSource::Memory(data) => {
                 data.get(self.packed_range.clone()).ok_or(Error::TooShort)
             }
-            ArchiveSource::File(_) | ArchiveSource::Reader(_) => Err(Error::InvalidHeader(
+            ArchiveSource::File(_)
+            | ArchiveSource::Reader(_)
+            | ArchiveSource::Overlay { .. } => Err(Error::InvalidHeader(
                 "RAR 1.3 file-backed packed data requires owned read",
             )),
         }

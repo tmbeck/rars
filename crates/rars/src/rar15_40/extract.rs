@@ -261,6 +261,20 @@ where
     extract_volumes_with_links(volumes, options, open, None)
 }
 
+pub fn extract_volumes_to_with_errors<F, E>(
+    volumes: &[Archive],
+    options: crate::ArchiveReadOptions<'_>,
+    open: F,
+    on_error: E,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    E: FnMut(&crate::ArchiveMember, &Error) -> Result<crate::ExtractionErrorAction>,
+{
+    let mut err_handler = on_error;
+    extract_volumes_with_links_and_errors(volumes, options, open, None, Some(&mut err_handler))
+}
+
 pub(crate) fn extract_volumes_with_links<F>(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,
@@ -270,16 +284,47 @@ pub(crate) fn extract_volumes_with_links<F>(
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
+    extract_volumes_with_links_and_errors(volumes, options, open, links, None)
+}
+
+pub(crate) fn extract_volumes_with_links_and_errors<F>(
+    volumes: &[Archive],
+    options: crate::ArchiveReadOptions<'_>,
+    open: F,
+    links: Option<&mut LegacyLink<'_>>,
+    on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+{
+    let repaired_volumes: Vec<Archive>;
+    let volumes = if options.auto_repair {
+        repaired_volumes = volumes
+            .iter()
+            .map(|v| {
+                if !v.is_overlaid() && v.has_recovery_record() {
+                    v.auto_repaired(options)
+                } else {
+                    Ok(v.clone())
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        &repaired_volumes
+    } else {
+        volumes
+    };
+
     if let Some(limit) = options.max_reader_workspace_bytes {
         return extract_volumes_with_allowance(
             volumes,
             options,
             open,
             links,
+            on_error,
             &Allowance::limited(limit),
         );
     }
-    extract_volumes_with_allowance(volumes, options, open, links, &Allowance::default())
+    extract_volumes_with_allowance(volumes, options, open, links, on_error, &Allowance::default())
 }
 
 fn extract_volumes_with_allowance<F, B: Budget>(
@@ -287,6 +332,7 @@ fn extract_volumes_with_allowance<F, B: Budget>(
     options: crate::ArchiveReadOptions<'_>,
     mut open: F,
     mut links: Option<&mut LegacyLink<'_>>,
+    mut on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
     allowance: &B,
 ) -> Result<()>
 where
@@ -323,7 +369,7 @@ where
                         options.check_cancelled()?;
                         check_legacy_size(&meta, file.unp_size, links.is_some())?;
                         let control = budget.control.clone();
-                        legacy_output(
+                        let result = legacy_output(
                             &meta,
                             allowance,
                             &control,
@@ -348,7 +394,31 @@ where
                                     Ok(())
                                 })
                             },
-                        )?;
+                        );
+                        if let Err(error) = result {
+                            let solid = archive.main.is_solid() || file.is_solid();
+                            if solid
+                                || on_error.is_none()
+                                || matches!(
+                                    error.kind(),
+                                    crate::ErrorKind::Cancelled | crate::ErrorKind::ResourceLimit
+                                )
+                            {
+                                return Err(error);
+                            }
+                            let handler = on_error.as_deref_mut().unwrap();
+                            let member = crate::rar15_40_member(file);
+                            let action = handler(&member, &error)?;
+                            match action {
+                                crate::ExtractionErrorAction::Abort => return Err(error),
+                                crate::ExtractionErrorAction::Continue => {
+                                    session = DecoderSession::with_allowance(
+                                        false, password, allowance,
+                                    );
+                                    session.read_control = budget.control.clone();
+                                }
+                            }
+                        }
                     }
                 }
                 SplitVolumeStep::Start => {
@@ -367,14 +437,37 @@ where
                 SplitVolumeStep::Finish(mut completed) => {
                     validate_split_continuation_refs(&completed, file, password)?;
                     completed.append(file, volume_index, file_index)?;
-                    completed.write_to(
+                    let result = completed.write_to(
                         volumes,
                         file,
                         &mut session,
                         &mut budget,
                         &mut open,
                         &mut links,
-                    )?;
+                    );
+                    if let Err(error) = result {
+                        let solid = archive.main.is_solid() || file.is_solid();
+                        if solid
+                            || on_error.is_none()
+                            || matches!(
+                                error.kind(),
+                                crate::ErrorKind::Cancelled | crate::ErrorKind::ResourceLimit
+                            )
+                        {
+                            return Err(error);
+                        }
+                        let handler = on_error.as_deref_mut().unwrap();
+                        let member = crate::rar15_40_member(file);
+                        let action = handler(&member, &error)?;
+                        match action {
+                            crate::ExtractionErrorAction::Abort => return Err(error),
+                            crate::ExtractionErrorAction::Continue => {
+                                session =
+                                    DecoderSession::with_allowance(false, password, allowance);
+                                session.read_control = budget.control.clone();
+                            }
+                        }
+                    }
                 }
                 SplitVolumeStep::MissingFirst => {
                     return Err(Error::InvalidHeader(
