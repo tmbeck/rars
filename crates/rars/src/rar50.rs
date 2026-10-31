@@ -29,6 +29,7 @@ pub(crate) mod write;
 pub(crate) use extract::test_volumes_to;
 pub use extract::{
     extract_volumes_to, extract_volumes_to_with_errors, extract_volumes_to_with_redirections,
+    extract_volumes_to_with_redirections_and_errors,
 };
 #[cfg(feature = "write")]
 pub use write::{

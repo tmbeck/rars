@@ -767,6 +767,31 @@ impl Archive {
             .map(|_| ())
     }
 
+    pub fn extract_to_with_redirections_and_errors<F, R, E>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        mut open: F,
+        mut redirect: R,
+        on_error: E,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+        R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
+        E: FnMut(&crate::ArchiveMember, &Error) -> Result<crate::ExtractionErrorAction>,
+    {
+        options.check_cancelled()?;
+        let mut err_handler = on_error;
+        self.extract_to_impl(
+            options,
+            &mut open,
+            &mut redirect,
+            true,
+            None,
+            Some(&mut err_handler),
+        )
+        .map(|_| ())
+    }
+
     pub fn extract_to_with_errors<F, E>(
         &self,
         options: crate::ArchiveReadOptions<'_>,
@@ -1433,6 +1458,30 @@ where
 {
     options.check_cancelled()?;
     extract_volumes_to_impl(volumes, options, &mut open, &mut redirect, true, None)
+}
+
+pub fn extract_volumes_to_with_redirections_and_errors<F, R, E>(
+    volumes: &[Archive],
+    options: crate::ArchiveReadOptions<'_>,
+    mut open: F,
+    mut redirect: R,
+    on_error: E,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
+    E: FnMut(&crate::ArchiveMember, &Error) -> Result<crate::ExtractionErrorAction>,
+{
+    options.check_cancelled()?;
+    let mut err_handler = on_error;
+    extract_volumes_to_impl(
+        volumes,
+        options,
+        &mut open,
+        &mut redirect,
+        true,
+        Some(&mut err_handler),
+    )
 }
 
 pub fn extract_volumes_to_with_errors<F, E>(
