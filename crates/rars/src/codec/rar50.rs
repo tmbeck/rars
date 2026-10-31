@@ -1177,13 +1177,10 @@ impl<B: Budget> ReaderState<B> {
         output_limit: usize,
         dictionary_size: usize,
     ) -> Result<()> {
-        if output
-            .len()
-            .checked_add(length)
-            .is_none_or(|end| end > output_limit)
-        {
-            return Err(Error::InvalidData("RAR 5 match exceeds output limit"));
+        if output.len() >= output_limit {
+            return Ok(());
         }
+        let length = length.min(output_limit - output.len());
         // A match reaching past the start of the window writes zeroes rather
         // than failing. WinRAR never clears its window and guards the copy
         // with a first-wrap flag instead, so those bytes read as zero there,
@@ -1320,7 +1317,7 @@ impl<B: Budget> StreamingOutput<B> {
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
         if self.written >= self.output_limit {
-            return Err(Error::InvalidData("RAR 5 match exceeds output limit").into());
+            return Ok(());
         }
         if byte != 0 {
             self.all_zero = false;
@@ -1339,13 +1336,10 @@ impl<B: Budget> StreamingOutput<B> {
         mut count: usize,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
-        if self
-            .written
-            .checked_add(count)
-            .is_none_or(|end| end > self.output_limit)
-        {
-            return Err(Error::InvalidData("RAR 5 match exceeds output limit").into());
+        if self.written >= self.output_limit {
+            return Ok(());
         }
+        count = count.min(self.output_limit - self.written);
         if byte != 0 {
             self.all_zero = false;
         }
@@ -1368,13 +1362,10 @@ impl<B: Budget> StreamingOutput<B> {
         count: usize,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
-        if self
-            .written
-            .checked_add(count)
-            .is_none_or(|end| end > self.output_limit)
-        {
-            return Err(Error::InvalidData("RAR 5 match exceeds output limit").into());
+        if self.written >= self.output_limit {
+            return Ok(());
         }
+        let count = count.min(self.output_limit - self.written);
         self.flush(sink)?;
         // copy_match only reaches this path with an initialized positive
         // distance. Either retained history exists, or flushing the pending
@@ -1397,6 +1388,10 @@ impl<B: Budget> StreamingOutput<B> {
         length: usize,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
+        if self.written >= self.output_limit {
+            return Ok(());
+        }
+        let length = length.min(self.output_limit - self.written);
         if self.all_zero && distance <= self.written + self.history.len() {
             return self.push_zeroes(length, sink);
         }
@@ -1406,13 +1401,6 @@ impl<B: Budget> StreamingOutput<B> {
             || distance > self.history.len() + self.pending.len()
         {
             return self.push_repeated(0, length, sink);
-        }
-        if self
-            .written
-            .checked_add(length)
-            .is_none_or(|end| end > self.output_limit)
-        {
-            return Err(Error::InvalidData("RAR 5 match exceeds output limit").into());
         }
         if distance == 1 {
             let byte = self.byte_at_distance(1);

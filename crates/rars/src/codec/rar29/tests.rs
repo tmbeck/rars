@@ -1152,16 +1152,14 @@ fn rejects_an_lz_literal_after_the_declared_member_size() {
 }
 
 #[test]
-fn rejects_an_lz_match_crossing_the_declared_member_size() {
+fn truncates_an_lz_match_crossing_the_declared_member_size() {
     let input = b"repeated tail ".repeat(256);
     let packed = Unpack29Encoder::new().encode_member(&input).unwrap();
 
-    assert!(matches!(
-        unpack29_decode(&packed, input.len() - 1),
-        Err(Error::InvalidData(
-            "RAR 2.9 member produces more output than its declared size"
-        ))
-    ));
+    assert_eq!(
+        unpack29_decode(&packed, input.len() - 1).unwrap(),
+        &input[..input.len() - 1]
+    );
 }
 
 #[test]
