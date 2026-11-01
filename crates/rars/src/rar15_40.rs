@@ -1809,20 +1809,129 @@ impl Archive {
             );
         }
 
-        let mut files = self.files().peekable();
+        const PARALLEL_FILE_LIMIT: u64 = 32 * 1024 * 1024;
+        const PARALLEL_BATCH_LIMIT: u64 = 128 * 1024 * 1024;
+
+        let mut repaired_archive: Option<Self> = None;
+        let mut repair_attempted = false;
+        let all_files: Vec<_> = self.files().collect();
+        let mut idx = 0;
         let window = crate::parallel::default_window().max(1);
         let publication = crate::read_control::ReadControl::new(options.cancellation);
-        while files.peek().is_some() {
+        let allowance = Allowance::default();
+        let mut budget = crate::output_limit::OutputBudget::new(options);
+        while idx < all_files.len() {
             options.check_cancelled()?;
-            let batch = files.by_ref().take(window).collect();
+            let file = all_files[idx];
+            if !file.is_directory() && file.unp_size > PARALLEL_FILE_LIMIT {
+                let meta = file.metadata();
+                budget.check(file.unp_size, &file.name)?;
+                check_legacy_size(&meta, file.unp_size, links.is_some())?;
+                let control = budget.control.clone();
+                let password = options.password;
+                let stream_res = {
+                    let active = repaired_archive.as_ref().unwrap_or(self);
+                    legacy_output(
+                        &meta,
+                        &allowance,
+                        &control,
+                        &mut links,
+                        || open(&meta),
+                        |writer| {
+                            budget.run(&file.name, writer, |mut writer| {
+                                if file.is_stored() {
+                                    file.write_stored_with_allowance(
+                                        active,
+                                        password,
+                                        &mut writer,
+                                        &allowance,
+                                    )
+                                    .map_err(|error| file.entry_error("extracting", error))?;
+                                } else {
+                                    let mut session =
+                                        DecoderSession::with_allowance(false, password, &allowance);
+                                    session.read_control = control.clone();
+                                    session
+                                        .write_file_to(active, file, &mut writer)
+                                        .map_err(|error| file.entry_error("extracting", error))?;
+                                }
+                                options.check_cancelled()?;
+                                Ok(())
+                            })
+                        },
+                    )
+                };
+                if let Err(error) = stream_res {
+                    let active = repaired_archive.as_ref().unwrap_or(self);
+                    if !repair_attempted
+                        && options.auto_repair
+                        && !active.is_overlaid()
+                        && active.has_recovery_record()
+                        && !matches!(
+                            error.kind(),
+                            crate::ErrorKind::Cancelled | crate::ErrorKind::ResourceLimit
+                        )
+                    {
+                        repair_attempted = true;
+                        let rep = active.auto_repaired(options)?;
+                        if rep.is_overlaid() {
+                            repaired_archive = Some(rep);
+                            continue;
+                        }
+                    }
+                    return Err(error);
+                }
+                idx += 1;
+                continue;
+            }
+
+            let mut batch = Vec::new();
+            let mut batch_bytes = 0u64;
+            while batch.len() < window && idx + batch.len() < all_files.len() {
+                let f = all_files[idx + batch.len()];
+                if !f.is_directory() && f.unp_size > PARALLEL_FILE_LIMIT {
+                    break;
+                }
+                let add = if f.is_directory() { 0 } else { f.unp_size };
+                if !batch.is_empty() && batch_bytes.saturating_add(add) > PARALLEL_BATCH_LIMIT {
+                    break;
+                }
+                batch_bytes = batch_bytes.saturating_add(add);
+                batch.push(f);
+            }
             // Write the verified members ahead of a failure before reporting it.
-            let (entries, failure) = crate::parallel::map_prefix(batch, |file| {
-                decode_parallel_entry(self, file, options, emit_links)
-            });
+            let (entries, failure) = {
+                let active = repaired_archive.as_ref().unwrap_or(self);
+                let active_files: Vec<_> = active.files().collect();
+                let active_batch: Vec<_> = (idx..idx + batch.len())
+                    .map(|i| active_files[i])
+                    .collect();
+                crate::parallel::map_prefix(active_batch, |file| {
+                    decode_parallel_entry(active, file, options, emit_links)
+                })
+            };
             for entry in entries {
                 write_parallel_entry(entry, &mut open, &publication, &mut links)?;
+                idx += 1;
             }
             if let Some(error) = failure {
+                let active = repaired_archive.as_ref().unwrap_or(self);
+                if !repair_attempted
+                    && options.auto_repair
+                    && !active.is_overlaid()
+                    && active.has_recovery_record()
+                    && !matches!(
+                        error.kind(),
+                        crate::ErrorKind::Cancelled | crate::ErrorKind::ResourceLimit
+                    )
+                {
+                    repair_attempted = true;
+                    let rep = active.auto_repaired(options)?;
+                    if rep.is_overlaid() {
+                        repaired_archive = Some(rep);
+                        continue;
+                    }
+                }
                 return Err(error);
             }
         }
@@ -1898,7 +2007,7 @@ impl Archive {
     }
 }
 
-fn decode_parallel_entry(
+pub(crate) fn decode_parallel_entry(
     archive: &Archive,
     file: &FileHeader,
     options: crate::ArchiveReadOptions<'_>,
@@ -1907,7 +2016,7 @@ fn decode_parallel_entry(
     decode_parallel_entry_with_allowance(archive, file, options, &Allowance::default(), links)
 }
 
-enum ParallelExtractedEntry<B: Budget = Allowance> {
+pub(crate) enum ParallelExtractedEntry<B: Budget = Allowance> {
     Directory(ExtractedEntryMeta),
     File {
         meta: ExtractedEntryMeta,
@@ -1951,7 +2060,7 @@ fn decode_parallel_entry_with_allowance<B: Budget>(
     Ok(ParallelExtractedEntry::File { meta, data })
 }
 
-fn write_parallel_entry<F, B: Budget>(
+pub(crate) fn write_parallel_entry<F, B: Budget>(
     entry: ParallelExtractedEntry<B>,
     open: &mut F,
     control: &crate::read_control::ReadControl,

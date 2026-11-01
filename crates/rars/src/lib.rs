@@ -1687,23 +1687,6 @@ where
         return Err(Error::InvalidHeader("volume set is empty"));
     };
 
-    let repaired_archives: Vec<Archive>;
-    let archives = if options.auto_repair {
-        repaired_archives = archives
-            .iter()
-            .map(|a| {
-                if !a.is_overlaid() && a.has_recovery_record() {
-                    a.auto_repaired(options)
-                } else {
-                    Ok(a.clone())
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        &repaired_archives
-    } else {
-        archives
-    };
-
     match first.family() {
         ArchiveFamily::Rar13 => {
             let typed = rar13_volumes(archives)?;

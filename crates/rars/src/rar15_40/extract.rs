@@ -297,23 +297,6 @@ pub(crate) fn extract_volumes_with_links_and_errors<F>(
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
-    let repaired_volumes: Vec<Archive>;
-    let volumes = if options.auto_repair {
-        repaired_volumes = volumes
-            .iter()
-            .map(|v| {
-                if !v.is_overlaid() && v.has_recovery_record() {
-                    v.auto_repaired(options)
-                } else {
-                    Ok(v.clone())
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        &repaired_volumes
-    } else {
-        volumes
-    };
-
     if let Some(limit) = options.max_reader_workspace_bytes {
         return extract_volumes_with_allowance(
             volumes,
@@ -345,11 +328,17 @@ fn extract_volumes_with_allowance<F, B: Budget>(
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
+    const PARALLEL_FILE_LIMIT: u64 = 32 * 1024 * 1024;
+    const PARALLEL_BATCH_LIMIT: u64 = 128 * 1024 * 1024;
+    const LAZY_REPAIR_STAGE_LIMIT: u64 = 64 * 1024 * 1024;
+
     options.check_cancelled()?;
     if volumes.is_empty() {
         return Err(Error::InvalidHeader("RAR 1.5 volume set is empty"));
     }
 
+    let mut volumes = std::borrow::Cow::Borrowed(volumes);
+    let mut repair_attempted = vec![false; volumes.len()];
     let password = options.password;
     let mut budget = crate::output_limit::OutputBudget::new(options);
     let mut split = SplitVolumeState::new();
@@ -361,17 +350,205 @@ where
         allowance,
     );
     session.read_control = budget.control.clone();
-    for (volume_index, archive) in volumes.iter().enumerate() {
-        for (file_index, file) in archive.files().enumerate() {
+    let window = crate::parallel::default_window().max(1);
+    let can_parallel = !B::LIMITED && options.max_total_output_bytes.is_none() && window > 1;
+    let publication = crate::read_control::ReadControl::new(options.cancellation);
+
+    for volume_index in 0..volumes.len() {
+        let file_count = volumes[volume_index].files().count();
+        let mut file_index = 0;
+        while file_index < file_count {
             options.check_cancelled()?;
-            match split.advance(file.is_split_before(), file.is_split_after()) {
+            if can_parallel && !split.is_pending() && !volumes[volume_index].main.is_solid() {
+                let emit_links = links.is_some();
+                let batch_len = {
+                    let archive = &volumes[volume_index];
+                    let files: Vec<_> = archive.files().collect();
+                    let mut count = 0;
+                    let mut batch_bytes = 0u64;
+                    while count < window && file_index + count < files.len() {
+                        let f = files[file_index + count];
+                        if f.is_split_before() || f.is_split_after() || f.is_solid() {
+                            break;
+                        }
+                        if !f.is_directory() && f.unp_size > PARALLEL_FILE_LIMIT {
+                            break;
+                        }
+                        let add = if f.is_directory() { 0 } else { f.unp_size };
+                        if count > 0 && batch_bytes.saturating_add(add) > PARALLEL_BATCH_LIMIT {
+                            break;
+                        }
+                        batch_bytes = batch_bytes.saturating_add(add);
+                        count += 1;
+                    }
+                    count
+                };
+                if batch_len >= 2 {
+                    let (entries, failure) = {
+                        let archive = &volumes[volume_index];
+                        let files: Vec<_> = archive
+                            .files()
+                            .skip(file_index)
+                            .take(batch_len)
+                            .collect();
+                        crate::parallel::map_prefix(files, |file| {
+                            super::decode_parallel_entry(archive, file, options, emit_links)
+                        })
+                    };
+                    for entry in entries {
+                        super::write_parallel_entry(entry, &mut open, &publication, &mut links)?;
+                        file_index += 1;
+                    }
+                    if let Some(error) = failure {
+                        if options.auto_repair
+                            && !repair_attempted[volume_index]
+                            && !volumes[volume_index].is_overlaid()
+                            && volumes[volume_index].has_recovery_record()
+                            && !matches!(
+                                error.kind(),
+                                crate::ErrorKind::Cancelled | crate::ErrorKind::ResourceLimit
+                            )
+                        {
+                            repair_attempted[volume_index] = true;
+                            let rep = volumes[volume_index].auto_repaired(options)?;
+                            if rep.is_overlaid() {
+                                volumes.to_mut()[volume_index] = rep;
+                                continue;
+                            }
+                        }
+                        if on_error.is_none()
+                            || matches!(
+                                error.kind(),
+                                crate::ErrorKind::Cancelled | crate::ErrorKind::ResourceLimit
+                            )
+                        {
+                            return Err(error);
+                        }
+                        let handler = on_error.as_deref_mut().unwrap();
+                        let member = {
+                            let file = volumes[volume_index]
+                                .files()
+                                .nth(file_index)
+                                .expect("failed member index");
+                            crate::rar15_40_member(file)
+                        };
+                        match handler(&member, &error)? {
+                            crate::ExtractionErrorAction::Abort => return Err(error),
+                            crate::ExtractionErrorAction::Continue => {
+                                session =
+                                    DecoderSession::with_allowance(false, password, allowance);
+                                session.read_control = budget.control.clone();
+                                file_index += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            let step = {
+                let file = volumes[volume_index]
+                    .files()
+                    .nth(file_index)
+                    .expect("file index in bounds");
+                split.advance(file.is_split_before(), file.is_split_after())
+            };
+            match step {
                 SplitVolumeStep::Regular => {
-                    let meta = file.metadata();
-                    if meta.is_directory {
+                    let is_dir = volumes[volume_index]
+                        .files()
+                        .nth(file_index)
+                        .expect("file index in bounds")
+                        .is_directory();
+                    if is_dir {
+                        let meta = volumes[volume_index]
+                            .files()
+                            .nth(file_index)
+                            .expect("file index in bounds")
+                            .metadata();
                         options.check_cancelled()?;
                         let _ = open(&meta)?;
                         options.check_cancelled()?;
                     } else {
+                        let can_stage_repair = options.auto_repair
+                            && !repair_attempted[volume_index]
+                            && !volumes[volume_index].is_overlaid()
+                            && volumes[volume_index].has_recovery_record()
+                            && !volumes[volume_index].main.is_solid()
+                            && volumes[volume_index]
+                                .files()
+                                .nth(file_index)
+                                .is_some_and(|f| !f.is_solid() && f.unp_size <= LAZY_REPAIR_STAGE_LIMIT);
+                        if can_stage_repair {
+                            let stage_res = {
+                                let archive = &volumes[volume_index];
+                                let file = archive.files().nth(file_index).unwrap();
+                                budget.check(file.unp_size, &file.name)?;
+                                options.check_cancelled()?;
+                                let meta = file.metadata();
+                                check_legacy_size(&meta, file.unp_size, links.is_some())?;
+                                let mut staged = Vec::with_capacity(file.unp_size as usize);
+                                let decode_res = if file.is_stored() {
+                                    file.write_stored_with_allowance(
+                                        archive,
+                                        password,
+                                        &mut staged,
+                                        allowance,
+                                    )
+                                    .map_err(|error| file.entry_error("extracting", error))
+                                } else {
+                                    session
+                                        .write_file_to(archive, file, &mut staged)
+                                        .map_err(|error| file.entry_error("extracting", error))
+                                };
+                                decode_res.map(|()| (meta, file.name.clone(), staged))
+                            };
+                            match stage_res {
+                                Ok((meta, file_name, staged)) => {
+                                    let control = budget.control.clone();
+                                    legacy_output(
+                                        &meta,
+                                        allowance,
+                                        &control,
+                                        &mut links,
+                                        || open(&meta),
+                                        |writer| {
+                                            budget.run(&file_name, writer, |writer| {
+                                                writer.write_all(&staged)?;
+                                                options.check_cancelled()?;
+                                                Ok(())
+                                            })
+                                        },
+                                    )?;
+                                    file_index += 1;
+                                    continue;
+                                }
+                                Err(err)
+                                    if !matches!(
+                                        err.kind(),
+                                        crate::ErrorKind::Cancelled
+                                            | crate::ErrorKind::ResourceLimit
+                                    ) =>
+                                {
+                                    repair_attempted[volume_index] = true;
+                                    let rep = volumes[volume_index].auto_repaired(options)?;
+                                    if rep.is_overlaid() {
+                                        volumes.to_mut()[volume_index] = rep;
+                                        session = DecoderSession::with_allowance(
+                                            false, password, allowance,
+                                        );
+                                        session.read_control = budget.control.clone();
+                                        continue;
+                                    }
+                                }
+                                Err(err) => return Err(err),
+                            }
+                        }
+
+                        let archive = &volumes[volume_index];
+                        let file = archive.files().nth(file_index).unwrap();
+                        let meta = file.metadata();
                         budget.check(file.unp_size, &file.name)?;
                         options.check_cancelled()?;
                         check_legacy_size(&meta, file.unp_size, links.is_some())?;
@@ -428,6 +605,7 @@ where
                     }
                 }
                 SplitVolumeStep::Start => {
+                    let file = volumes[volume_index].files().nth(file_index).unwrap();
                     validate_split_fragment(file, password)?;
                     split.begin(PendingSplitRefs::with_allowance(
                         file,
@@ -437,14 +615,34 @@ where
                     )?);
                 }
                 SplitVolumeStep::Continue(current) => {
+                    let file = volumes[volume_index].files().nth(file_index).unwrap();
                     validate_split_continuation_refs(current, file, password)?;
                     current.append(file, volume_index, file_index)?;
                 }
                 SplitVolumeStep::Finish(mut completed) => {
-                    validate_split_continuation_refs(&completed, file, password)?;
-                    completed.append(file, volume_index, file_index)?;
+                    {
+                        let file = volumes[volume_index].files().nth(file_index).unwrap();
+                        validate_split_continuation_refs(&completed, file, password)?;
+                        completed.append(file, volume_index, file_index)?;
+                    }
+                    if options.auto_repair {
+                        for &(v_idx, _) in completed.fragments.iter() {
+                            if !repair_attempted[v_idx]
+                                && !volumes[v_idx].is_overlaid()
+                                && volumes[v_idx].has_recovery_record()
+                            {
+                                repair_attempted[v_idx] = true;
+                                let rep = volumes[v_idx].auto_repaired(options)?;
+                                if rep.is_overlaid() {
+                                    volumes.to_mut()[v_idx] = rep;
+                                }
+                            }
+                        }
+                    }
+                    let archive = &volumes[volume_index];
+                    let file = archive.files().nth(file_index).unwrap();
                     let result = completed.write_to(
-                        volumes,
+                        &volumes,
                         file,
                         &mut session,
                         &mut budget,
@@ -486,6 +684,7 @@ where
                     ));
                 }
             }
+            file_index += 1;
         }
     }
 

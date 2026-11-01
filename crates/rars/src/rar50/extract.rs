@@ -1044,7 +1044,22 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
-        self.parallel_to_impl(options, &mut open, false)
+        self.parallel_to_impl(options, &mut open, &mut |_, _| Ok(()), false, false)
+    }
+
+    /// Decodes independent members in bounded batches, emitting regular files and
+    /// redirections in archive order.
+    pub fn extract_to_parallel_buffered_with_redirections<F, R>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        mut open: F,
+        mut redirect: R,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+        R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
+    {
+        self.parallel_to_impl(options, &mut open, &mut redirect, true, false)
     }
 
     pub(crate) fn test_to<F>(
@@ -1061,20 +1076,26 @@ impl Archive {
                 tested(meta)?;
                 Ok(Box::new(std::io::sink()) as Box<dyn Write>)
             },
+            &mut |_, _| Ok(()),
+            false,
             true,
         )
     }
 
-    fn parallel_to_impl<F>(
+    fn parallel_to_impl<F, R>(
         &self,
         options: crate::ArchiveReadOptions<'_>,
         open: &mut F,
+        redirect: &mut R,
+        emit_redirections: bool,
         verification: bool,
     ) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+        R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
     {
         options.check_cancelled()?;
+        let buffered_decode_limit = rar50_buffered_decode_limit(options);
         // Admit and charge total-limited work in archive order before dispatch.
         if options.rar50_scratch.is_some()
             || options.max_total_output_bytes.is_some()
@@ -1082,11 +1103,14 @@ impl Archive {
             || self.files().any(|file| {
                 file.is_split_before()
                     || file.is_split_after()
-                    || file.unpacked_size > rar50_buffered_decode_limit(options)
+                    || (options.max_reader_workspace_bytes.is_some()
+                        && file.unpacked_size > buffered_decode_limit)
                     || file.decoded_compression_info().is_ok_and(|info| info.solid)
             })
         {
-            return self.extract_to(options, open);
+            return self
+                .extract_to_impl(options, open, redirect, emit_redirections, None, None)
+                .map(|_| ());
         }
 
         if let Some(limit) = options.max_reader_workspace_bytes {
@@ -1116,48 +1140,138 @@ impl Archive {
                         self,
                         file,
                         options.password,
-                        rar50_buffered_decode_limit(options),
+                        buffered_decode_limit,
                         options,
                         verification,
                         local,
                     )
                 },
-                |entry| write_parallel_entry(entry, open, &mut |_, _| Ok(()), &publication),
+                |entry| write_parallel_entry(entry, open, redirect, &publication),
             );
         }
 
         let password = options.password;
-        let buffered_decode_limit = rar50_buffered_decode_limit(options);
-        let mut files = self.files().peekable();
+        let batch_byte_limit = buffered_decode_limit.max(128 * 1024 * 1024);
+        let mut repaired_archive: Option<Self> = None;
+        let mut repair_attempted = false;
+        let all_files: Vec<_> = self.files().collect();
+        let mut idx = 0;
         let window = crate::parallel::default_window().max(1);
         let publication = crate::read_control::ReadControl::new(options.cancellation);
-        while files.peek().is_some() {
+        let allowance = Allowance::default();
+        let mut budget = crate::output_limit::OutputBudget::new(options);
+        while idx < all_files.len() {
             options.check_cancelled()?;
-            let mut batch = Vec::new();
-            let mut remaining = buffered_decode_limit;
-            while batch.len() < window {
-                let Some(file) = files.peek() else { break };
-                if file.unpacked_size > remaining {
+            let file = all_files[idx];
+            if !file.is_directory()
+                && file.redirection.is_none()
+                && file
+                    .known_unpacked_size()
+                    .is_none_or(|n| n > buffered_decode_limit)
+            {
+                file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
+                file.check_output_limit(&budget)?;
+                let meta = file.metadata();
+                options.check_cancelled()?;
+                let stream_res = {
+                    let active = repaired_archive.as_ref().unwrap_or(self);
+                    let mut session =
+                        DecoderSession::with_allowance(password, buffered_decode_limit, &allowance);
+                    session.decoder.read_control = budget.control.clone();
+                    session.scratch = options.rar50_scratch;
+                    if verification {
+                        let _ = open(&meta)?;
+                        options.check_cancelled()?;
+                        budget.run(&file.name, std::io::sink(), |writer| {
+                            session.write_file_to(active, file, writer)
+                        })
+                    } else {
+                        let mut writer = open(&meta)?;
+                        options.check_cancelled()?;
+                        budget.run(&file.name, &mut writer, |writer| {
+                            session.write_file_to(active, file, writer)
+                        })
+                    }
+                };
+                if let Err(error) = stream_res {
+                    let active = repaired_archive.as_ref().unwrap_or(self);
+                    if !repair_attempted
+                        && options.auto_repair
+                        && !active.is_overlaid()
+                        && active.has_recovery_record()
+                        && !matches!(
+                            error.kind(),
+                            crate::ErrorKind::Cancelled | crate::ErrorKind::ResourceLimit
+                        )
+                    {
+                        repair_attempted = true;
+                        let rep = active.auto_repaired(options)?;
+                        if rep.is_overlaid() {
+                            repaired_archive = Some(rep);
+                            continue;
+                        }
+                    }
+                    return Err(error);
+                }
+                idx += 1;
+                continue;
+            }
+
+            let mut batch_len = 0;
+            let mut batch_bytes = 0u64;
+            while batch_len < window && idx + batch_len < all_files.len() {
+                let f = all_files[idx + batch_len];
+                let is_meta_only = f.is_directory() || f.redirection.is_some();
+                if !is_meta_only
+                    && f.known_unpacked_size()
+                        .is_none_or(|n| n > buffered_decode_limit)
+                {
                     break;
                 }
-                remaining -= file.unpacked_size;
-                batch.push(files.next().expect("peeked file"));
+                let add = if is_meta_only { 0 } else { f.unpacked_size };
+                if batch_len > 0 && batch_bytes.saturating_add(add) > batch_byte_limit {
+                    break;
+                }
+                batch_bytes = batch_bytes.saturating_add(add);
+                batch_len += 1;
             }
             // Write the verified members ahead of a failure before reporting it.
-            let (entries, failure) = crate::parallel::map_prefix(batch, |file| {
-                decode_parallel_entry(
-                    self,
-                    file,
-                    password,
-                    buffered_decode_limit,
-                    options,
-                    verification,
-                )
-            });
+            let (entries, failure) = {
+                let active = repaired_archive.as_ref().unwrap_or(self);
+                let active_files: Vec<_> = active.files().skip(idx).take(batch_len).collect();
+                crate::parallel::map_prefix(active_files, |file| {
+                    decode_parallel_entry(
+                        active,
+                        file,
+                        password,
+                        buffered_decode_limit,
+                        options,
+                        verification,
+                    )
+                })
+            };
             for entry in entries {
-                write_parallel_entry(entry, open, &mut |_, _| Ok(()), &publication)?;
+                write_parallel_entry(entry, open, redirect, &publication)?;
+                idx += 1;
             }
             if let Some(error) = failure {
+                let active = repaired_archive.as_ref().unwrap_or(self);
+                if !repair_attempted
+                    && options.auto_repair
+                    && !active.is_overlaid()
+                    && active.has_recovery_record()
+                    && !matches!(
+                        error.kind(),
+                        crate::ErrorKind::Cancelled | crate::ErrorKind::ResourceLimit
+                    )
+                {
+                    repair_attempted = true;
+                    let rep = active.auto_repaired(options)?;
+                    if rep.is_overlaid() {
+                        repaired_archive = Some(rep);
+                        continue;
+                    }
+                }
                 return Err(error);
             }
         }
@@ -1577,23 +1691,6 @@ where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
 {
-    let repaired_volumes: Vec<Archive>;
-    let volumes = if options.auto_repair {
-        repaired_volumes = volumes
-            .iter()
-            .map(|v| {
-                if !v.is_overlaid() && v.has_recovery_record() {
-                    v.auto_repaired(options)
-                } else {
-                    Ok(v.clone())
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        &repaired_volumes
-    } else {
-        volumes
-    };
-
     if let Some(limit) = options.max_reader_workspace_bytes {
         return extract_volumes_with_allowance(
             volumes,
@@ -1629,35 +1726,227 @@ where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
 {
+    const LAZY_REPAIR_STAGE_LIMIT: u64 = 64 * 1024 * 1024;
+
     options.check_cancelled()?;
     if volumes.is_empty() {
         return Err(Error::InvalidHeader("RAR 5 volume set is empty"));
     }
 
+    let mut volumes = std::borrow::Cow::Borrowed(volumes);
+    let mut repair_attempted = vec![false; volumes.len()];
     let password = options.password;
     let mut budget = crate::output_limit::OutputBudget::new(options);
     let mut split = SplitVolumeState::new();
     let buffered_decode_limit = rar50_buffered_decode_limit(options);
+    let batch_byte_limit = buffered_decode_limit.max(128 * 1024 * 1024);
     let mut session = DecoderSession::with_allowance(password, buffered_decode_limit, allowance);
     session.decoder.read_control = budget.control.clone();
     session.scratch = options.rar50_scratch;
+    let window = crate::parallel::default_window().max(1);
+    let can_parallel = !B::LIMITED
+        && options.max_total_output_bytes.is_none()
+        && options.rar50_scratch.is_none()
+        && window > 1;
+    let publication = crate::read_control::ReadControl::new(options.cancellation);
 
-    for (volume_index, archive) in volumes.iter().enumerate() {
-        for (file_index, file) in archive.files().enumerate() {
+    for volume_index in 0..volumes.len() {
+        let file_count = volumes[volume_index].files().count();
+        let mut file_index = 0;
+        while file_index < file_count {
             options.check_cancelled()?;
+            if can_parallel && !split.is_pending() && !volumes[volume_index].main.is_solid() {
+                let batch_len = {
+                    let archive = &volumes[volume_index];
+                    let files: Vec<_> = archive.files().collect();
+                    let mut count = 0;
+                    let mut batch_bytes = 0u64;
+                    while count < window && file_index + count < files.len() {
+                        let f = files[file_index + count];
+                        if f.is_split_before()
+                            || f.is_split_after()
+                            || f.decoded_compression_info().is_ok_and(|info| info.solid)
+                        {
+                            break;
+                        }
+                        let is_meta_only = f.is_directory() || f.redirection.is_some();
+                        if !is_meta_only
+                            && f.known_unpacked_size()
+                                .is_none_or(|n| n > buffered_decode_limit)
+                        {
+                            break;
+                        }
+                        let add = if is_meta_only { 0 } else { f.unpacked_size };
+                        if count > 0 && batch_bytes.saturating_add(add) > batch_byte_limit {
+                            break;
+                        }
+                        batch_bytes = batch_bytes.saturating_add(add);
+                        count += 1;
+                    }
+                    count
+                };
+                if batch_len >= 2 {
+                    let (entries, failure) = {
+                        let archive = &volumes[volume_index];
+                        let files: Vec<_> = archive
+                            .files()
+                            .skip(file_index)
+                            .take(batch_len)
+                            .collect();
+                        crate::parallel::map_prefix(files, |file| {
+                            decode_parallel_entry(
+                                archive,
+                                file,
+                                password,
+                                buffered_decode_limit,
+                                options,
+                                false,
+                            )
+                        })
+                    };
+                    for entry in entries {
+                        write_parallel_entry(entry, open, redirect, &publication)?;
+                        file_index += 1;
+                    }
+                    if let Some(error) = failure {
+                        if options.auto_repair
+                            && !repair_attempted[volume_index]
+                            && !volumes[volume_index].is_overlaid()
+                            && volumes[volume_index].has_recovery_record()
+                            && !matches!(
+                                error.kind(),
+                                crate::ErrorKind::Cancelled | crate::ErrorKind::ResourceLimit
+                            )
+                        {
+                            repair_attempted[volume_index] = true;
+                            let rep = volumes[volume_index].auto_repaired(options)?;
+                            if rep.is_overlaid() {
+                                volumes.to_mut()[volume_index] = rep;
+                                continue;
+                            }
+                        }
+                        if on_error.is_none()
+                            || matches!(
+                                error.kind(),
+                                crate::ErrorKind::Cancelled | crate::ErrorKind::ResourceLimit
+                            )
+                        {
+                            return Err(error);
+                        }
+                        let handler = on_error.as_deref_mut().unwrap();
+                        let member = {
+                            let file = volumes[volume_index]
+                                .files()
+                                .nth(file_index)
+                                .expect("failed member index");
+                            crate::rar50_member(file)
+                        };
+                        match handler(&member, &error)? {
+                            crate::ExtractionErrorAction::Abort => return Err(error),
+                            crate::ExtractionErrorAction::Continue => {
+                                session = DecoderSession::with_allowance(
+                                    password,
+                                    buffered_decode_limit,
+                                    allowance,
+                                );
+                                session.decoder.read_control = budget.control.clone();
+                                session.scratch = options.rar50_scratch;
+                                file_index += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+
             // Admission precedes split decryption and checksum-error preference:
             // a resource refusal must not read payloads or become a checksum error.
-            file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
-            match split.advance(file.is_split_before(), file.is_split_after()) {
+            let step = {
+                let file = volumes[volume_index]
+                    .files()
+                    .nth(file_index)
+                    .expect("file index in bounds");
+                file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
+                split.advance(file.is_split_before(), file.is_split_after())
+            };
+            match step {
                 SplitVolumeStep::Regular => {
-                    if let Some(redirection) = &file.redirection {
-                        if emit_redirections {
-                            options.check_cancelled()?;
-                            redirect(&file.metadata(), redirection)?;
-                            options.check_cancelled()?;
+                    {
+                        let file = volumes[volume_index].files().nth(file_index).unwrap();
+                        if let Some(redirection) = &file.redirection {
+                            if emit_redirections {
+                                options.check_cancelled()?;
+                                redirect(&file.metadata(), redirection)?;
+                                options.check_cancelled()?;
+                            }
+                            file_index += 1;
+                            continue;
                         }
-                        continue;
                     }
+                    let can_stage_repair = options.auto_repair
+                        && !repair_attempted[volume_index]
+                        && !volumes[volume_index].is_overlaid()
+                        && volumes[volume_index].has_recovery_record()
+                        && !volumes[volume_index].main.is_solid()
+                        && volumes[volume_index]
+                            .files()
+                            .nth(file_index)
+                            .is_some_and(|f| {
+                                !f.is_directory()
+                                    && f.compression_info & 0x40 == 0
+                                    && f.known_unpacked_size()
+                                        .is_some_and(|n| n <= LAZY_REPAIR_STAGE_LIMIT)
+                            });
+                    if can_stage_repair {
+                        let stage_res = {
+                            let archive = &volumes[volume_index];
+                            let file = archive.files().nth(file_index).unwrap();
+                            file.check_output_limit(&budget)?;
+                            let meta = file.metadata();
+                            options.check_cancelled()?;
+                            let mut staged = Vec::with_capacity(file.unpacked_size as usize);
+                            session
+                                .write_file_to(archive, file, &mut staged)
+                                .map(|()| (meta, file.name.clone(), staged))
+                        };
+                        match stage_res {
+                            Ok((meta, file_name, staged)) => {
+                                let mut writer = open(&meta)?;
+                                options.check_cancelled()?;
+                                budget.run(&file_name, &mut writer, |writer| {
+                                    writer.write_all(&staged)?;
+                                    Ok(())
+                                })?;
+                                file_index += 1;
+                                continue;
+                            }
+                            Err(err)
+                                if !matches!(
+                                    err.kind(),
+                                    crate::ErrorKind::Cancelled | crate::ErrorKind::ResourceLimit
+                                ) =>
+                            {
+                                repair_attempted[volume_index] = true;
+                                let rep = volumes[volume_index].auto_repaired(options)?;
+                                if rep.is_overlaid() {
+                                    volumes.to_mut()[volume_index] = rep;
+                                    session = DecoderSession::with_allowance(
+                                        password,
+                                        buffered_decode_limit,
+                                        allowance,
+                                    );
+                                    session.decoder.read_control = budget.control.clone();
+                                    session.scratch = options.rar50_scratch;
+                                    continue;
+                                }
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    }
+
+                    let archive = &volumes[volume_index];
+                    let file = archive.files().nth(file_index).unwrap();
                     file.check_output_limit(&budget)?;
                     let meta = file.metadata();
                     options.check_cancelled()?;
@@ -1698,6 +1987,7 @@ where
                     }
                 }
                 SplitVolumeStep::Start => {
+                    let file = volumes[volume_index].files().nth(file_index).unwrap();
                     validate_split_fragment(file, password)?;
                     split.begin(PendingSplitRefs::with_allowance(
                         file,
@@ -1707,15 +1997,35 @@ where
                     )?);
                 }
                 SplitVolumeStep::Continue(current) => {
+                    let file = volumes[volume_index].files().nth(file_index).unwrap();
                     validate_split_continuation_refs(current, file, password)?;
                     current.append(volume_index, file_index)?;
                 }
                 SplitVolumeStep::Finish(mut completed) => {
-                    validate_split_continuation_refs(&completed, file, password)?;
-                    completed.append(volume_index, file_index)?;
-                    file.check_output_limit(&budget)?;
+                    {
+                        let file = volumes[volume_index].files().nth(file_index).unwrap();
+                        validate_split_continuation_refs(&completed, file, password)?;
+                        completed.append(volume_index, file_index)?;
+                        file.check_output_limit(&budget)?;
+                    }
+                    if options.auto_repair {
+                        for &(v_idx, _) in completed.fragments.iter() {
+                            if !repair_attempted[v_idx]
+                                && !volumes[v_idx].is_overlaid()
+                                && volumes[v_idx].has_recovery_record()
+                            {
+                                repair_attempted[v_idx] = true;
+                                let rep = volumes[v_idx].auto_repaired(options)?;
+                                if rep.is_overlaid() {
+                                    volumes.to_mut()[v_idx] = rep;
+                                }
+                            }
+                        }
+                    }
+                    let archive = &volumes[volume_index];
+                    let file = archive.files().nth(file_index).unwrap();
                     let result =
-                        completed.write_to(volumes, file, &mut session, &mut budget, &mut *open);
+                        completed.write_to(&volumes, file, &mut session, &mut budget, &mut *open);
                     if let Err(error) = result {
                         let solid = archive.main.is_solid() || file.compression_info & 0x40 != 0;
                         if solid
@@ -1755,6 +2065,7 @@ where
                     ));
                 }
             }
+            file_index += 1;
         }
     }
 
