@@ -750,12 +750,7 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
         options.check_cancelled()?;
-        let archive = if options.auto_repair && !self.is_overlaid() && self.has_recovery_record() {
-            self.auto_repaired(options)?
-        } else {
-            self.clone()
-        };
-        match &archive {
+        match self {
             Self::Rar13(archive) => {
                 archive.extract_to_with_options(options, |meta| open(&rar13_meta(meta)))
             }
@@ -778,12 +773,7 @@ impl Archive {
         E: FnMut(&ArchiveMember, &Error) -> Result<ExtractionErrorAction>,
     {
         options.check_cancelled()?;
-        let archive = if options.auto_repair && !self.is_overlaid() && self.has_recovery_record() {
-            self.auto_repaired(options)?
-        } else {
-            self.clone()
-        };
-        match &archive {
+        match self {
             Self::Rar13(archive) => {
                 archive.extract_to_with_errors(options, |meta| open(&rar13_meta(meta)), on_error)
             }
@@ -841,12 +831,7 @@ impl Archive {
     where
         F: FnMut(&ArchiveMember) -> Result<ExtractionDecision>,
     {
-        let archive = if options.auto_repair && !self.is_overlaid() && self.has_recovery_record() {
-            self.auto_repaired(options)?
-        } else {
-            self.clone()
-        };
-        match &archive {
+        match self {
             Self::Rar13(archive) => archive.extract_controlled(options, &mut decide, None),
             Self::Rar15To40(archive) => archive.extract_controlled(options, &mut decide, None),
             Self::Rar50Plus(archive) => archive.extract_controlled(options, &mut decide, None),
@@ -872,12 +857,7 @@ impl Archive {
         F: FnMut(&ArchiveMember) -> Result<ExtractionDecision>,
         E: FnMut(&ArchiveMember, &Error) -> Result<ExtractionErrorAction>,
     {
-        let archive = if options.auto_repair && !self.is_overlaid() && self.has_recovery_record() {
-            self.auto_repaired(options)?
-        } else {
-            self.clone()
-        };
-        match &archive {
+        match self {
             Self::Rar13(archive) => {
                 archive.extract_controlled(options, &mut decide, Some(&mut on_error))
             }

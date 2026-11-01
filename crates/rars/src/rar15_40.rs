@@ -35,8 +35,8 @@ use crate::extraction_links::{check_legacy_size, emit_legacy_link, legacy_output
 pub use crate::streaming::{EntrySource, WriterResources};
 #[cfg(feature = "write")]
 pub use crate::write_plan::MemberCoding;
-pub use extract::{extract_volumes_to, extract_volumes_to_with_errors};
 pub(crate) use extract::extract_volumes_with_links;
+pub use extract::{extract_volumes_to, extract_volumes_to_with_errors};
 use extract::{DecoderSession, DecryptingReader, PackedReader};
 #[cfg(feature = "write")]
 pub(crate) use write::write_stored_volumes_with_progress;
@@ -1362,7 +1362,9 @@ impl Archive {
     pub fn has_recovery_record(&self) -> bool {
         self.main.has_recovery_record()
             || self.protect_records().next().is_some()
-            || self.new_subs().any(|sub| sub.kind == NewSubKind::RecoveryRecord)
+            || self
+                .new_subs()
+                .any(|sub| sub.kind == NewSubKind::RecoveryRecord)
     }
 
     pub fn with_overlay(&self, patches: Arc<std::collections::BTreeMap<u64, Vec<u8>>>) -> Self {
@@ -1382,28 +1384,16 @@ impl Archive {
     ) -> Result<std::collections::BTreeMap<u64, Vec<u8>>> {
         options.check_cancelled()?;
         let control = crate::read_control::ReadControl::new(options.cancellation);
-        let source_bytes = self.source_bytes()?;
         if let Some(recovery) = self
             .new_subs()
             .find(|sub| sub.kind == NewSubKind::RecoveryRecord)
         {
-            repair_newsub_recovery_patches(
-                &source_bytes,
-                self.sfx_offset,
-                self,
-                recovery,
-                &control,
-            )
+            repair_newsub_recovery_patches(self, self.sfx_offset, recovery, &control)
         } else {
             let protect = self.protect_records().next().ok_or(Error::InvalidHeader(
                 "RAR 2.x archive does not contain a PROTECT_HEAD recovery record",
             ))?;
-            repair_protect_head_patches(
-                &source_bytes,
-                self.sfx_offset,
-                protect,
-                &control,
-            )
+            repair_protect_head_patches(self, self.sfx_offset, protect, &control)
         }
     }
 
@@ -1424,9 +1414,7 @@ impl Archive {
         #[cfg(feature = "recovery")]
         {
             match self.recovery_patches_with_options(options) {
-                Ok(patches) if !patches.is_empty() => {
-                    Ok(self.with_overlay(Arc::new(patches)))
-                }
+                Ok(patches) if !patches.is_empty() => Ok(self.with_overlay(Arc::new(patches))),
                 Ok(_) => Ok(self.clone()),
                 Err(err) => {
                     if matches!(err.kind(), crate::ErrorKind::Cancelled) {
@@ -1490,6 +1478,7 @@ impl Archive {
                 repair_protect_head_bytes(
                     &self.source_bytes()?,
                     self.sfx_offset,
+                    self,
                     protect,
                     &control,
                 )?
@@ -1556,16 +1545,8 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
-        let repaired_archive;
-        let target = if options.auto_repair && !self.is_overlaid() && self.has_recovery_record() {
-            repaired_archive = self.auto_repaired(options)?;
-            &repaired_archive
-        } else {
-            self
-        };
-
         if let Some(limit) = options.max_reader_workspace_bytes {
-            return target.extract_with_allowance(
+            return self.extract_with_allowance(
                 options,
                 open,
                 selector,
@@ -1574,7 +1555,7 @@ impl Archive {
                 &crate::codec::workspace::Allowance::limited(limit),
             );
         }
-        target.extract_with_allowance(
+        self.extract_with_allowance(
             options,
             open,
             selector,
@@ -1596,6 +1577,7 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
+        const LAZY_REPAIR_STAGE_LIMIT: u64 = 16 * 1024 * 1024;
         debug_assert!(links.is_none() || selector.is_none());
         options.check_cancelled()?;
         let password = options.password;
@@ -1603,7 +1585,10 @@ impl Archive {
         let mut session = DecoderSession::with_allowance(self.main.is_solid(), password, allowance);
         session.read_control = budget.control.clone();
         let solid = self.main.is_solid() || self.files().any(|file| file.is_solid());
-        for file in self.files() {
+        let mut repaired_archive: Option<Self> = None;
+        let mut repair_attempted = false;
+        let all_files: Vec<_> = self.files().collect();
+        for (file_index, &file) in all_files.iter().enumerate() {
             let selected = crate::extraction_control::select(
                 &mut selector,
                 options,
@@ -1639,6 +1624,81 @@ impl Archive {
                 options.check_cancelled()?;
                 check_legacy_size(&meta, file.unp_size, links.is_some())?;
                 let control = budget.control.clone();
+
+                let can_stage_for_lazy_repair = !repair_attempted
+                    && options.auto_repair
+                    && repaired_archive.is_none()
+                    && !self.is_overlaid()
+                    && self.has_recovery_record()
+                    && file.unp_size <= LAZY_REPAIR_STAGE_LIMIT;
+
+                if can_stage_for_lazy_repair {
+                    let mut staged = Vec::with_capacity(file.unp_size as usize);
+                    let stage_res = if file.is_stored() {
+                        file.write_stored_with_allowance(self, password, &mut staged, allowance)
+                            .map_err(|error| file.entry_error("extracting", error))
+                    } else {
+                        session
+                            .write_file_to(self, file, &mut staged)
+                            .map_err(|error| file.entry_error("extracting", error))
+                    };
+                    match stage_res {
+                        Ok(()) => {
+                            return legacy_output(
+                                &meta,
+                                allowance,
+                                &control,
+                                &mut links,
+                                || match selected_writer.take() {
+                                    Some(writer) => Ok(writer),
+                                    None => open(&meta),
+                                },
+                                |writer| {
+                                    budget.run(&file.name, writer, |writer| {
+                                        writer.write_all(&staged)?;
+                                        Ok(())
+                                    })
+                                },
+                            );
+                        }
+                        Err(err)
+                            if !matches!(
+                                err.kind(),
+                                crate::ErrorKind::Cancelled | crate::ErrorKind::ResourceLimit
+                            ) =>
+                        {
+                            repair_attempted = true;
+                            let rep = self.auto_repaired(options)?;
+                            if rep.is_overlaid() {
+                                repaired_archive = Some(rep);
+                                let active = repaired_archive.as_ref().unwrap();
+                                session = DecoderSession::with_allowance(
+                                    active.main.is_solid(),
+                                    password,
+                                    allowance,
+                                );
+                                session.read_control = budget.control.clone();
+                                if solid && file_index > 0 {
+                                    for &prev in &all_files[..file_index] {
+                                        if !prev.is_directory() && !prev.is_stored() {
+                                            let mut sink = std::io::sink();
+                                            session
+                                                .write_file_to(active, prev, &mut sink)
+                                                .map_err(|error| {
+                                                    prev.entry_error("extracting", error)
+                                                })?;
+                                        }
+                                    }
+                                }
+                            } else {
+                                return Err(err);
+                            }
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+
+                let active = repaired_archive.as_ref().unwrap_or(self);
                 legacy_output(
                     &meta,
                     allowance,
@@ -1652,7 +1712,7 @@ impl Archive {
                         budget.run(&file.name, writer, |mut writer| {
                             if file.is_stored() {
                                 file.write_stored_with_allowance(
-                                    self,
+                                    active,
                                     password,
                                     &mut writer,
                                     allowance,
@@ -1660,7 +1720,7 @@ impl Archive {
                                 .map_err(|error| file.entry_error("extracting", error))?;
                             } else {
                                 session
-                                    .write_file_to(self, file, &mut writer)
+                                    .write_file_to(active, file, &mut writer)
                                     .map_err(|error| file.entry_error("extracting", error))?;
                             }
                             Ok(())
@@ -2086,7 +2146,7 @@ fn parse_protect_header(
 
 #[cfg(feature = "recovery")]
 fn repair_protect_head_patches(
-    source: &[u8],
+    archive: &Archive,
     sfx_offset: usize,
     protect: &ProtectHeader,
     control: &crate::read_control::ReadControl,
@@ -2113,91 +2173,105 @@ fn repair_protect_head_patches(
         .ok_or(Error::InvalidHeader(
             "RAR 2.x protected sector range overflows",
         ))?;
-    if protected_end > source.len() {
+    let source_len = archive.source.len()?;
+    if protected_end > source_len {
         return Err(Error::InvalidHeader(
             "RAR 2.x protected sector range is invalid",
         ));
     }
-    let recovery_data = source
-        .get(protect.data_range.clone())
-        .ok_or(Error::TooShort)?;
+    if protect.data_range.end > source_len {
+        return Err(Error::TooShort);
+    }
     // The successful 512-byte sector calculation also bounds two-byte tags.
     let tag_len = declared_blocks * 2;
     // A u16 sector count needs at most 33553920 parity bytes on either host.
     let parity_len = usize::from(protect.rec_sectors) * 512;
-    if recovery_data.len() != tag_len + parity_len {
+    if protect.data_range.len() != tag_len + parity_len {
         return Err(Error::InvalidHeader(
             "RAR 2.x recovery data size is invalid",
         ));
     }
-    let tags = &recovery_data[..tag_len];
-    let parity = &recovery_data[tag_len..];
     // RAR 2.50 records may declare a final sector that starts before
     // PROTECT_HEAD but overlaps the recovery block. Only complete sectors
     // before the recovery block are safely repairable.
     let repairable_blocks = declared_blocks.min(protect.block.offset / 512);
+    let repairable_bytes = repairable_blocks * 512;
+    let repairable_tags = repairable_blocks * 2;
+
+    let mut sector_reader = std::io::BufReader::with_capacity(
+        64 * 1024,
+        archive.range_reader(protected_start..protected_start + repairable_bytes)?,
+    );
+    let mut tag_reader = std::io::BufReader::with_capacity(
+        64 * 1024,
+        archive
+            .range_reader(protect.data_range.start..protect.data_range.start + repairable_tags)?,
+    );
 
     let mut damaged = Vec::new();
+    let mut sector = [0u8; 512];
+    let mut tag_bytes = [0u8; 2];
     for index in 0..repairable_blocks {
         control.check()?;
-        let sector_start = protected_start + index * 512;
-        let sector = &source[sector_start..sector_start + 512];
-        let actual = (!crc32(sector) & 0xffff) as u16;
-        let expected = u16::from_le_bytes([tags[index * 2], tags[index * 2 + 1]]);
+        sector_reader.read_exact(&mut sector)?;
+        tag_reader.read_exact(&mut tag_bytes)?;
+        let actual = (!crc32(&sector) & 0xffff) as u16;
+        let expected = u16::from_le_bytes(tag_bytes);
         if actual != expected {
-            damaged.push(index);
+            damaged.push((index, expected));
         }
     }
     if damaged.is_empty() {
         return Ok(std::collections::BTreeMap::new());
     }
-    if damaged.len() > usize::from(protect.rec_sectors) {
+    let rec_sectors = usize::from(protect.rec_sectors);
+    if damaged.len() > rec_sectors {
         return Err(Error::InvalidHeader(
             "RAR 2.x recovery damage exceeds parity sector count",
         ));
     }
 
-    let mut used_slots = vec![false; usize::from(protect.rec_sectors)];
-    for &index in &damaged {
+    let mut slot_to_pos = std::collections::BTreeMap::new();
+    let mut rebuilt = Vec::with_capacity(damaged.len());
+    let parity_base = protect.data_range.start + tag_len;
+    for (pos, &(missing_index, _)) in damaged.iter().enumerate() {
         control.check()?;
-        let slot = index % usize::from(protect.rec_sectors);
-        if used_slots[slot] {
+        let slot = missing_index % rec_sectors;
+        if slot_to_pos.insert(slot, pos).is_some() {
             return Err(Error::InvalidHeader(
                 "RAR 2.x recovery cannot repair multiple sectors in the same parity group",
             ));
         }
-        used_slots[slot] = true;
+        let p_start = parity_base + slot * 512;
+        rebuilt.push(archive.read_range(p_start..p_start + 512)?);
+    }
+
+    let mut pass_reader = std::io::BufReader::with_capacity(
+        64 * 1024,
+        archive.range_reader(protected_start..protected_start + repairable_bytes)?,
+    );
+    for index in 0..repairable_blocks {
+        control.check()?;
+        pass_reader.read_exact(&mut sector)?;
+        let slot = index % rec_sectors;
+        if let Some(&pos) = slot_to_pos.get(&slot) {
+            if index != damaged[pos].0 {
+                for (out, &byte) in rebuilt[pos].iter_mut().zip(&sector) {
+                    *out ^= byte;
+                }
+            }
+        }
     }
 
     let mut patches = std::collections::BTreeMap::new();
-    for &missing_index in &damaged {
+    for ((missing_index, expected), rebuilt_sector) in damaged.into_iter().zip(rebuilt) {
         control.check()?;
-        let slot = missing_index % usize::from(protect.rec_sectors);
-        let mut sector = parity[slot * 512..slot * 512 + 512].to_vec();
-        for index in (slot..repairable_blocks).step_by(usize::from(protect.rec_sectors)) {
-            control.check()?;
-            if index == missing_index {
-                continue;
-            }
-            let sector_start = protected_start + index * 512;
-            for (out, byte) in sector
-                .iter_mut()
-                .zip(&source[sector_start..sector_start + 512])
-            {
-                *out ^= *byte;
-            }
-        }
-        let actual = (!crc32(&sector) & 0xffff) as u16;
-        let expected = u16::from_le_bytes(
-            tags[missing_index * 2..missing_index * 2 + 2]
-                .try_into()
-                .unwrap(),
-        );
+        let actual = (!crc32(&rebuilt_sector) & 0xffff) as u16;
         if actual != expected {
             return Err(Error::CrcMismatch { expected, actual });
         }
         let sector_start = protected_start + missing_index * 512;
-        patches.insert(sector_start as u64, sector);
+        patches.insert(sector_start as u64, rebuilt_sector);
     }
     Ok(patches)
 }
@@ -2206,10 +2280,11 @@ fn repair_protect_head_patches(
 fn repair_protect_head_bytes(
     source: &[u8],
     sfx_offset: usize,
+    archive: &Archive,
     protect: &ProtectHeader,
     control: &crate::read_control::ReadControl,
 ) -> Result<(Vec<u8>, bool)> {
-    let patches = repair_protect_head_patches(source, sfx_offset, protect, control)?;
+    let patches = repair_protect_head_patches(archive, sfx_offset, protect, control)?;
     if patches.is_empty() {
         return Ok((source.to_vec(), false));
     }
@@ -2220,21 +2295,20 @@ fn repair_protect_head_bytes(
 
 #[cfg(feature = "recovery")]
 fn repair_newsub_recovery_patches(
-    source: &[u8],
-    sfx_offset: usize,
     archive: &Archive,
+    sfx_offset: usize,
     recovery: &NewSubHeader,
     control: &crate::read_control::ReadControl,
 ) -> Result<std::collections::BTreeMap<u64, Vec<u8>>> {
     control.check()?;
-    let recovery_data = newsub_recovery_data(archive, recovery, control)?;
+    if recovery.file.is_encrypted() {
+        return Err(Error::UnsupportedFeature {
+            version: ArchiveVersion::Rar30,
+            feature: "encrypted RAR 3.x NEWSUB recovery record",
+        });
+    }
     let expected_unpacked = usize::try_from(recovery.file.unp_size)
         .map_err(|_| Error::InvalidHeader("RAR 3.x recovery unpacked size overflows usize"))?;
-    if recovery_data.len() != expected_unpacked {
-        return Err(Error::InvalidHeader(
-            "RAR 3.x recovery data size does not match unpacked size",
-        ));
-    }
     let protected_start = sfx_offset;
     let protected_end =
         sfx_offset
@@ -2242,7 +2316,8 @@ fn repair_newsub_recovery_patches(
             .ok_or(Error::InvalidHeader(
                 "RAR 3.x recovery protected range overflows",
             ))?;
-    if protected_end > source.len() {
+    let source_len = archive.source.len()?;
+    if protected_end > source_len {
         return Err(Error::InvalidHeader(
             "RAR 3.x recovery protected range is invalid",
         ));
@@ -2256,23 +2331,128 @@ fn repair_newsub_recovery_patches(
     }
     // Sector count is ceil(an already-admitted physical extent / 512).
     let tag_len = protected_sectors * 2;
-    if recovery_data.len() <= tag_len || !(recovery_data.len() - tag_len).is_multiple_of(512) {
+    if expected_unpacked <= tag_len || !(expected_unpacked - tag_len).is_multiple_of(512) {
         return Err(Error::InvalidHeader(
             "RAR 3.x recovery data size is invalid",
         ));
     }
-    let parity_sectors = (recovery_data.len() - tag_len) / 512;
+    let parity_sectors = (expected_unpacked - tag_len) / 512;
+
+    if recovery.file.method == 0x30 {
+        if recovery.file.pack_size != recovery.file.unp_size {
+            return Err(Error::InvalidHeader(
+                "RAR 3.x recovery record packed size does not match unpacked size",
+            ));
+        }
+        if recovery.file.packed_range.end > source_len {
+            return Err(Error::TooShort);
+        }
+        if recovery.file.packed_range.len() != expected_unpacked {
+            return Err(Error::InvalidHeader(
+                "RAR 3.x recovery data size does not match unpacked size",
+            ));
+        }
+        let rec_start = recovery.file.packed_range.start;
+        let mut sector_reader = std::io::BufReader::with_capacity(
+            64 * 1024,
+            archive.range_reader(protected_start..protected_end)?,
+        );
+        let mut tag_reader = std::io::BufReader::with_capacity(
+            64 * 1024,
+            archive.range_reader(rec_start..rec_start + tag_len)?,
+        );
+
+        let mut damaged = Vec::new();
+        let mut sector = [0u8; 512];
+        let mut tag_bytes = [0u8; 2];
+        for index in 0..protected_sectors {
+            control.check()?;
+            read_padded_sector(&mut sector_reader, protected_len, index, &mut sector)?;
+            tag_reader.read_exact(&mut tag_bytes)?;
+            let actual = (!crc32(&sector) & 0xffff) as u16;
+            let expected = u16::from_le_bytes(tag_bytes);
+            if actual != expected {
+                damaged.push((index, expected));
+            }
+        }
+        if damaged.is_empty() {
+            return Ok(std::collections::BTreeMap::new());
+        }
+        if damaged.len() > parity_sectors {
+            return Err(Error::InvalidHeader(
+                "RAR 3.x recovery damage exceeds parity sector count",
+            ));
+        }
+
+        let mut slot_to_pos = std::collections::BTreeMap::new();
+        let mut rebuilt = Vec::with_capacity(damaged.len());
+        let parity_base = rec_start + tag_len;
+        for (pos, &(missing_index, _)) in damaged.iter().enumerate() {
+            control.check()?;
+            let slot = missing_index % parity_sectors;
+            if slot_to_pos.insert(slot, pos).is_some() {
+                return Err(Error::InvalidHeader(
+                    "RAR 3.x recovery cannot repair multiple sectors in the same parity group",
+                ));
+            }
+            let p_start = parity_base + slot * 512;
+            rebuilt.push(archive.read_range(p_start..p_start + 512)?);
+        }
+
+        let mut pass_reader = std::io::BufReader::with_capacity(
+            64 * 1024,
+            archive.range_reader(protected_start..protected_end)?,
+        );
+        for index in 0..protected_sectors {
+            control.check()?;
+            read_padded_sector(&mut pass_reader, protected_len, index, &mut sector)?;
+            let slot = index % parity_sectors;
+            if let Some(&pos) = slot_to_pos.get(&slot) {
+                if index != damaged[pos].0 {
+                    for (out, &byte) in rebuilt[pos].iter_mut().zip(&sector) {
+                        *out ^= byte;
+                    }
+                }
+            }
+        }
+
+        let mut patches = std::collections::BTreeMap::new();
+        for ((missing_index, expected), mut rebuilt_sector) in damaged.into_iter().zip(rebuilt) {
+            control.check()?;
+            let actual = (!crc32(&rebuilt_sector) & 0xffff) as u16;
+            if actual != expected {
+                return Err(Error::CrcMismatch { expected, actual });
+            }
+            let sector_start = protected_start + missing_index * 512;
+            let write_len = 512.min(protected_end - sector_start);
+            rebuilt_sector.truncate(write_len);
+            patches.insert(sector_start as u64, rebuilt_sector);
+        }
+        return Ok(patches);
+    }
+
+    let recovery_data = newsub_recovery_data(archive, recovery, control)?;
+    if recovery_data.len() != expected_unpacked {
+        return Err(Error::InvalidHeader(
+            "RAR 3.x recovery data size does not match unpacked size",
+        ));
+    }
     let tags = &recovery_data[..tag_len];
     let parity = &recovery_data[tag_len..];
 
+    let mut sector_reader = std::io::BufReader::with_capacity(
+        64 * 1024,
+        archive.range_reader(protected_start..protected_end)?,
+    );
     let mut damaged = Vec::new();
+    let mut sector = [0u8; 512];
     for index in 0..protected_sectors {
         control.check()?;
-        let sector = protected_sector(source, protected_start, protected_len, index);
+        read_padded_sector(&mut sector_reader, protected_len, index, &mut sector)?;
         let actual = (!crc32(&sector) & 0xffff) as u16;
         let expected = u16::from_le_bytes([tags[index * 2], tags[index * 2 + 1]]);
         if actual != expected {
-            damaged.push(index);
+            damaged.push((index, expected));
         }
     }
     if damaged.is_empty() {
@@ -2284,46 +2464,47 @@ fn repair_newsub_recovery_patches(
         ));
     }
 
-    let mut used_slots = vec![false; parity_sectors];
-    for &index in &damaged {
+    let mut slot_to_pos = std::collections::BTreeMap::new();
+    let mut rebuilt = Vec::with_capacity(damaged.len());
+    for (pos, &(missing_index, _)) in damaged.iter().enumerate() {
         control.check()?;
-        let slot = index % parity_sectors;
-        if used_slots[slot] {
+        let slot = missing_index % parity_sectors;
+        if slot_to_pos.insert(slot, pos).is_some() {
             return Err(Error::InvalidHeader(
                 "RAR 3.x recovery cannot repair multiple sectors in the same parity group",
             ));
         }
-        used_slots[slot] = true;
+        rebuilt.push(parity[slot * 512..slot * 512 + 512].to_vec());
+    }
+
+    let mut pass_reader = std::io::BufReader::with_capacity(
+        64 * 1024,
+        archive.range_reader(protected_start..protected_end)?,
+    );
+    for index in 0..protected_sectors {
+        control.check()?;
+        read_padded_sector(&mut pass_reader, protected_len, index, &mut sector)?;
+        let slot = index % parity_sectors;
+        if let Some(&pos) = slot_to_pos.get(&slot) {
+            if index != damaged[pos].0 {
+                for (out, &byte) in rebuilt[pos].iter_mut().zip(&sector) {
+                    *out ^= byte;
+                }
+            }
+        }
     }
 
     let mut patches = std::collections::BTreeMap::new();
-    for &missing_index in &damaged {
+    for ((missing_index, expected), mut rebuilt_sector) in damaged.into_iter().zip(rebuilt) {
         control.check()?;
-        let slot = missing_index % parity_sectors;
-        let mut sector = parity[slot * 512..slot * 512 + 512].to_vec();
-        for index in (slot..protected_sectors).step_by(parity_sectors) {
-            control.check()?;
-            if index == missing_index {
-                continue;
-            }
-            let other = protected_sector(source, protected_start, protected_len, index);
-            for (out, byte) in sector.iter_mut().zip(other) {
-                control.check()?;
-                *out ^= byte;
-            }
-        }
-        let actual = (!crc32(&sector) & 0xffff) as u16;
-        let expected = u16::from_le_bytes(
-            tags[missing_index * 2..missing_index * 2 + 2]
-                .try_into()
-                .unwrap(),
-        );
+        let actual = (!crc32(&rebuilt_sector) & 0xffff) as u16;
         if actual != expected {
             return Err(Error::CrcMismatch { expected, actual });
         }
         let sector_start = protected_start + missing_index * 512;
         let write_len = 512.min(protected_end - sector_start);
-        patches.insert(sector_start as u64, sector[..write_len].to_vec());
+        rebuilt_sector.truncate(write_len);
+        patches.insert(sector_start as u64, rebuilt_sector);
     }
 
     Ok(patches)
@@ -2337,7 +2518,7 @@ fn repair_newsub_recovery_bytes(
     recovery: &NewSubHeader,
     control: &crate::read_control::ReadControl,
 ) -> Result<(Vec<u8>, bool)> {
-    let patches = repair_newsub_recovery_patches(source, sfx_offset, archive, recovery, control)?;
+    let patches = repair_newsub_recovery_patches(archive, sfx_offset, recovery, control)?;
     if patches.is_empty() {
         return Ok((source.to_vec(), false));
     }
@@ -2372,21 +2553,20 @@ fn newsub_recovery_data(
 }
 
 #[cfg(feature = "recovery")]
-fn protected_sector(
-    source: &[u8],
-    protected_start: usize,
+fn read_padded_sector(
+    reader: &mut impl Read,
     protected_len: usize,
     index: usize,
-) -> [u8; 512] {
-    // Both callers bound index by ceil(protected_len / 512), after validating
-    // the complete protected range against source.
+    sector: &mut [u8; 512],
+) -> Result<()> {
     let sector_offset = index * 512;
     debug_assert!(sector_offset < protected_len);
-    let sector_start = protected_start + sector_offset;
     let available = 512.min(protected_len - sector_offset);
-    let mut sector = [0u8; 512];
-    sector[..available].copy_from_slice(&source[sector_start..sector_start + available]);
-    sector
+    reader.read_exact(&mut sector[..available])?;
+    if available < 512 {
+        sector[available..].fill(0);
+    }
+    Ok(())
 }
 
 pub fn repair_rev3_volumes_to<F>(

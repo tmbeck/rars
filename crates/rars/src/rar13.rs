@@ -531,9 +531,7 @@ impl Archive {
                     out.write_all(&buffer[..chunk.len()])?;
                 }
             }
-            ArchiveSource::File(_)
-            | ArchiveSource::Reader(_)
-            | ArchiveSource::Overlay { .. } => {
+            ArchiveSource::File(_) | ArchiveSource::Reader(_) | ArchiveSource::Overlay { .. } => {
                 let mut file = self.source.range_reader(range.clone())?;
                 let mut remaining = range.len();
                 while remaining > 0 {
@@ -933,11 +931,11 @@ impl Entry {
             ArchiveSource::Memory(data) => {
                 data.get(self.packed_range.clone()).ok_or(Error::TooShort)
             }
-            ArchiveSource::File(_)
-            | ArchiveSource::Reader(_)
-            | ArchiveSource::Overlay { .. } => Err(Error::InvalidHeader(
-                "RAR 1.3 file-backed packed data requires owned read",
-            )),
+            ArchiveSource::File(_) | ArchiveSource::Reader(_) | ArchiveSource::Overlay { .. } => {
+                Err(Error::InvalidHeader(
+                    "RAR 1.3 file-backed packed data requires owned read",
+                ))
+            }
         }
     }
 

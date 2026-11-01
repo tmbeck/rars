@@ -133,7 +133,10 @@ impl ArchiveSource {
             return self;
         }
         match self {
-            Self::Overlay { base, patches: existing } => {
+            Self::Overlay {
+                base,
+                patches: existing,
+            } => {
                 let mut combined = (*existing).clone();
                 for (&offset, data) in patches.iter() {
                     combined.insert(offset, data.clone());

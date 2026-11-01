@@ -921,9 +921,7 @@ impl Archive {
         #[cfg(feature = "recovery")]
         {
             match self.recovery_patches_with_options(options) {
-                Ok(patches) if !patches.is_empty() => {
-                    Ok(self.with_overlay(Arc::new(patches)))
-                }
+                Ok(patches) if !patches.is_empty() => Ok(self.with_overlay(Arc::new(patches))),
                 Ok(_) => Ok(self.clone()),
                 Err(err) => {
                     if matches!(err.kind(), crate::ErrorKind::Cancelled) {

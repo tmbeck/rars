@@ -844,16 +844,8 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
     {
-        let repaired_archive;
-        let target = if options.auto_repair && !self.is_overlaid() && self.has_recovery_record() {
-            repaired_archive = self.auto_repaired(options)?;
-            &repaired_archive
-        } else {
-            self
-        };
-
         if let Some(limit) = options.max_reader_workspace_bytes {
-            return target.extract_with_allowance(
+            return self.extract_with_allowance(
                 options,
                 open,
                 redirect,
@@ -863,7 +855,7 @@ impl Archive {
                 &crate::codec::workspace::Allowance::limited(limit),
             );
         }
-        target.extract_with_allowance(
+        self.extract_with_allowance(
             options,
             open,
             redirect,
@@ -889,6 +881,7 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
     {
+        const LAZY_REPAIR_STAGE_LIMIT: u64 = 16 * 1024 * 1024;
         options.check_cancelled()?;
         let mut budget = crate::output_limit::OutputBudget::new(options);
         let buffered_decode_limit = rar50_buffered_decode_limit(options);
@@ -896,9 +889,12 @@ impl Archive {
             DecoderSession::with_allowance(options.password, buffered_decode_limit, allowance);
         session.decoder.read_control = budget.control.clone();
         session.scratch = options.rar50_scratch;
-        let solid = self.main.is_solid()
-            || self.files().any(|file| file.compression_info & 0x40 != 0);
-        for file in self.files() {
+        let solid =
+            self.main.is_solid() || self.files().any(|file| file.compression_info & 0x40 != 0);
+        let mut repaired_archive: Option<Self> = None;
+        let mut repair_attempted = false;
+        let all_files: Vec<_> = self.files().collect();
+        for (file_index, &file) in all_files.iter().enumerate() {
             let selected = crate::extraction_control::select(
                 &mut selector,
                 options,
@@ -941,6 +937,69 @@ impl Archive {
                 file.check_output_limit(&budget)?;
                 let meta = file.metadata();
                 options.check_cancelled()?;
+
+                let can_stage_for_lazy_repair = !meta.is_directory
+                    && !repair_attempted
+                    && options.auto_repair
+                    && repaired_archive.is_none()
+                    && !self.is_overlaid()
+                    && self.has_recovery_record()
+                    && file
+                        .known_unpacked_size()
+                        .is_some_and(|n| n <= LAZY_REPAIR_STAGE_LIMIT);
+
+                if can_stage_for_lazy_repair {
+                    let mut staged = Vec::with_capacity(file.unpacked_size as usize);
+                    match session.write_file_to(self, file, &mut staged) {
+                        Ok(()) => {
+                            let mut writer = match selected_writer {
+                                Some(writer) => writer,
+                                None => open(&meta)?,
+                            };
+                            options.check_cancelled()?;
+                            return budget.run(&file.name, &mut writer, |writer| {
+                                writer.write_all(&staged)?;
+                                Ok(())
+                            });
+                        }
+                        Err(err)
+                            if !matches!(
+                                err.kind(),
+                                crate::ErrorKind::Cancelled | crate::ErrorKind::ResourceLimit
+                            ) =>
+                        {
+                            repair_attempted = true;
+                            let rep = self.auto_repaired(options)?;
+                            if rep.is_overlaid() {
+                                repaired_archive = Some(rep);
+                                let active = repaired_archive.as_ref().unwrap();
+                                session = DecoderSession::with_allowance(
+                                    options.password,
+                                    buffered_decode_limit,
+                                    allowance,
+                                );
+                                session.decoder.read_control = budget.control.clone();
+                                session.scratch = options.rar50_scratch;
+                                if solid && file_index > 0 {
+                                    for &prev in &all_files[..file_index] {
+                                        if !prev.is_directory()
+                                            && !prev.is_redirection()
+                                            && !prev.is_stored()
+                                        {
+                                            let mut sink = std::io::sink();
+                                            session.write_file_to(active, prev, &mut sink)?;
+                                        }
+                                    }
+                                }
+                            } else {
+                                return Err(err);
+                            }
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+
+                let active = repaired_archive.as_ref().unwrap_or(self);
                 let mut writer = match selected_writer {
                     Some(writer) => writer,
                     None => open(&meta)?,
@@ -948,7 +1007,7 @@ impl Archive {
                 options.check_cancelled()?;
                 if !meta.is_directory {
                     budget.run(&file.name, &mut writer, |writer| {
-                        session.write_file_to(self, file, writer)
+                        session.write_file_to(active, file, writer)
                     })?;
                 }
                 Ok(())
@@ -1609,8 +1668,8 @@ where
                             session.write_file_to(archive, file, writer)
                         });
                         if let Err(error) = result {
-                            let solid = archive.main.is_solid()
-                                || file.compression_info & 0x40 != 0;
+                            let solid =
+                                archive.main.is_solid() || file.compression_info & 0x40 != 0;
                             if solid
                                 || on_error.is_none()
                                 || matches!(
@@ -1655,7 +1714,8 @@ where
                     validate_split_continuation_refs(&completed, file, password)?;
                     completed.append(volume_index, file_index)?;
                     file.check_output_limit(&budget)?;
-                    let result = completed.write_to(volumes, file, &mut session, &mut budget, &mut *open);
+                    let result =
+                        completed.write_to(volumes, file, &mut session, &mut budget, &mut *open);
                     if let Err(error) = result {
                         let solid = archive.main.is_solid() || file.compression_info & 0x40 != 0;
                         if solid
@@ -1856,11 +1916,9 @@ impl<B: Budget> PendingSplitRefs<B> {
                 break;
             }
             let chunk = if final_file.encrypted {
-                let remaining = final_file
-                    .known_unpacked_size()
-                    .map_or(usize::MAX, |size| {
-                        usize::try_from(size.saturating_sub(written)).unwrap_or(usize::MAX)
-                    });
+                let remaining = final_file.known_unpacked_size().map_or(usize::MAX, |size| {
+                    usize::try_from(size.saturating_sub(written)).unwrap_or(usize::MAX)
+                });
                 // The padding after the unpacked size may hold any bytes, as
                 // unrar accepts.
                 let chunk_len = count.min(remaining);

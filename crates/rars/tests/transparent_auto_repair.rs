@@ -1,10 +1,11 @@
 #![cfg(feature = "write")]
+#![allow(clippy::type_complexity)]
 
 use rars::crc32::crc32;
 use rars::rar50::{self, Archive as Rar50Archive};
 use rars::{
-    Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, ExtractionErrorAction,
-    FeatureSet, ReadAt, RepairedReadAt, SeekReader,
+    Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, ExtractionErrorAction, FeatureSet,
+    ReadAt, RepairedReadAt, SeekReader,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -230,7 +231,9 @@ fn test_rar300_newsub_auto_repair() {
         ArchiveReadOptions::default().with_auto_repair(true),
     )
     .unwrap();
-    let file_data2 = extracted_on_extract.get(b"bigtext_64k.bin".as_slice()).unwrap();
+    let file_data2 = extracted_on_extract
+        .get(b"bigtext_64k.bin".as_slice())
+        .unwrap();
     assert_eq!(crc32(file_data2), 0xddc95682);
 }
 
@@ -390,5 +393,56 @@ fn test_multivolume_error_callback_continuation() {
             .borrow()
             .as_slice(),
         &payload2
+    );
+}
+
+#[test]
+fn test_rar300_newsub_recovery_streams_without_full_archive_read() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct BoundedReadAt {
+        bytes: Vec<u8>,
+        max_single_read: AtomicUsize,
+    }
+
+    impl ReadAt for BoundedReadAt {
+        fn size(&self) -> std::io::Result<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+            self.max_single_read.fetch_max(buf.len(), Ordering::Relaxed);
+            let start = usize::try_from(offset).unwrap_or(self.bytes.len());
+            if start >= self.bytes.len() {
+                return Ok(0);
+            }
+            let available = &self.bytes[start..];
+            let n = available.len().min(buf.len());
+            buf[..n].copy_from_slice(&available[..n]);
+            Ok(n)
+        }
+    }
+
+    let mut damaged = std::fs::read(fixture("rar15_40/rar300/with_recovery_rar300.rar")).unwrap();
+    damaged[512 + 16..512 + 80].fill(0xa5);
+
+    let source = Arc::new(BoundedReadAt {
+        bytes: damaged,
+        max_single_read: AtomicUsize::new(0),
+    });
+    let total_len = source.bytes.len();
+
+    let archive = ArchiveReader::read_source(source.clone()).unwrap();
+    source.max_single_read.store(0, Ordering::Relaxed);
+
+    let patches = archive
+        .recovery_patches_with_options(ArchiveReadOptions::new().with_auto_repair(true))
+        .unwrap();
+    assert!(!patches.is_empty());
+    // Must stream in small chunks rather than reading the entire archive into a single Vec.
+    let largest_read = source.max_single_read.load(Ordering::Relaxed);
+    assert!(
+        largest_read < total_len,
+        "expected streaming reads < archive len {total_len}, got {largest_read}"
     );
 }

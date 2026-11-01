@@ -324,7 +324,14 @@ where
             &Allowance::limited(limit),
         );
     }
-    extract_volumes_with_allowance(volumes, options, open, links, on_error, &Allowance::default())
+    extract_volumes_with_allowance(
+        volumes,
+        options,
+        open,
+        links,
+        on_error,
+        &Allowance::default(),
+    )
 }
 
 fn extract_volumes_with_allowance<F, B: Budget>(
@@ -412,9 +419,8 @@ where
                             match action {
                                 crate::ExtractionErrorAction::Abort => return Err(error),
                                 crate::ExtractionErrorAction::Continue => {
-                                    session = DecoderSession::with_allowance(
-                                        false, password, allowance,
-                                    );
+                                    session =
+                                        DecoderSession::with_allowance(false, password, allowance);
                                     session.read_control = budget.control.clone();
                                 }
                             }
